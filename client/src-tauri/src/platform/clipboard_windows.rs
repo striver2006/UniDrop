@@ -3,15 +3,17 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
-use windows::Win32::Foundation::{HANDLE, HGLOBAL, HWND};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW,
-    SetClipboardData, CF_HDROP,
+    SetClipboardData,
 };
 use windows::Win32::System::Memory::{
-    GlobalAlloc, GlobalFree, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+    GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
 };
 use windows::Win32::UI::Shell::DROPFILES;
+
+const CF_HDROP: u32 = 15;
 
 fn open_clipboard_with_retry(hwnd: HWND, max_retries: u32) -> Result<(), String> {
     for attempt in 0..max_retries {
@@ -69,7 +71,7 @@ pub fn inject_files_to_clipboard(paths: &[PathBuf]) -> Result<(), String> {
         let _ = GlobalUnlock(h_global);
 
         // 4. Open and empty clipboard
-        if let Err(e) = open_clipboard_with_retry(HWND(0), 5) {
+        if let Err(e) = open_clipboard_with_retry(HWND::default(), 5) {
             let _ = GlobalFree(h_global);
             return Err(e);
         }
@@ -81,7 +83,7 @@ pub fn inject_files_to_clipboard(paths: &[PathBuf]) -> Result<(), String> {
         }
 
         // 5. Set CF_HDROP data
-        if SetClipboardData(CF_HDROP.0 as u32, Some(HANDLE(h_global.0))).is_err() {
+        if SetClipboardData(CF_HDROP, HANDLE(h_global.0)).is_err() {
             let _ = CloseClipboard();
             let _ = GlobalFree(h_global);
             return Err("SetClipboardData for CF_HDROP failed".into());
@@ -115,7 +117,7 @@ unsafe fn inject_drop_effect(effect: u32) -> Result<(), String> {
     *p_mem = effect;
     let _ = GlobalUnlock(h_global);
 
-    if SetClipboardData(format_id, Some(HANDLE(h_global.0))).is_err() {
+    if SetClipboardData(format_id, HANDLE(h_global.0)).is_err() {
         let _ = GlobalFree(h_global);
         return Err("Set DropEffect failed".into());
     }
