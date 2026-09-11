@@ -19,6 +19,11 @@ pub async fn cmd_get_settings(state: State<'_, AppState>) -> Result<AppSettings,
 
 #[tauri::command]
 pub async fn cmd_save_settings(state: State<'_, AppState>, new_settings: AppSettings) -> Result<(), String> {
+    let json_str = serde_json::to_string(&new_settings).map_err(|e| e.to_string())?;
+    {
+        let conn = state.db_conn.lock().await;
+        crate::storage::db::save_persisted_settings(&conn, &json_str).map_err(|e| e.to_string())?;
+    }
     let mut s = state.settings.lock().await;
     *s = new_settings;
     Ok(())

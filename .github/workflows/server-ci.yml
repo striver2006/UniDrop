@@ -13,7 +13,7 @@ on:
 
 jobs:
   test-and-build:
-    name: Go Test & Build
+    name: Go Lint, Test & Build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -25,9 +25,23 @@ jobs:
           go-version: "1.23"
           cache-dependency-path: server/go.sum
 
+      - name: Verify Formatting (gofmt)
+        working-directory: server
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "The following Go files are not formatted properly:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Go Vet
+        working-directory: server
+        run: go vet ./...
+
       - name: Run Tests with Race Detector
         working-directory: server
-        run: go test -v -race ./internal/...
+        run: go test -v -race ./...
 
       - name: Build Binary
         working-directory: server

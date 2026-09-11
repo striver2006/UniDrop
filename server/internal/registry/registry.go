@@ -41,6 +41,24 @@ func (r *DeviceRegistry) Unregister(deviceID string) {
 	}
 }
 
+// UnregisterSession performs a compare-and-delete (P0-5): it only unregisters and closes
+// the session if the session currently registered under s.DeviceID is precisely s.
+// Returns true if the session was matched and unregistered.
+func (r *DeviceRegistry) UnregisterSession(s *DeviceSession) bool {
+	if s == nil {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if current, exists := r.sessions[s.DeviceID]; exists && current == s {
+		s.Close()
+		delete(r.sessions, s.DeviceID)
+		return true
+	}
+	return false
+}
+
 // Get retrieves a session by DeviceID.
 func (r *DeviceRegistry) Get(deviceID string) (*DeviceSession, bool) {
 	r.mu.RLock()
@@ -98,7 +116,7 @@ func (r *DeviceRegistry) SweepInactive(timeout time.Duration, now time.Time) []s
 	}
 
 	for id, s := range r.sessions {
-		if now.Sub(s.LastPingAt) > timeout {
+		if now.Sub(s.GetLastPing()) > timeout {
 			timedOut = append(timedOut, struct {
 				AccountID string
 				DeviceID  string

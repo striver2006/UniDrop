@@ -37,7 +37,7 @@ func TestEndToEndTransfer(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", controller.HealthHandler(reg, relayMgr))
-	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, reg))
+	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, reg, relayMgr))
 	mux.Handle("GET /ws/data", controller.NewDataWSHandler(relayMgr))
 
 	server := httptest.NewServer(mux)
@@ -148,15 +148,22 @@ func TestEndToEndTransfer(t *testing.T) {
 		}
 	}
 
-	// 5. Connect Client A (Sender) and Client B (Receiver) to Data Plane
-	dataURLSender := fmt.Sprintf("%s/ws/data?session_id=%s&role=sender&device_id=devA&target_device_id=devB", wsURL, sessionUUID.String())
+	var answerObj protocol.TransferAnswerPayload
+	_ = json.Unmarshal(receivedAnswer.Payload, &answerObj)
+	sessionToken := answerObj.Token
+	if sessionToken == "" {
+		t.Fatalf("expected non-empty data session token in TRANSFER_ANSWER")
+	}
+
+	// 5. Connect Client A (Sender) and Client B (Receiver) to Data Plane with secure token
+	dataURLSender := fmt.Sprintf("%s/ws/data?session_id=%s&role=sender&device_id=devA&target_device_id=devB&token=%s", wsURL, sessionUUID.String(), sessionToken)
 	clientAData, _, err := websocket.Dial(ctx, dataURLSender, nil)
 	if err != nil {
 		t.Fatalf("Client A data dial failed: %v", err)
 	}
 	defer clientAData.Close(websocket.StatusNormalClosure, "done")
 
-	dataURLReceiver := fmt.Sprintf("%s/ws/data?session_id=%s&role=receiver&device_id=devB&target_device_id=devA", wsURL, sessionUUID.String())
+	dataURLReceiver := fmt.Sprintf("%s/ws/data?session_id=%s&role=receiver&device_id=devB&target_device_id=devA&token=%s", wsURL, sessionUUID.String(), sessionToken)
 	clientBData, _, err := websocket.Dial(ctx, dataURLReceiver, nil)
 	if err != nil {
 		t.Fatalf("Client B data dial failed: %v", err)
@@ -306,10 +313,13 @@ func connectAndAuthClient(t *testing.T, ctx context.Context, wsURL, accountID, d
 		t.Fatalf("unexpected challenge: %v", string(msgBytes))
 	}
 
-	// 2. Send auth request
+	// 2. Send auth request with NonceSalt
+	var challengePayload protocol.AuthChallengePayload
+	_ = json.Unmarshal(challengeEnv.Payload, &challengePayload)
+
 	now := time.Now().UnixMilli()
 	nonce := uuid.NewString()
-	sig := v.GenerateSignature(accountID, deviceID, nonce, now)
+	sig := v.GenerateSignatureWithSalt(accountID, deviceID, nonce, now, challengePayload.NonceSalt)
 
 	reqPayload, _ := json.Marshal(protocol.AuthRequestPayload{
 		AccountID:  accountID,

@@ -2,6 +2,7 @@ package stun
 
 import (
 	"encoding/binary"
+	"io"
 	"log/slog"
 	"net"
 )
@@ -11,7 +12,7 @@ const MagicCookie uint32 = 0x2112A442
 
 // STUN Message Types
 const (
-	BindingRequest = 0x0001
+	BindingRequest  = 0x0001
 	BindingResponse = 0x0101
 )
 
@@ -22,9 +23,15 @@ const (
 
 // StartSTUNServer starts a lightweight UDP STUN responder on the given address.
 func StartSTUNServer(addr string) error {
+	_, err := StartSTUNServerWithCloser(addr)
+	return err
+}
+
+// StartSTUNServerWithCloser starts STUN responder and returns an io.Closer for graceful shutdown (P2-9).
+func StartSTUNServerWithCloser(addr string) (io.Closer, error) {
 	conn, err := net.ListenPacket("udp", addr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	slog.Info("STUN server listening", "addr", addr)
 
@@ -50,15 +57,23 @@ func StartSTUNServer(addr string) error {
 				}
 
 				resp := buildBindingResponse(buf[8:20], udpAddr)
-				_, _ = conn.WriteTo(resp, clientAddr)
+				if resp != nil {
+					_, _ = conn.WriteTo(resp, clientAddr)
+				}
 			}
 		}
 	}()
 
-	return nil
+	return conn, nil
 }
 
 func buildBindingResponse(transactionID []byte, addr *net.UDPAddr) []byte {
+	ip := addr.IP.To4()
+	if ip == nil {
+		// UniDrop focuses on IPv4 NAT traversal; safely skip non-IPv4 to avoid 0-address mapping (P2-9)
+		return nil
+	}
+
 	// 20 bytes STUN header + 12 bytes XOR-MAPPED-ADDRESS attribute
 	resp := make([]byte, 32)
 	binary.BigEndian.PutUint16(resp[0:2], BindingResponse)
@@ -69,19 +84,16 @@ func buildBindingResponse(transactionID []byte, addr *net.UDPAddr) []byte {
 	// XOR-MAPPED-ADDRESS
 	binary.BigEndian.PutUint16(resp[20:22], AttrXORMappedAddress)
 	binary.BigEndian.PutUint16(resp[22:24], 8) // Value length
-	resp[24] = 0x00                          // Reserved
-	resp[25] = 0x01                          // IPv4 family
+	resp[24] = 0x00                            // Reserved
+	resp[25] = 0x01                            // IPv4 family
 
 	// XOR Port
 	xorPort := uint16(addr.Port) ^ uint16(MagicCookie>>16)
 	binary.BigEndian.PutUint16(resp[26:28], xorPort)
 
 	// XOR IPv4
-	ip := addr.IP.To4()
-	if ip != nil {
-		xorIP := binary.BigEndian.Uint32(ip) ^ MagicCookie
-		binary.BigEndian.PutUint32(resp[28:32], xorIP)
-	}
+	xorIP := binary.BigEndian.Uint32(ip) ^ MagicCookie
+	binary.BigEndian.PutUint32(resp[28:32], xorIP)
 
 	return resp
 }

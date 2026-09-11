@@ -8,9 +8,9 @@ import (
 )
 
 var (
-	ErrPipeClosed         = errors.New("relay pipe is closed")
-	ErrReceiverCongested  = errors.New("downstream receiver is congested (timeout)")
-	ErrSenderCongested    = errors.New("upstream sender is congested (timeout)")
+	ErrPipeClosed        = errors.New("relay pipe is closed")
+	ErrReceiverCongested = errors.New("downstream receiver is congested (timeout)")
+	ErrSenderCongested   = errors.New("upstream sender is congested (timeout)")
 )
 
 // RelayPipe provides bidirectional streaming channels between sender and receiver.

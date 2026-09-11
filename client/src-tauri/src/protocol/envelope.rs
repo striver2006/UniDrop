@@ -129,6 +129,8 @@ pub struct TransferAnswerPayload {
     pub reject_reason: Option<String>,
     #[serde(default)]
     pub resumed_items: Vec<ResumedItemPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -12,11 +12,11 @@ const (
 	ActionAuthResponse  ActionType = "AUTH_RESPONSE"
 
 	// Topology & Keepalive
-	ActionHeartbeatPing   ActionType = "HEARTBEAT_PING"
-	ActionHeartbeatPong   ActionType = "HEARTBEAT_PONG"
-	ActionDeviceOnline    ActionType = "DEVICE_ONLINE"
-	ActionDeviceOffline   ActionType = "DEVICE_OFFLINE"
-	ActionDeviceListSync  ActionType = "DEVICE_LIST_SYNC"
+	ActionHeartbeatPing  ActionType = "HEARTBEAT_PING"
+	ActionHeartbeatPong  ActionType = "HEARTBEAT_PONG"
+	ActionDeviceOnline   ActionType = "DEVICE_ONLINE"
+	ActionDeviceOffline  ActionType = "DEVICE_OFFLINE"
+	ActionDeviceListSync ActionType = "DEVICE_LIST_SYNC"
 
 	// Transfer Negotiation
 	ActionTransferOffer    ActionType = "TRANSFER_OFFER"
@@ -31,13 +31,13 @@ const (
 
 // ControlEnvelope is the universal outer JSON envelope for all control plane messages.
 type ControlEnvelope struct {
-	Version    int             `json:"version"`               // Currently 1
-	TraceID    string          `json:"trace_id"`              // UUIDv4 trace id
-	Action     ActionType      `json:"action"`                // ActionType
-	FromDevice string          `json:"from_device"`           // Sender device ID
-	ToDevice   string          `json:"to_device,omitempty"`   // Target device ID (if unicast)
-	Timestamp  int64           `json:"timestamp"`             // Millisecond timestamp
-	Payload    json.RawMessage `json:"payload,omitempty"`     // Raw JSON payload
+	Version    int             `json:"version"`             // Currently 1
+	TraceID    string          `json:"trace_id"`            // UUIDv4 trace id
+	Action     ActionType      `json:"action"`              // ActionType
+	FromDevice string          `json:"from_device"`         // Sender device ID
+	ToDevice   string          `json:"to_device,omitempty"` // Target device ID (if unicast)
+	Timestamp  int64           `json:"timestamp"`           // Millisecond timestamp
+	Payload    json.RawMessage `json:"payload,omitempty"`   // Raw JSON payload
 }
 
 // AuthChallengePayload is sent by server to client upon connection.
@@ -51,7 +51,7 @@ type AuthRequestPayload struct {
 	AccountID  string `json:"account_id"`
 	DeviceID   string `json:"device_id"`
 	Hostname   string `json:"hostname"`
-	OSType     string `json:"os_type"`     // "windows" | "macos" | "linux"
+	OSType     string `json:"os_type"` // "windows" | "macos" | "linux"
 	AppVersion string `json:"app_version"`
 	Signature  string `json:"signature"`
 	Nonce      string `json:"nonce"`
@@ -125,14 +125,15 @@ type TransferAnswerPayload struct {
 	Accepted     bool                 `json:"accepted"`
 	RejectReason string               `json:"reject_reason,omitempty"`
 	ResumedItems []ResumedItemPayload `json:"resumed_items,omitempty"`
+	Token        string               `json:"token,omitempty"`
 }
 
 // TransferFailurePayload reports an unrecoverable failure.
 type TransferFailurePayload struct {
-	SessionID        string `json:"session_id"`
-	ErrorCode        string `json:"error_code"`
-	ErrorMessage     string `json:"error_message"`
-	FailedItemIndex  uint32 `json:"failed_item_index,omitempty"`
+	SessionID       string `json:"session_id"`
+	ErrorCode       string `json:"error_code"`
+	ErrorMessage    string `json:"error_message"`
+	FailedItemIndex uint32 `json:"failed_item_index,omitempty"`
 }
 
 // ClipboardInjectedPayload is sent when the receiver has loaded the files into clipboard.

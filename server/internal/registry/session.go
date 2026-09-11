@@ -1,7 +1,9 @@
 package registry
 
 import (
+	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -10,14 +12,14 @@ import (
 
 // DeviceSession represents an authenticated active client connection.
 type DeviceSession struct {
-	AccountID   string
-	DeviceID    string
-	Hostname    string
-	OSType      string
-	AppVersion  string
-	RemoteIP    string
-	ConnectedAt time.Time
-	LastPingAt  time.Time
+	AccountID    string
+	DeviceID     string
+	Hostname     string
+	OSType       string
+	AppVersion   string
+	RemoteIP     string
+	ConnectedAt  time.Time
+	lastPingNano atomic.Int64
 
 	ControlWS *websocket.Conn
 	SendChan  chan []byte
@@ -28,7 +30,7 @@ type DeviceSession struct {
 // NewDeviceSession constructs a new DeviceSession.
 func NewDeviceSession(accountID, deviceID, hostname, osType, appVersion, remoteIP string, ws *websocket.Conn) *DeviceSession {
 	now := time.Now()
-	return &DeviceSession{
+	s := &DeviceSession{
 		AccountID:   accountID,
 		DeviceID:    deviceID,
 		Hostname:    hostname,
@@ -36,11 +38,12 @@ func NewDeviceSession(accountID, deviceID, hostname, osType, appVersion, remoteI
 		AppVersion:  appVersion,
 		RemoteIP:    remoteIP,
 		ConnectedAt: now,
-		LastPingAt:  now,
 		ControlWS:   ws,
 		SendChan:    make(chan []byte, 256),
 		Closed:      make(chan struct{}),
 	}
+	s.lastPingNano.Store(now.UnixNano())
+	return s
 }
 
 // Close gracefully closes the session and signals the write pump.
@@ -61,14 +64,19 @@ func (s *DeviceSession) Send(msg []byte) bool {
 	case s.SendChan <- msg:
 		return true
 	default:
-		// Queue full, client is slow
+		slog.Warn("client send channel full, message dropped", "device_id", s.DeviceID)
 		return false
 	}
 }
 
-// TouchPing updates the last heartbeat time.
+// TouchPing updates the last heartbeat time atomically.
 func (s *DeviceSession) TouchPing(now time.Time) {
-	s.LastPingAt = now
+	s.lastPingNano.Store(now.UnixNano())
+}
+
+// GetLastPing returns the last heartbeat time.
+func (s *DeviceSession) GetLastPing() time.Time {
+	return time.Unix(0, s.lastPingNano.Load())
 }
 
 // ToOnlineDevice converts session into public protocol model.

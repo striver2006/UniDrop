@@ -1,4 +1,5 @@
 pub mod notification;
+pub use notification::show_transfer_notification;
 
 #[cfg(target_os = "windows")]
 pub mod clipboard_windows;
@@ -37,3 +38,10 @@ pub fn inject_files_to_clipboard(paths: &[PathBuf]) -> Result<(), String> {
     #[allow(unreachable_code)]
     Err("Unsupported platform for native clipboard injection".into())
 }
+
+#[cfg(target_os = "macos")]
+pub use listener_macos::start_clipboard_listener;
+#[cfg(target_os = "windows")]
+pub use listener_windows::start_clipboard_listener;
+#[cfg(target_os = "linux")]
+pub use listener_linux::start_clipboard_listener;

@@ -1,17 +1,17 @@
-use std::sync::Arc;
 use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-use crate::protocol::{ActionType, AuthRequestPayload, ControlEnvelope};
+use crate::protocol::{ActionType, AuthChallengePayload, AuthRequestPayload, AuthResponsePayload, ControlEnvelope};
 
 type HmacSha256 = Hmac<Sha256>;
 
+#[derive(Debug, Clone)]
 pub struct ConnectionConfig {
     pub server_url: String, // e.g. "ws://127.0.0.1:8080"
     pub account_id: String,
@@ -24,36 +24,35 @@ pub struct ConnectionConfig {
 
 pub struct ConnectionActor {
     config: ConnectionConfig,
-    #[allow(dead_code)]
-    outgoing_tx: mpsc::Sender<ControlEnvelope>,
-    #[allow(dead_code)]
-    incoming_rx: Arc<Mutex<mpsc::Receiver<ControlEnvelope>>>,
+    outgoing_rx: mpsc::Receiver<ControlEnvelope>,
 }
 
 impl ConnectionActor {
-    pub fn new(config: ConnectionConfig) -> (Self, mpsc::Sender<ControlEnvelope>, mpsc::Receiver<ControlEnvelope>) {
+    pub fn new(config: ConnectionConfig) -> (Self, mpsc::Sender<ControlEnvelope>) {
         let (out_tx, out_rx) = mpsc::channel(128);
-        let (_in_tx, in_rx) = mpsc::channel(128);
 
         let actor = Self {
             config,
-            outgoing_tx: out_tx.clone(),
-            incoming_rx: Arc::new(Mutex::new(out_rx)),
+            outgoing_rx: out_rx,
         };
 
-        (actor, out_tx, in_rx)
+        (actor, out_tx)
     }
 
-    /// Generates canonical signature: "UNIDROP_V1\n{account_id}\n{device_id}\n{nonce}\n{timestamp_ms}"
-    pub fn compute_signature(secret: &str, account_id: &str, device_id: &str, nonce: &str, timestamp: i64) -> String {
-        let canonical = format!("UNIDROP_V1\n{}\n{}\n{}\n{}", account_id, device_id, nonce, timestamp);
+    /// Generates canonical signature: "UNIDROP_V1\n{account_id}\n{device_id}\n{nonce}\n{timestamp_ms}\n{nonce_salt}"
+    pub fn compute_signature(secret: &str, account_id: &str, device_id: &str, nonce: &str, timestamp: i64, nonce_salt: &str) -> String {
+        let canonical = if nonce_salt.is_empty() {
+            format!("UNIDROP_V1\n{}\n{}\n{}\n{}", account_id, device_id, nonce, timestamp)
+        } else {
+            format!("UNIDROP_V1\n{}\n{}\n{}\n{}\n{}", account_id, device_id, nonce, timestamp, nonce_salt)
+        };
         let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC can take key of any size");
         mac.update(canonical.as_bytes());
         hex::encode(mac.finalize().into_bytes())
     }
 
     /// Background loop with exponential backoff and jitter.
-    pub async fn run(self, incoming_tx: mpsc::Sender<ControlEnvelope>) {
+    pub async fn run(mut self, incoming_tx: mpsc::Sender<ControlEnvelope>) {
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(30);
 
@@ -69,11 +68,18 @@ impl ConnectionActor {
                     let (mut write, mut read) = ws_stream.split();
 
                     // 1. Wait for AUTH_CHALLENGE
+                    let mut authed = false;
+                    let mut auth_rejected = false;
                     if let Some(Ok(Message::Text(text))) = read.next().await {
                         if let Ok(env) = serde_json::from_str::<ControlEnvelope>(&text) {
                             if env.action == ActionType::AUTH_CHALLENGE {
-                                // 2. Send AUTH_REQUEST
-                                let now = chrono_now_ms();
+                                let challenge = serde_json::from_value::<AuthChallengePayload>(env.payload).unwrap_or(AuthChallengePayload {
+                                    nonce_salt: String::new(),
+                                    server_time: 0,
+                                });
+
+                                // 2. Send AUTH_REQUEST with NonceSalt binding (P2-1)
+                                let now = current_time_ms();
                                 let nonce = Uuid::new_v4().to_string();
                                 let sig = Self::compute_signature(
                                     &self.config.psk_secret,
@@ -81,6 +87,7 @@ impl ConnectionActor {
                                     &self.config.device_id,
                                     &nonce,
                                     now,
+                                    &challenge.nonce_salt,
                                 );
 
                                 let auth_payload = AuthRequestPayload {
@@ -104,12 +111,41 @@ impl ConnectionActor {
                                     payload: serde_json::to_value(auth_payload).unwrap(),
                                 };
 
-                                let _ = write.send(Message::Text(serde_json::to_string(&auth_env).unwrap())).await;
+                                if write.send(Message::Text(serde_json::to_string(&auth_env).unwrap())).await.is_ok() {
+                                    // 3. Wait for AUTH_RESPONSE and check result (P0-4)
+                                    if let Some(Ok(Message::Text(resp_text))) = read.next().await {
+                                        if let Ok(resp_env) = serde_json::from_str::<ControlEnvelope>(&resp_text) {
+                                            if resp_env.action == ActionType::AUTH_RESPONSE {
+                                                if let Ok(resp_payload) = serde_json::from_value::<AuthResponsePayload>(resp_env.payload.clone()) {
+                                                    if resp_payload.success {
+                                                        authed = true;
+                                                        let _ = incoming_tx.send(resp_env).await;
+                                                    } else {
+                                                        log::error!("Authentication failed: {:?}", resp_payload.error_message);
+                                                        auth_rejected = true;
+                                                        let _ = incoming_tx.send(resp_env).await;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
 
-                    // 3. Heartbeat & Forwarding loop
+                    if !authed {
+                        if auth_rejected {
+                            log::warn!("Authentication rejected by server (invalid credentials). Backing off for 30s before retry (N9).");
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                        } else {
+                            log::warn!("Authentication handshake unsuccessful, disconnecting");
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                        }
+                        continue;
+                    }
+
+                    // 4. Heartbeat & Forwarding loop (P0-2: consume outgoing_rx and forward to websocket)
                     let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
                     loop {
                         tokio::select! {
@@ -120,10 +156,24 @@ impl ConnectionActor {
                                     action: ActionType::HEARTBEAT_PING,
                                     from_device: self.config.device_id.clone(),
                                     to_device: None,
-                                    timestamp: chrono_now_ms(),
+                                    timestamp: current_time_ms(),
                                     payload: serde_json::Value::Null,
                                 };
                                 if write.send(Message::Text(serde_json::to_string(&ping_env).unwrap())).await.is_err() {
+                                    break;
+                                }
+                            }
+
+                            Some(env) = self.outgoing_rx.recv() => {
+                                let text = match serde_json::to_string(&env) {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        log::error!("failed to serialize outgoing envelope: {}", e);
+                                        continue;
+                                    }
+                                };
+                                if let Err(e) = write.send(Message::Text(text)).await {
+                                    log::warn!("failed to send outgoing message to server: {}", e);
                                     break;
                                 }
                             }
@@ -154,7 +204,7 @@ impl ConnectionActor {
     }
 }
 
-fn chrono_now_ms() -> i64 {
+pub fn current_time_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

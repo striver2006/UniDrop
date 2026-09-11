@@ -70,6 +70,23 @@ impl CacheManager {
         Ok(())
     }
 
+    /// Returns all file paths registered for a given session_id.
+    pub async fn get_session_files(&self, session_id: &str) -> Result<Vec<PathBuf>, String> {
+        let conn = self.db_conn.lock().await;
+        let mut stmt = conn
+            .prepare("SELECT file_path FROM cache_entries WHERE session_id = ?1")
+            .map_err(|e| e.to_string())?;
+        let paths: Vec<PathBuf> = stmt
+            .query_map([session_id], |row| {
+                let s: String = row.get(0)?;
+                Ok(PathBuf::from(s))
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(paths)
+    }
+
     /// Registers a newly written file entry in the cache database.
     pub async fn register_entry(&self, file_path: &Path, session_id: &str, file_size: i64) -> Result<(), String> {
         let path_str = file_path.to_str().ok_or("invalid UTF-8 in file path")?;
@@ -83,12 +100,11 @@ impl CacheManager {
         Ok(())
     }
 
-    /// Scans cache, purging expired files (>24h) and enforcing LRU quota (<10GB) while respecting 2h clipboard lock.
+    /// Scans cache, purging expired files (>24h) and enforcing LRU quota (<10GB) while respecting 2h clipboard lock (P1-9, P3-3).
     pub async fn sweep_expired_and_lru(&self) -> Result<usize, String> {
         let conn = self.db_conn.lock().await;
 
-        // 1. Query files eligible for TTL eviction:
-        // older than 24 hours AND (no clipboard lock OR clipboard lock > 2 hours ago)
+        // 1. Query files eligible for TTL eviction (>24h and no active clipboard lock)
         let mut stmt = conn.prepare(
             "SELECT file_path FROM cache_entries
              WHERE (strftime('%s', 'now') - strftime('%s', created_at)) > 86400
@@ -100,7 +116,6 @@ impl CacheManager {
             .map_err(|e| e.to_string())?
             .filter_map(Result::ok)
             .collect();
-
         drop(stmt);
 
         let mut purged_count = 0;
@@ -111,6 +126,39 @@ impl CacheManager {
             }
             conn.execute("DELETE FROM cache_entries WHERE file_path = ?1", [path_str]).ok();
             purged_count += 1;
+        }
+
+        // 2. Enforce LRU quota: if total cache size > 10GB, evict oldest accessed files down to 8GB
+        let mut total_size_stmt = conn.prepare("SELECT COALESCE(SUM(file_size), 0) FROM cache_entries").map_err(|e| e.to_string())?;
+        let mut current_total: u64 = total_size_stmt.query_row([], |row| row.get(0)).unwrap_or(0);
+        drop(total_size_stmt);
+
+        if current_total > MAX_CACHE_SIZE_BYTES {
+            let mut lru_stmt = conn.prepare(
+                "SELECT file_path, file_size FROM cache_entries
+                 WHERE (clipboard_injected_at IS NULL OR (strftime('%s', 'now') - strftime('%s', clipboard_injected_at)) > 7200)
+                 ORDER BY last_accessed_at ASC"
+            ).map_err(|e| e.to_string())?;
+
+            let lru_entries: Vec<(String, u64)> = lru_stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|e| e.to_string())?
+                .filter_map(Result::ok)
+                .collect();
+            drop(lru_stmt);
+
+            for (path_str, size) in lru_entries {
+                if current_total <= SAFE_LOW_WATERMARK_BYTES {
+                    break;
+                }
+                let p = PathBuf::from(&path_str);
+                if p.exists() {
+                    let _ = fs::remove_file(&p);
+                }
+                conn.execute("DELETE FROM cache_entries WHERE file_path = ?1", [&path_str]).ok();
+                current_total = current_total.saturating_sub(size);
+                purged_count += 1;
+            }
         }
 
         Ok(purged_count)

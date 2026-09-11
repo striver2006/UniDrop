@@ -12,19 +12,22 @@ import (
 	"github.com/unidrop/unidrop-server/internal/auth"
 	"github.com/unidrop/unidrop-server/internal/protocol"
 	"github.com/unidrop/unidrop-server/internal/registry"
+	"github.com/unidrop/unidrop-server/internal/relay"
 )
 
 // ControlWSHandler handles incoming WebSocket connections on /ws/control.
 type ControlWSHandler struct {
-	verifier *auth.Verifier
-	registry *registry.DeviceRegistry
+	verifier     *auth.Verifier
+	registry     *registry.DeviceRegistry
+	relayManager *relay.RelayManager
 }
 
 // NewControlWSHandler creates a new ControlWSHandler.
-func NewControlWSHandler(v *auth.Verifier, reg *registry.DeviceRegistry) *ControlWSHandler {
+func NewControlWSHandler(v *auth.Verifier, reg *registry.DeviceRegistry, rm *relay.RelayManager) *ControlWSHandler {
 	return &ControlWSHandler{
-		verifier: v,
-		registry: reg,
+		verifier:     v,
+		registry:     reg,
+		relayManager: rm,
 	}
 }
 
@@ -43,10 +46,11 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ws.SetReadLimit(512 * 1024)
 
 	// Step 1: Send AUTH_CHALLENGE
-	challengePayload, _ := json.Marshal(protocol.AuthChallengePayload{
+	challengePayloadObj := protocol.AuthChallengePayload{
 		NonceSalt:  uuid.NewString(),
 		ServerTime: time.Now().UnixMilli(),
-	})
+	}
+	challengePayload, _ := json.Marshal(challengePayloadObj)
 	challengeEnv := protocol.ControlEnvelope{
 		Version:   1,
 		TraceID:   uuid.NewString(),
@@ -65,24 +69,27 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	authCancel()
 	if err != nil || msgType != websocket.MessageText {
 		slog.Warn("auth handshake read failed or timed out", "error", err)
+		_ = ws.Close(websocket.StatusPolicyViolation, "auth handshake timed out")
 		return
 	}
 
 	var authEnv protocol.ControlEnvelope
 	if err := json.Unmarshal(authBytes, &authEnv); err != nil || authEnv.Action != protocol.ActionAuthRequest {
 		slog.Warn("invalid auth request envelope")
+		_ = ws.Close(websocket.StatusPolicyViolation, "invalid auth envelope")
 		return
 	}
 
 	var authReq protocol.AuthRequestPayload
 	if err := json.Unmarshal(authEnv.Payload, &authReq); err != nil {
 		slog.Warn("invalid auth payload")
+		_ = ws.Close(websocket.StatusPolicyViolation, "invalid auth payload format")
 		return
 	}
 
-	// Step 3: Verify HMAC Signature and Nonce
+	// Step 3: Verify HMAC Signature with challenge NonceSalt (P2-1)
 	now := time.Now()
-	if err := h.verifier.Verify(&authReq, now); err != nil {
+	if err := h.verifier.VerifyWithSalt(&authReq, now, challengePayloadObj.NonceSalt); err != nil {
 		slog.Warn("auth verification failed", "device", authReq.DeviceID, "error", err)
 		respPayload, _ := json.Marshal(protocol.AuthResponsePayload{
 			Success:      false,
@@ -97,6 +104,7 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Payload:   respPayload,
 		})
 		_ = ws.Write(ctx, websocket.MessageText, respEnv)
+		_ = ws.Close(websocket.StatusPolicyViolation, "authentication failed")
 		return
 	}
 
@@ -112,22 +120,25 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 	h.registry.Register(session)
 	defer func() {
-		h.registry.Unregister(session.DeviceID)
-		// Broadcast offline event
-		offlinePayload, _ := json.Marshal(protocol.DeviceOfflinePayload{
-			DeviceID: session.DeviceID,
-			Reason:   "connection disconnected",
-		})
-		offlineEnv, _ := json.Marshal(protocol.ControlEnvelope{
-			Version:    1,
-			TraceID:    uuid.NewString(),
-			Action:     protocol.ActionDeviceOffline,
-			FromDevice: session.DeviceID,
-			Timestamp:  time.Now().UnixMilli(),
-			Payload:    offlinePayload,
-		})
-		h.registry.BroadcastToAccount(session.AccountID, session.DeviceID, offlineEnv)
-		slog.Info("device disconnected", "device", session.DeviceID)
+		// P0-5 CAS compare-and-delete: only unregister and broadcast if active session is this exact instance
+		if h.registry.UnregisterSession(session) {
+			offlinePayload, _ := json.Marshal(protocol.DeviceOfflinePayload{
+				DeviceID: session.DeviceID,
+				Reason:   "connection disconnected",
+			})
+			offlineEnv, _ := json.Marshal(protocol.ControlEnvelope{
+				Version:    1,
+				TraceID:    uuid.NewString(),
+				Action:     protocol.ActionDeviceOffline,
+				FromDevice: session.DeviceID,
+				Timestamp:  time.Now().UnixMilli(),
+				Payload:    offlinePayload,
+			})
+			h.registry.BroadcastToAccount(session.AccountID, session.DeviceID, offlineEnv)
+			slog.Info("device disconnected", "device", session.DeviceID)
+		} else {
+			slog.Info("old session disconnected, superseded by newer session", "device", session.DeviceID)
+		}
 	}()
 
 	slog.Info("device authenticated", "device", session.DeviceID, "account", session.AccountID, "os", session.OSType)
@@ -234,27 +245,81 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			})
 			session.Send(pongEnv)
 
-		case protocol.ActionTransferOffer,
-			protocol.ActionTransferAnswer,
-			protocol.ActionTransferCancel,
-			protocol.ActionTransferFailure,
-			protocol.ActionTransferComplete,
-			protocol.ActionClipboardInjected:
-
+		case protocol.ActionTransferOffer:
 			if env.ToDevice == "" {
 				continue
 			}
-
-			// Route to target peer
-			if targetSession, ok := h.registry.Get(env.ToDevice); ok {
-				// Verify target belongs to same account
-				if targetSession.AccountID == session.AccountID {
-					repacked, _ := json.Marshal(env)
-					targetSession.Send(repacked)
+			// P1-8: Enforce max items per offer limit (<= 1000)
+			var offer protocol.TransferOfferPayload
+			if err := json.Unmarshal(env.Payload, &offer); err == nil {
+				if len(offer.Items) > 1000 {
+					slog.Warn("transfer offer exceeded items limit", "items", len(offer.Items), "device", session.DeviceID)
+					continue
 				}
-			} else {
-				slog.Debug("target device offline for transfer message", "to_device", env.ToDevice)
 			}
+			h.routeToPeer(session, env)
+
+		case protocol.ActionTransferAnswer:
+			if env.ToDevice == "" {
+				continue
+			}
+			// P0-1, P2-7: Authorize session in RelayManager when receiver accepts offer
+			var answer protocol.TransferAnswerPayload
+			if err := json.Unmarshal(env.Payload, &answer); err == nil && answer.Accepted && h.relayManager != nil {
+				token, authErr := h.relayManager.AuthorizeSession(
+					answer.SessionID,
+					env.ToDevice,     // Sender is ToDevice
+					session.DeviceID, // Receiver is current session
+					session.AccountID,
+					5*time.Minute,
+				)
+				if authErr == nil {
+					answer.Token = token
+					env.Payload, _ = json.Marshal(answer)
+					// Echo authorized token back to the receiver as well
+					echoEnv := env
+					echoEnv.ToDevice = session.DeviceID
+					echoBytes, _ := json.Marshal(echoEnv)
+					session.Send(echoBytes)
+				}
+			}
+			h.routeToPeer(session, env)
+
+		case protocol.ActionTransferComplete,
+			protocol.ActionTransferFailure,
+			protocol.ActionTransferCancel:
+			// P2-12: Proactively clean up relay pipe and auth session
+			if h.relayManager != nil {
+				var termPayload struct {
+					SessionID string `json:"session_id"`
+				}
+				if err := json.Unmarshal(env.Payload, &termPayload); err == nil && termPayload.SessionID != "" {
+					h.relayManager.RemovePipe(termPayload.SessionID)
+				}
+			}
+			h.routeToPeer(session, env)
+
+		case protocol.ActionClipboardInjected:
+			h.routeToPeer(session, env)
 		}
+	}
+}
+
+// routeToPeer routes a control message to target peer and logs drops (P1-1).
+func (h *ControlWSHandler) routeToPeer(session *registry.DeviceSession, env protocol.ControlEnvelope) {
+	if env.ToDevice == "" {
+		return
+	}
+	if targetSession, ok := h.registry.Get(env.ToDevice); ok {
+		if targetSession.AccountID == session.AccountID {
+			repacked, _ := json.Marshal(env)
+			if !targetSession.Send(repacked) {
+				slog.Warn("failed to deliver control message to target peer (queue full)", "action", env.Action, "to_device", env.ToDevice)
+			}
+		} else {
+			slog.Warn("cross-account transfer attempt blocked", "from", session.AccountID, "to_device", env.ToDevice)
+		}
+	} else {
+		slog.Debug("target device offline for transfer message", "action", env.Action, "to_device", env.ToDevice)
 	}
 }

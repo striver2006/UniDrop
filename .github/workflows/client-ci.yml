@@ -36,7 +36,7 @@ jobs:
           pnpm build
 
   check-rust:
-    name: Check Rust Backend
+    name: Test & Build Rust Backend
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -53,3 +53,7 @@ jobs:
       - name: Check Rust Code
         working-directory: client/src-tauri
         run: cargo check
+
+      - name: Run Rust Tests
+        working-directory: client/src-tauri
+        run: cargo test

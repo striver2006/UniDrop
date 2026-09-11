@@ -5,6 +5,8 @@ const MIN_RTO: Duration = Duration::from_millis(500);
 const MAX_RTO: Duration = Duration::from_secs(15);
 const INITIAL_RTO: Duration = Duration::from_millis(1500);
 
+pub const MAX_RETRIES: u32 = 5;
+
 pub struct InFlightChunk {
     pub chunk_index: u32,
     pub sent_at: Instant,
@@ -38,9 +40,17 @@ impl SlidingWindow {
         }
     }
 
-    /// Determines if more chunks can be sent into flight.
-    pub fn can_send(&self, next_chunk: u32) -> bool {
-        next_chunk < self.total_chunks && self.in_flight.len() < self.window_size
+    /// Checks whether any chunk in-flight has exceeded MAX_RETRIES (N5).
+    pub fn has_exceeded_max_retries(&self) -> bool {
+        self.in_flight.values().any(|entry| entry.retries >= MAX_RETRIES)
+    }
+
+    /// Determines whether the next chunk can be sent according to sliding window size.
+    pub fn can_send(&self, chunk_index: u32) -> bool {
+        chunk_index < self.total_chunks
+            && (chunk_index as usize) < (self.base_chunk as usize + self.window_size)
+            && !self.acked.contains_key(&chunk_index)
+            && !self.in_flight.contains_key(&chunk_index)
     }
 
     /// Registers a chunk as sent into flight.
@@ -72,11 +82,14 @@ impl SlidingWindow {
         }
     }
 
-    /// Handles a NACK frame, requesting immediate fast retransmission.
+    /// Handles a NACK frame, requesting immediate fast retransmission (N1 / N5).
     pub fn on_nack(&mut self, chunk_index: u32) -> Option<u32> {
         if let Some(entry) = self.in_flight.get_mut(&chunk_index) {
             entry.retries += 1;
             entry.sent_at = Instant::now();
+            if entry.retries > MAX_RETRIES {
+                return None;
+            }
             return Some(chunk_index);
         }
         None
@@ -89,7 +102,9 @@ impl SlidingWindow {
             if now.duration_since(in_flight.sent_at) > self.rto {
                 in_flight.retries += 1;
                 in_flight.sent_at = now;
-                to_retransmit.push(*idx);
+                if in_flight.retries <= MAX_RETRIES {
+                    to_retransmit.push(*idx);
+                }
             }
         }
 
@@ -121,5 +136,67 @@ impl SlidingWindow {
     /// Returns true if all chunks have been received and verified.
     pub fn is_complete(&self) -> bool {
         self.base_chunk >= self.total_chunks
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sliding_window_progression() {
+        let mut sw = SlidingWindow::new(5, 2);
+        assert!(sw.can_send(0));
+        sw.on_chunk_sent(0);
+
+        assert!(sw.can_send(1));
+        sw.on_chunk_sent(1);
+
+        // Window full (window_size=2)
+        assert!(!sw.can_send(2));
+
+        // ACK chunk 0 -> slides base
+        sw.on_ack(0);
+        assert_eq!(sw.base_chunk, 1);
+        assert!(sw.can_send(2));
+        sw.on_chunk_sent(2);
+
+        // Out of order ACK 2
+        sw.on_ack(2);
+        assert_eq!(sw.base_chunk, 1); // Still waiting for 1
+
+        // ACK 1 -> jumps base to 3
+        sw.on_ack(1);
+        assert_eq!(sw.base_chunk, 3);
+    }
+
+    #[test]
+    fn test_sliding_window_nack_and_timeout() {
+        let mut sw = SlidingWindow::new(3, 2);
+        sw.on_chunk_sent(0);
+
+        // NACK triggers retransmit
+        let nack_ret = sw.on_nack(0);
+        assert_eq!(nack_ret, Some(0));
+
+        // Check timeout
+        let future = Instant::now() + Duration::from_secs(20);
+        let timeouts = sw.check_timeouts(future);
+        assert_eq!(timeouts, vec![0]);
+    }
+
+    #[test]
+    fn test_sliding_window_max_retries() {
+        let mut sw = SlidingWindow::new(2, 2);
+        sw.on_chunk_sent(0);
+
+        for _ in 0..MAX_RETRIES {
+            assert!(!sw.has_exceeded_max_retries());
+            sw.on_nack(0);
+        }
+
+        // Exceeded MAX_RETRIES
+        assert!(sw.has_exceeded_max_retries());
+        assert_eq!(sw.on_nack(0), None);
     }
 }

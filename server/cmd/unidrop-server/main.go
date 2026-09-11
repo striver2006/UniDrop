@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -27,6 +28,9 @@ func main() {
 
 	cfg := config.Load()
 	slog.Info("starting UniDrop Server", "listen", cfg.ListenAddr)
+	if cfg.PSKSecret == "default-insecure-psk-change-me" {
+		slog.Warn("SECURITY WARNING: Running with default insecure PSK secret! Set UNIDROP_PSK_SECRET environment variable for production (P1-3).")
+	}
 
 	verifier, err := auth.NewVerifier(cfg.PSKSecret)
 	if err != nil {
@@ -37,9 +41,12 @@ func main() {
 	devRegistry := registry.NewDeviceRegistry()
 	relayManager := relay.NewRelayManager()
 
-	// Optional STUN service
+	// Optional STUN service with graceful shutdown support (P2-9)
+	var stunCloser io.Closer
 	if cfg.STUNAddr != "" {
-		if err := stun.StartSTUNServer(cfg.STUNAddr); err != nil {
+		var err error
+		stunCloser, err = stun.StartSTUNServerWithCloser(cfg.STUNAddr)
+		if err != nil {
 			slog.Warn("STUN service failed to start", "addr", cfg.STUNAddr, "error", err)
 		}
 	}
@@ -67,7 +74,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", controller.HealthHandler(devRegistry, relayManager))
 	mux.HandleFunc("GET /metrics", controller.MetricsHandler(devRegistry, relayManager))
-	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, devRegistry))
+	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, devRegistry, relayManager))
 	mux.Handle("GET /ws/data", controller.NewDataWSHandler(relayManager))
 
 	server := &http.Server{
@@ -98,6 +105,11 @@ func main() {
 
 	if err := server.Shutdown(ctx); err != nil {
 		slog.Error("forced server shutdown", "error", err)
+	}
+	if stunCloser != nil {
+		if err := stunCloser.Close(); err != nil {
+			slog.Warn("failed to close STUN server cleanly", "error", err)
+		}
 	}
 	slog.Info("server exited gracefully")
 }

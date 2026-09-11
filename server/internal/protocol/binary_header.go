@@ -37,33 +37,33 @@ const (
 type FrameFlags uint32
 
 const (
-	FlagEncrypted FrameFlags = 1 << 0 // Payload is encrypted with E2EE
+	FlagEncrypted  FrameFlags = 1 << 0 // Payload is encrypted with E2EE
 	FlagCompressed FrameFlags = 1 << 1 // Payload is compressed
 	FlagLastChunk  FrameFlags = 1 << 2 // Final chunk of the current item
 )
 
 var (
-	ErrBufferTooSmall    = errors.New("buffer is smaller than the 64-byte header size")
-	ErrInvalidMagic      = errors.New("invalid protocol magic number")
+	ErrBufferTooSmall     = errors.New("buffer is smaller than the 64-byte header size")
+	ErrInvalidMagic       = errors.New("invalid protocol magic number")
 	ErrUnsupportedVersion = errors.New("unsupported protocol version")
-	ErrPayloadTooLarge   = errors.New("payload length exceeds maximum 4MB limit")
-	ErrChecksumMismatch  = errors.New("CRC32 checksum mismatch")
+	ErrPayloadTooLarge    = errors.New("payload length exceeds maximum 4MB limit")
+	ErrChecksumMismatch   = errors.New("CRC32 checksum mismatch")
 )
 
 // BinaryHeader represents the 64-byte fixed frame header.
 type BinaryHeader struct {
-	Magic       uint16    // Offset 0..1
-	Version     uint8     // Offset 2
-	ChunkType   ChunkType // Offset 3
-	SessionID   [16]byte  // Offset 4..19
-	ItemIndex   uint32    // Offset 20..23
-	ChunkIndex  uint32    // Offset 24..27
-	TotalChunks uint32    // Offset 28..31
-	PayloadLen  uint32    // Offset 32..35
-	Checksum    uint32    // Offset 36..39 (CRC32-IEEE)
-	Nonce       [12]byte  // Offset 40..51 (AES-256-GCM 96-bit Nonce)
-	Flags       FrameFlags// Offset 52..55
-	Reserved    [8]byte   // Offset 56..63
+	Magic       uint16     // Offset 0..1
+	Version     uint8      // Offset 2
+	ChunkType   ChunkType  // Offset 3
+	SessionID   [16]byte   // Offset 4..19
+	ItemIndex   uint32     // Offset 20..23
+	ChunkIndex  uint32     // Offset 24..27
+	TotalChunks uint32     // Offset 28..31
+	PayloadLen  uint32     // Offset 32..35
+	Checksum    uint32     // Offset 36..39 (CRC32-IEEE)
+	Nonce       [12]byte   // Offset 40..51 (AES-256-GCM 96-bit Nonce)
+	Flags       FrameFlags // Offset 52..55
+	Reserved    [8]byte    // Offset 56..63
 }
 
 // NewDataHeader creates a standard data chunk header.

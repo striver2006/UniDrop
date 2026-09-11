@@ -75,8 +75,49 @@ pub fn init_database(db_path: Option<PathBuf>) -> Result<Connection, rusqlite::E
             clipboard_injected_at DATETIME,
             last_accessed_at DATETIME DEFAULT CURRENT_TIMESTAMP
         );
+
+        -- 6. Local Config & Device ID Persistence (P1-4, P1-5)
+        CREATE TABLE IF NOT EXISTS local_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
         "#,
     )?;
 
     Ok(conn)
+}
+
+/// Retrieves the existing device_id from SQLite or generates and persists a new one (P1-4).
+pub fn get_or_create_device_id(conn: &Connection) -> Result<String, rusqlite::Error> {
+    let mut stmt = conn.prepare("SELECT value FROM local_config WHERE key = 'device_id'")?;
+    let mut rows = stmt.query([])?;
+    if let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        return Ok(id);
+    }
+    drop(rows);
+    drop(stmt);
+
+    let new_id = uuid::Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO local_config (key, value) VALUES ('device_id', ?1)",
+        [&new_id],
+    )?;
+    Ok(new_id)
+}
+
+/// Retrieves saved settings JSON string if present (P1-5).
+pub fn get_persisted_settings(conn: &Connection) -> Option<String> {
+    let mut stmt = conn.prepare("SELECT value FROM local_config WHERE key = 'app_settings'").ok()?;
+    stmt.query_row([], |row| row.get(0)).ok()
+}
+
+/// Persists settings JSON string into SQLite (P1-5).
+pub fn save_persisted_settings(conn: &Connection, json_val: &str) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT OR REPLACE INTO local_config (key, value, updated_at) VALUES ('app_settings', ?1, CURRENT_TIMESTAMP)",
+        [json_val],
+    )?;
+    Ok(())
 }

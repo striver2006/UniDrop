@@ -57,10 +57,10 @@ func TestDeviceRegistrySweepInactive(t *testing.T) {
 	now := time.Now()
 
 	s1 := NewDeviceSession("user1", "dev1", "PC1", "windows", "1.0.0", "127.0.0.1", nil)
-	s1.LastPingAt = now.Add(-50 * time.Second) // timed out (>45s)
+	s1.TouchPing(now.Add(-50 * time.Second)) // timed out (>45s)
 
 	s2 := NewDeviceSession("user1", "dev2", "PC2", "linux", "1.0.0", "127.0.0.1", nil)
-	s2.LastPingAt = now.Add(-10 * time.Second) // still alive
+	s2.TouchPing(now.Add(-10 * time.Second)) // still alive
 
 	reg.Register(s1)
 	reg.Register(s2)
@@ -72,6 +72,37 @@ func TestDeviceRegistrySweepInactive(t *testing.T) {
 
 	if reg.Count() != 1 {
 		t.Fatalf("expected count 1 after sweep, got %d", reg.Count())
+	}
+}
+
+func TestDeviceRegistryUnregisterSessionCAS(t *testing.T) {
+	reg := NewDeviceRegistry()
+
+	// Old session
+	sOld := NewDeviceSession("user1", "dev1", "PC1", "windows", "1.0.0", "127.0.0.1", nil)
+	reg.Register(sOld)
+
+	// New reconnect session for same deviceID
+	sNew := NewDeviceSession("user1", "dev1", "PC1", "windows", "1.0.0", "127.0.0.1", nil)
+	reg.Register(sNew)
+
+	// Old session exits defer UnregisterSession: should FAIL to delete sNew (P0-5)
+	if reg.UnregisterSession(sOld) {
+		t.Fatal("expected unregister of stale session to fail CAS")
+	}
+
+	// sNew must still be present and alive
+	current, exists := reg.Get("dev1")
+	if !exists || current != sNew {
+		t.Fatal("expected sNew to remain registered")
+	}
+
+	// sNew unregister should succeed
+	if !reg.UnregisterSession(sNew) {
+		t.Fatal("expected sNew unregister to succeed")
+	}
+	if _, exists := reg.Get("dev1"); exists {
+		t.Fatal("expected dev1 to be deleted after sNew unregister")
 	}
 }
 

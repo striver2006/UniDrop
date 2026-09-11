@@ -33,3 +33,35 @@ impl BitmapRepo {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bitmap_repo_crud() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Create table
+        conn.execute(
+            "CREATE TABLE chunk_bitmaps (
+                session_id TEXT NOT NULL,
+                item_index INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                checksum INTEGER NOT NULL,
+                received_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (session_id, item_index, chunk_index)
+            );",
+            [],
+        ).unwrap();
+
+        BitmapRepo::mark_chunk_received(&conn, "sess-1", 0, 0, 12345).unwrap();
+        BitmapRepo::mark_chunk_received(&conn, "sess-1", 0, 1, 67890).unwrap();
+
+        let chunks = BitmapRepo::get_received_chunks(&conn, "sess-1", 0).unwrap();
+        assert_eq!(chunks, vec![0, 1]);
+
+        BitmapRepo::clear_session_bitmaps(&conn, "sess-1").unwrap();
+        let chunks_after = BitmapRepo::get_received_chunks(&conn, "sess-1", 0).unwrap();
+        assert!(chunks_after.is_empty());
+    }
+}

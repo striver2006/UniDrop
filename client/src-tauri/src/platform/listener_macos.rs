@@ -17,6 +17,12 @@ pub fn start_clipboard_listener(tx: mpsc::Sender<ClipboardChangeEvent>) {
             let pboard = unsafe { NSPasteboard::generalPasteboard() };
             let current_count = unsafe { pboard.changeCount() };
 
+            // P3-7: Establish baseline on first loop to avoid broadcasting existing clipboard on startup
+            if last_change_count == -1 {
+                last_change_count = current_count;
+                continue;
+            }
+
             if current_count != last_change_count {
                 last_change_count = current_count;
 

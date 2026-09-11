@@ -5,6 +5,7 @@ pub mod platform;
 pub mod protocol;
 pub mod storage;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem},
@@ -15,39 +16,87 @@ use tokio::sync::{mpsc, Mutex};
 
 use app_state::AppState;
 use core::connection_actor::{ConnectionActor, ConnectionConfig};
-use protocol::{ActionType, DeviceListSyncPayload, DeviceOfflinePayload, DeviceOnlinePayload};
+use core::transfer_engine::TransferEngine;
+use protocol::{
+    ActionType, DeviceListSyncPayload, DeviceOfflinePayload, DeviceOnlinePayload,
+    TransferAnswerPayload, TransferOfferPayload,
+};
 use storage::db::init_database;
 
 pub fn run() {
     env_logger::init();
 
-    // 1. Initialize SQLite local database
+    // 1. Initialize SQLite local database and persistent identity (P1-4, P1-5)
     let db = init_database(None).expect("Failed to initialize SQLite database");
+    let device_id = storage::db::get_or_create_device_id(&db).expect("Failed to get/create device_id");
 
-    // 2. Initialize connection actor channels
+    let initial_settings = if let Some(json_str) = storage::db::get_persisted_settings(&db) {
+        serde_json::from_str::<commands::settings_cmd::AppSettings>(&json_str).unwrap_or_else(|_| {
+            commands::settings_cmd::AppSettings {
+                server_url: "ws://127.0.0.1:8080".to_string(),
+                account_id: "default_user".to_string(),
+                psk_secret: "dev-insecure-psk-secret".to_string(),
+                auto_inject: false,
+                rate_limit_mb: 10,
+            }
+        })
+    } else {
+        commands::settings_cmd::AppSettings {
+            server_url: "ws://127.0.0.1:8080".to_string(),
+            account_id: "default_user".to_string(),
+            psk_secret: "dev-insecure-psk-secret".to_string(),
+            auto_inject: false,
+            rate_limit_mb: 10,
+        }
+    };
+
+    // 2. Initialize connection actor
     let config = ConnectionConfig {
-        server_url: "ws://127.0.0.1:8080".to_string(),
-        account_id: "default_user".to_string(),
-        device_id: uuid::Uuid::new_v4().to_string(),
-        psk_secret: "YOUR_SHARED_SECRET_KEY_HERE".to_string(),
-        hostname: whoami_hostname(),
+        server_url: initial_settings.server_url.clone(),
+        account_id: initial_settings.account_id.clone(),
+        device_id: device_id.clone(),
+        psk_secret: initial_settings.psk_secret.clone(),
+        hostname: app_state::whoami_hostname(),
         os_type: std::env::consts::OS.to_string(),
         app_version: "0.1.0".to_string(),
     };
 
-    let (actor, outgoing_tx, _incoming_rx) = ConnectionActor::new(config);
-    let app_state = AppState::new(Arc::new(Mutex::new(db)), outgoing_tx);
+    let (actor, outgoing_tx) = ConnectionActor::new(config);
+    let app_state = AppState::new(
+        Arc::new(Mutex::new(db)),
+        outgoing_tx.clone(),
+        device_id.clone(),
+        initial_settings.clone(),
+    );
+
     let online_devices_ref = app_state.online_devices.clone();
+    let pending_outbound_ref = app_state.pending_outbound.clone();
+    let cache_manager_ref = app_state.cache_manager.clone();
+    let settings_ref = app_state.settings.clone();
+    let self_device_id = device_id.clone();
+    let current_server_url = initial_settings.server_url.clone();
+
+    // Map to track inbound offers waiting for transfer token
+    let pending_inbound: Arc<Mutex<HashMap<String, (TransferOfferPayload, String)>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let pending_inbound_ref = pending_inbound.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .manage(app_state)
-        .setup(|app| {
+        .setup(move |app| {
             let app_handle = app.handle().clone();
+            let outgoing_tx_actor = outgoing_tx.clone();
+            let app_handle_for_actor = app_handle.clone();
+            let cache_manager_for_actor = cache_manager_ref.clone();
+            let settings_for_actor = settings_ref.clone();
 
             // 3. Spawn Connection Actor in Tokio runtime
             tauri::async_runtime::spawn(async move {
+                let app_handle = app_handle_for_actor;
+                let cache_manager_ref = cache_manager_for_actor;
+                let settings_ref = settings_for_actor;
                 let (internal_tx, mut internal_rx) = mpsc::channel(128);
                 tokio::spawn(actor.run(internal_tx));
 
@@ -77,19 +126,134 @@ pub fn run() {
                             }
                         }
                         ActionType::TRANSFER_OFFER => {
-                            let _ = app_handle.emit("transfer-offer-received", env.payload);
+                            // Receiver received offer: send TRANSFER_ANSWER(accepted=true) back
+                            if let Ok(offer) = serde_json::from_value::<TransferOfferPayload>(env.payload.clone()) {
+                                log::info!("Received TRANSFER_OFFER from {} for session {}", env.from_device, offer.session_id);
+                                let answer = TransferAnswerPayload {
+                                    session_id: offer.session_id.clone(),
+                                    accepted: true,
+                                    reject_reason: None,
+                                    resumed_items: Vec::new(),
+                                    token: None,
+                                };
+
+                                let answer_env = protocol::ControlEnvelope {
+                                    version: 1,
+                                    trace_id: uuid::Uuid::new_v4().to_string(),
+                                    action: ActionType::TRANSFER_ANSWER,
+                                    from_device: self_device_id.clone(),
+                                    to_device: Some(env.from_device.clone()),
+                                    timestamp: core::connection_actor::current_time_ms(),
+                                    payload: serde_json::to_value(&answer).unwrap(),
+                                };
+
+                                pending_inbound_ref.lock().await.insert(offer.session_id.clone(), (offer.clone(), env.from_device.clone()));
+                                let _ = outgoing_tx_actor.send(answer_env).await;
+                                let _ = app_handle.emit("transfer-offer-received", &offer);
+                            }
+                        }
+                        ActionType::TRANSFER_ANSWER => {
+                            if let Ok(answer) = serde_json::from_value::<TransferAnswerPayload>(env.payload) {
+                                if answer.accepted {
+                                    if let Some(token) = answer.token {
+                                        // Check if we are the Sender
+                                        let outbound_entry = {
+                                            let mut pending = pending_outbound_ref.lock().await;
+                                            pending.remove(&answer.session_id)
+                                        };
+
+                                        if let Some((offer, paths)) = outbound_entry {
+                                            log::info!("Starting Sender task for session {}", answer.session_id);
+                                            tokio::spawn(TransferEngine::start_sender_task(
+                                                current_server_url.clone(),
+                                                answer.session_id.clone(),
+                                                token.clone(),
+                                                self_device_id.clone(),
+                                                env.from_device.clone(),
+                                                paths,
+                                                offer,
+                                                outgoing_tx_actor.clone(),
+                                                app_handle.clone(),
+                                            ));
+                                        } else {
+                                            // Check if we are the Receiver (token echo)
+                                            let inbound_entry = {
+                                                let mut pending = pending_inbound_ref.lock().await;
+                                                pending.remove(&answer.session_id)
+                                            };
+
+                                            if let Some((offer, sender_device)) = inbound_entry {
+                                                let auto_inject = {
+                                                    let s = settings_ref.lock().await;
+                                                    s.auto_inject
+                                                };
+                                                log::info!("Starting Receiver task for session {}, auto_inject={}", answer.session_id, auto_inject);
+                                                tokio::spawn(TransferEngine::start_receiver_task(
+                                                    current_server_url.clone(),
+                                                    answer.session_id.clone(),
+                                                    token,
+                                                    sender_device,
+                                                    self_device_id.clone(),
+                                                    offer,
+                                                    cache_manager_ref.clone(),
+                                                    auto_inject,
+                                                    outgoing_tx_actor.clone(),
+                                                    app_handle.clone(),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        ActionType::AUTH_RESPONSE => {
+                            if let Ok(resp) = serde_json::from_value::<protocol::AuthResponsePayload>(env.payload) {
+                                if !resp.success {
+                                    let _ = app_handle.emit("auth-failed", resp.error_message);
+                                }
+                            }
                         }
                         _ => {}
                     }
                 }
             });
 
-            // 4. Build tray menu
+            // 4. Background periodic cache sweep worker (P1-9)
+            let cache_sweep_mgr = cache_manager_ref.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+                loop {
+                    interval.tick().await;
+                    if let Ok(purged) = cache_sweep_mgr.sweep_expired_and_lru().await {
+                        if purged > 0 {
+                            log::info!("Cache cleaner purged {} expired or LRU entries", purged);
+                        }
+                    }
+                }
+            });
+
+            // 5. Start platform clipboard listener (P1-9)
+            #[cfg(target_os = "macos")]
+            {
+                let (clip_tx, mut clip_rx) = mpsc::channel(32);
+                crate::platform::start_clipboard_listener(clip_tx);
+                let app_handle_clip = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    while let Some(event) = clip_rx.recv().await {
+                        if let Some(text) = event.text_content {
+                            log::info!("Clipboard changed (text len: {})", text.len());
+                            let _ = app_handle_clip.emit("clipboard-updated", text);
+                        }
+                    }
+                });
+            }
+
+            // 6. Build tray menu
             let quit_item = MenuItem::with_id(app, "quit", "退出 UniDrop", true, None::<&str>)?;
             let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
 
-            // 5. Setup system tray icon and click handling
+            // 7. Setup system tray icon and click handling
             let _tray = TrayIconBuilder::new()
                 .menu(&tray_menu)
                 .on_menu_event(|app, event| match event.id.as_ref() {
@@ -136,10 +300,4 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running UniDrop application");
-}
-
-fn whoami_hostname() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "localhost".to_string())
 }

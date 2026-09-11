@@ -7,11 +7,28 @@ use crate::platform::inject_files_to_clipboard;
 use crate::protocol::{ActionType, ControlEnvelope};
 
 #[tauri::command]
-pub async fn cmd_inject_files(state: State<'_, AppState>, session_id: String, paths: Vec<String>) -> Result<(), String> {
-    let path_bufs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-    inject_files_to_clipboard(&path_bufs)?;
+pub async fn cmd_inject_files(
+    state: State<'_, AppState>,
+    session_id: String,
+    paths: Option<Vec<String>>,
+) -> Result<(), String> {
+    let path_bufs: Vec<PathBuf> = match paths {
+        Some(p) if !p.is_empty() => p.into_iter().map(PathBuf::from).collect(),
+        _ => state.cache_manager.get_session_files(&session_id).await?,
+    };
 
-    // Mark 2h immunity lock
+    if path_bufs.is_empty() {
+        return Err(format!("No files found to inject for session {}", session_id));
+    }
+
+    // P1-10: Execute synchronous clipboard FFI in spawn_blocking
+    tokio::task::spawn_blocking(move || {
+        inject_files_to_clipboard(&path_bufs)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    // Mark 2h immunity lock (M2)
     state.cache_manager.mark_clipboard_injected(&session_id).await?;
 
     Ok(())
@@ -26,12 +43,15 @@ pub async fn cmd_send_files(state: State<'_, AppState>, target_device: String, p
     let path_bufs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
     let session_id = Uuid::new_v4();
 
-    // 1. Prepare offer
-    let offer_payload = TransferEngine::prepare_offer(session_id, &path_bufs)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64;
+    // 1. Prepare offer in spawn_blocking (P1-10: prevent hashing from blocking Tokio worker)
+    let paths_for_hash = path_bufs.clone();
+    let (offer_payload, valid_paths) = tokio::task::spawn_blocking(move || {
+        TransferEngine::prepare_offer(session_id, &paths_for_hash)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let now = crate::core::connection_actor::current_time_ms();
 
     // 2. Build TRANSFER_OFFER envelope
     let offer_env = ControlEnvelope {
@@ -44,7 +64,13 @@ pub async fn cmd_send_files(state: State<'_, AppState>, target_device: String, p
         payload: serde_json::to_value(&offer_payload).map_err(|e| e.to_string())?,
     };
 
-    // 3. Dispatch into outgoing channel
+    // Store in pending_outbound for when receiver responds with TRANSFER_ANSWER (R2 / N2: 1:1 aligned)
+    {
+        let mut pending = state.pending_outbound.lock().await;
+        pending.insert(session_id.to_string(), (offer_payload, valid_paths));
+    }
+
+    // 3. Dispatch into outgoing channel (P0-2: now actively read and sent)
     state.outgoing_tx.send(offer_env).await.map_err(|e| e.to_string())?;
 
     Ok(session_id.to_string())
