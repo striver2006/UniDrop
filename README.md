@@ -94,7 +94,8 @@
 ├── docker-compose.yml              # 容器化部署编排配置
 └── docs/                           # 官方文档、手册与设计规范
     ├── INSTALL.md                  # 客户端安装与权限配置手册
-    ├── DEPLOY.md                   # 服务端部署与运维手册
+    ├── DEPLOY.md                   # 服务端通用部署与运维手册
+    ├── DEPLOY_ALIBABA_CLOUD.md     # 阿里云 ECS (Alinux) 非标端口生产实战手册
     ├── USER_GUIDE.md               # 客户端使用与排障手册
     ├── design/                     # 系统需求规格与底层架构设计说明书
     │   ├── REQUIREMENTS.md         # 需求规格说明书 (PRD)
@@ -146,6 +147,7 @@ pnpm tauri build
 ### 🚀 用户与运维手册
 * [客户端安装手册 (INSTALL.md)](./docs/INSTALL.md) - macOS / Windows / Linux 安装与权限配置指南
 * [服务端部署运维手册 (DEPLOY.md)](./docs/DEPLOY.md) - Docker、Systemd、Nginx 反代与监控方案
+* [阿里云公网部署实战指南 (DEPLOY_ALIBABA_CLOUD.md)](./docs/DEPLOY_ALIBABA_CLOUD.md) - Alibaba Cloud Linux + 非标端口 + WSS 生产实战
 * [客户端用户使用手册 (USER_GUIDE.md)](./docs/USER_GUIDE.md) - 首次配对、设备发现、文件发送与剪贴板无感粘贴
 
 ### 📐 架构设计与审核演进
