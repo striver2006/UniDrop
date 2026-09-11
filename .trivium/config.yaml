@@ -1,0 +1,161 @@
+# TriviumCode 项目配置（进 Git，团队共享）
+# 本机绝对路径与探针结论在 config.local.yaml（不进 Git）
+# verify.build / verify.test 只执行此处显式声明的命令——编排器不猜测执行（§14.1）
+
+schema: trivium.config.v1
+archive_root: .reviews
+topic:
+  max_len: 64
+  forbid_chars:
+    - /
+    - \
+    - ..
+    - " "
+runtime:
+  node: null
+  run_root: ~/.trivium/runs
+isolation:
+  peer_artifact_globs:
+    - "**/*-gemini.md"
+    - "**/*-glm.md"
+  deny_via_cli: auto
+  context_max_docs: 12
+review:
+  parallel: true
+  failure_policy: strict
+  allow_single_flag: true
+  timeout_s:
+    plan: 900
+    code: 1200
+    bug: 1200
+  wait_timeout_s: 540
+  heartbeat_stale_s: 120
+  retry:
+    transient_max: 1
+  cache: false
+  min_tool_calls:
+    plan: 5
+    code: 5
+    bug: 5
+  min_project_reads:
+    plan: 3
+    code: 3
+    bug: 3
+  on_drift: warn
+  on_drift_related: fail
+  sensitive_globs:
+    - .env*
+    - "**/*.pem"
+    - "**/*.key"
+    - "**/id_rsa*"
+  block_severities:
+    - blocker
+    - major
+  skip_doc_only_review: false
+  skip_globs:
+    - "**/*.md"
+    - docs/**
+    - "**/*.txt"
+  never_skip_globs:
+    - "**/package.json"
+    - "**/pubspec.yaml"
+    - "**/Cargo.toml"
+    - "**/requirements*.txt"
+    - .github/**
+    - .gitlab-ci.yml
+    - Dockerfile
+    - .claude/**
+    - .trivium/**
+critics:
+  gemini:
+    vendor: antigravity
+    bin: null
+    agent: trivium-critic
+    effort:
+      plan: high
+      code: medium
+      bug: high
+    readonly_commands:
+      - git log
+      - git blame
+      - git diff
+      - git show
+      - git status
+      - ls
+      - cat
+      - head
+      - tail
+      - grep
+      - rg
+      - find
+      - wc
+  glm:
+    vendor: zcode
+    entry: null
+    max_turns: 40
+    unsupported_override: reject
+profiles:
+  default:
+    gemini:
+      plan: gemini-3.1-pro-high
+      code: gemini-3.8-flash-high
+      bug: gemini-3.1-pro-high
+    glm:
+      plan: GLM-5.3
+      code: GLM-5.3-Flash
+      bug: GLM-5.3
+  architecture:
+    gemini:
+      plan: gemini-3.1-pro-high
+      code: gemini-3.1-pro-high
+      bug: gemini-3.1-pro-high
+      effort: high
+    glm:
+      plan: GLM-5.3
+      code: GLM-5.3
+      bug: GLM-5.3
+  hotfix:
+    gemini:
+      plan: gemini-3.8-flash-low
+      code: gemini-3.8-flash-low
+      bug: gemini-3.8-flash-low
+    glm:
+      plan: GLM-5.3-Flash
+      code: GLM-5.3-Flash
+      bug: GLM-5.3-Flash
+  security:
+    gemini:
+      plan: gemini-3.1-pro-high
+      code: gemini-3.1-pro-high
+      bug: gemini-3.1-pro-high
+      effort: high
+    glm:
+      plan: GLM-5.3
+      code: GLM-5.3
+      bug: GLM-5.3
+active_profile: default
+gate:
+  require_adjudication: true
+  allow_defer: true
+  block_business_write_when_awaiting_approval: true
+  approval_lock_scope: session
+  approval_lock_ttl_h: 24
+  block_commit: true
+  stop_hook_max_blocks: 2
+  max_check_retries: 3
+  reason_policy: warn
+  joint_blocker_policy: warn
+preflight:
+  auth_cache_ttl_h: 1
+verify:
+  # monorepo：cwd 固定为项目根，且每条命令是独立的 /bin/sh -c 进程，
+  # 因此每条都必须自带 cd（前一条的 cd 不会累积到下一条）。
+  build:
+    - cd client && pnpm build
+    - cd server && go build ./...
+  test:
+    # client 侧目前没有任何测试脚本，test 组只覆盖 server。
+    - cd server && go test ./...
+retention:
+  run_dir_days: 30
+probe_ttl_days: 7
