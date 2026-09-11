@@ -1,6 +1,6 @@
-# UniDrop 服务端部署与运维手册 (Deployment & Operations Guide)
+# 瞬贴 (UniDrop) 服务端部署与运维手册 (Deployment & Operations Guide)
 
-本文档面向系统管理员与运维工程师，详细说明 UniDrop 公网中继服务（`unidrop-server`）的架构配置、容器化与原生系统服务部署、反向代理（SSL/WSS 终止）、安全加固以及监控运维方案。
+本文档面向系统管理员与运维工程师，详细说明“瞬贴 (UniDrop)”公网中继服务（`unidrop-server`）的架构配置、容器化与原生系统服务部署、反向代理（SSL/WSS 终止）、安全加固以及监控运维方案。
 
 ---
 

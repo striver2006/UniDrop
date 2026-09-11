@@ -1,4 +1,4 @@
-<h1 align="center">UniDrop (UniClip)</h1>
+<h1 align="center">瞬贴 (UniDrop)</h1>
 
 <p align="center">
   <strong>无缝、高效、安全的跨平台剪贴板与文件流转系统</strong><br>

@@ -1,6 +1,6 @@
-# UniDrop 客户端安装手册 (Installation Guide)
+# 瞬贴 (UniDrop) 客户端安装手册 (Installation Guide)
 
-本文档旨在指导终端用户与研发测试人员在各类桌面操作系统（macOS、Windows、Linux）上正确安装、配置系统权限并成功运行 UniDrop 客户端。
+本文档旨在指导终端用户与研发测试人员在各类桌面操作系统（macOS、Windows、Linux）上正确安装、配置系统权限并成功运行“瞬贴 (UniDrop)”客户端。
 
 ---
 

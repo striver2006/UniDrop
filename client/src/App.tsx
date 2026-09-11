@@ -154,7 +154,8 @@ export const App: React.FC = () => {
           </div>
           <div data-tauri-drag-region>
             <h1 className="text-sm font-semibold text-slate-100 flex items-center space-x-1.5 pointer-events-none">
-              <span>UniDrop</span>
+              <span>瞬贴</span>
+              <span className="text-[11px] text-slate-400 font-normal">UniDrop</span>
               <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-teal-500/20 text-teal-300 font-normal">
                 v0.1.0
               </span>

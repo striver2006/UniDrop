@@ -249,7 +249,7 @@ pub fn run() {
             }
 
             // 6. Build tray menu
-            let quit_item = MenuItem::with_id(app, "quit", "退出 UniDrop", true, None::<&str>)?;
+            let quit_item = MenuItem::with_id(app, "quit", "退出 瞬贴 (UniDrop)", true, None::<&str>)?;
             let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
 
