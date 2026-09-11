@@ -17,9 +17,10 @@
         "height": 560,
         "resizable": false,
         "decorations": false,
+        "center": true,
         "alwaysOnTop": true,
-        "visible": false,
-        "skipTaskbar": true
+        "visible": true,
+        "skipTaskbar": false
       }
     ],
     "trayIcon": {

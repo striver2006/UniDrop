@@ -296,6 +296,11 @@ pub fn run() {
                 })
                 .build(app)?;
 
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -306,6 +311,14 @@ pub fn run() {
             commands::cmd_get_settings,
             commands::cmd_save_settings,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running UniDrop application");
+        .build(tauri::generate_context!())
+        .expect("error while building UniDrop application")
+        .run(|app_handle, event| {
+            if let tauri::RunEvent::Reopen { .. } = event {
+                if let Some(win) = app_handle.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+            }
+        });
 }

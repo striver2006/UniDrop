@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import {
   Settings,
   RefreshCw,
@@ -197,6 +198,16 @@ export const App: React.FC = () => {
           >
             <Settings className="w-3.5 h-3.5 text-teal-400" />
             <span>偏好设置</span>
+          </button>
+          <button
+            onClick={() => {
+              const win = getCurrentWebviewWindow();
+              win.hide();
+            }}
+            className="p-1 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition ml-0.5"
+            title="隐藏窗口 (保持后台常驻)"
+          >
+            <X className="w-4 h-4" />
           </button>
         </div>
       </header>
