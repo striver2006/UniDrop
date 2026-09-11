@@ -116,6 +116,8 @@ pub fn write_image_to_clipboard(png: &[u8]) -> Result<(), String> {
 
 /// Minimal percent-decoding for file:// URIs ("%20" -> " ", ...). Returns None
 /// on malformed escape sequences so callers can skip the URI.
+// Only the macOS/Linux clipboard backends parse file URIs; Windows reads CF_HDROP directly.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub(crate) fn percent_decode(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -135,6 +137,7 @@ pub(crate) fn percent_decode(s: &str) -> Option<String> {
 }
 
 /// Extracts a filesystem path from a "file://host/path" URI string.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub(crate) fn path_from_file_uri(uri: &str) -> Option<String> {
     let rest = uri.strip_prefix("file://")?;
     let rest = rest.strip_prefix("localhost").unwrap_or(rest);
