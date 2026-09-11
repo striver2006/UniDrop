@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { X, Save, Shield } from "lucide-react";
 import { AppSettings } from "../types";
 
@@ -11,6 +11,10 @@ interface SettingsModalProps {
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, onClose, onSave }) => {
   const [form, setForm] = useState<AppSettings>(settings);
+
+  useEffect(() => {
+    setForm(settings);
+  }, [settings, isOpen]);
 
   if (!isOpen) return null;
 

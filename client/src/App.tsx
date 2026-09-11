@@ -17,11 +17,19 @@ import { TransferProgress } from "./components/TransferProgress";
 import { SettingsModal } from "./components/SettingsModal";
 import { SendModal } from "./components/SendModal";
 
+const defaultSettings: AppSettings = {
+  server_url: "ws://127.0.0.1:8080",
+  account_id: "default_user",
+  psk_secret: "dev-insecure-psk-secret",
+  auto_inject: false,
+  rate_limit_mb: 10,
+};
+
 export const App: React.FC = () => {
   const [selfDevice, setSelfDevice] = useState<OnlineDevice | null>(null);
   const [devices, setDevices] = useState<OnlineDevice[]>([]);
   const [transfers, setTransfers] = useState<ActiveTransfer[]>([]);
-  const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [settings, setSettings] = useState<AppSettings>(defaultSettings);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [selectedDeviceForSend, setSelectedDeviceForSend] = useState<OnlineDevice | null>(null);
@@ -99,11 +107,17 @@ export const App: React.FC = () => {
       showNotification(`收到传输请求: ${payload.items?.length || 1} 个文件`, "info");
     });
 
+    // 5. Listen for open-settings event from system tray
+    const unlistenSettingsPromise = listen("open-settings", () => {
+      setIsSettingsOpen(true);
+    });
+
     return () => {
       unlistenDevicesPromise.then((unlisten) => unlisten());
       unlistenAuthPromise.then((unlisten) => unlisten());
       unlistenProgressPromise.then((unlisten) => unlisten());
       unlistenOfferPromise.then((unlisten) => unlisten());
+      unlistenSettingsPromise.then((unlisten) => unlisten());
     };
   }, []);
 
@@ -166,7 +180,7 @@ export const App: React.FC = () => {
           </div>
         </div>
 
-        <div className="flex items-center space-x-1 cursor-default">
+        <div className="flex items-center space-x-1.5 cursor-default">
           <button
             onClick={fetchInitialData}
             className={`p-1.5 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition ${
@@ -178,10 +192,11 @@ export const App: React.FC = () => {
           </button>
           <button
             onClick={() => setIsSettingsOpen(true)}
-            className="p-1.5 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition"
+            className="flex items-center space-x-1 px-2.5 py-1 rounded-lg bg-slate-800/90 hover:bg-slate-700/90 border border-slate-700/70 text-slate-200 hover:text-teal-300 transition text-xs font-medium shadow-sm"
             title="偏好设置"
           >
-            <Settings className="w-4 h-4" />
+            <Settings className="w-3.5 h-3.5 text-teal-400" />
+            <span>偏好设置</span>
           </button>
         </div>
       </header>

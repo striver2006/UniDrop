@@ -250,8 +250,9 @@ pub fn run() {
 
             // 6. Build tray menu
             let quit_item = MenuItem::with_id(app, "quit", "退出 瞬贴 (UniDrop)", true, None::<&str>)?;
+            let settings_item = MenuItem::with_id(app, "settings", "偏好设置...", true, None::<&str>)?;
             let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+            let tray_menu = Menu::with_items(app, &[&show_item, &settings_item, &quit_item])?;
 
             // 7. Setup system tray icon and click handling
             let _tray = TrayIconBuilder::new()
@@ -264,6 +265,13 @@ pub fn run() {
                         if let Some(win) = app.get_webview_window("main") {
                             let _ = win.show();
                             let _ = win.set_focus();
+                        }
+                    }
+                    "settings" => {
+                        if let Some(win) = app.get_webview_window("main") {
+                            let _ = win.show();
+                            let _ = win.set_focus();
+                            let _ = win.emit("open-settings", ());
                         }
                     }
                     _ => {}
