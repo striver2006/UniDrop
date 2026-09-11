@@ -78,10 +78,15 @@ export const App: React.FC = () => {
       setAuthError(null); // Devices updated implies successful authentication
     });
 
-    // 2. Listen for auth failure events
+    // 2. Listen for auth events
     const unlistenAuthPromise = listen<string>("auth-failed", (event) => {
       setAuthError(event.payload);
       showNotification(`身份验证失败: ${event.payload}`, "error");
+    });
+
+    const unlistenAuthSuccessPromise = listen("auth-success", () => {
+      setAuthError(null);
+      showNotification("安全鉴权成功，已连接中继服务器", "success");
     });
 
     // 3. Listen for transfer progress updates (both outbound and inbound)
@@ -119,6 +124,7 @@ export const App: React.FC = () => {
     return () => {
       unlistenDevicesPromise.then((unlisten) => unlisten());
       unlistenAuthPromise.then((unlisten) => unlisten());
+      unlistenAuthSuccessPromise.then((unlisten) => unlisten());
       unlistenProgressPromise.then((unlisten) => unlisten());
       unlistenOfferPromise.then((unlisten) => unlisten());
       unlistenSettingsPromise.then((unlisten) => unlisten());
@@ -130,7 +136,10 @@ export const App: React.FC = () => {
       await invoke("cmd_save_settings", { newSettings });
       setSettings(newSettings);
       setAuthError(null);
-      showNotification("设置已保存并持久化，重启客户端后新配置生效", "success");
+      showNotification("配置已保存并即时生效，正在重连中继服务器...", "success");
+      setTimeout(() => {
+        fetchInitialData();
+      }, 300);
     } catch (err: any) {
       console.error("save settings error:", err);
       showNotification(typeof err === "string" ? err : "保存设置失败", "error");

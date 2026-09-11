@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use rusqlite::Connection;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 
 use crate::commands::settings_cmd::AppSettings;
 use crate::core::cache_manager::CacheManager;
+use crate::core::connection_actor::ConnectionConfig;
 use crate::core::transfer_engine::TransferEngine;
 use crate::protocol::{ControlEnvelope, OnlineDevice, TransferOfferPayload};
 
@@ -21,6 +22,8 @@ pub struct AppState {
     pub settings: Arc<Mutex<AppSettings>>,
     pub outgoing_tx: mpsc::Sender<ControlEnvelope>,
     pub pending_outbound: Arc<Mutex<HashMap<String, (TransferOfferPayload, Vec<PathBuf>)>>>,
+    pub config_actor: Arc<RwLock<ConnectionConfig>>,
+    pub reconnect_notify: Arc<Notify>,
 }
 
 impl AppState {
@@ -29,6 +32,8 @@ impl AppState {
         outgoing_tx: mpsc::Sender<ControlEnvelope>,
         device_id: String,
         initial_settings: AppSettings,
+        config_actor: Arc<RwLock<ConnectionConfig>>,
+        reconnect_notify: Arc<Notify>,
     ) -> Self {
         let cache_manager = CacheManager::new(db_conn.clone()).expect("Failed to initialize CacheManager");
         let transfer_engine = Arc::new(TransferEngine::new(cache_manager.clone()));
@@ -49,6 +54,8 @@ impl AppState {
             settings: Arc::new(Mutex::new(initial_settings)),
             outgoing_tx,
             pending_outbound: Arc::new(Mutex::new(HashMap::new())),
+            config_actor,
+            reconnect_notify,
         }
     }
 }

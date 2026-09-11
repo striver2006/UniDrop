@@ -12,6 +12,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "瞬贴 (UniDrop)",
         "width": 380,
         "height": 560,

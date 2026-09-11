@@ -54,7 +54,6 @@ pub fn run() {
         }
     };
 
-    // 2. Initialize connection actor
     let config = ConnectionConfig {
         server_url: initial_settings.server_url.clone(),
         account_id: initial_settings.account_id.clone(),
@@ -65,12 +64,17 @@ pub fn run() {
         app_version: "0.1.0".to_string(),
     };
 
-    let (actor, outgoing_tx) = ConnectionActor::new(config);
+    let config_actor = Arc::new(tokio::sync::RwLock::new(config));
+    let reconnect_notify = Arc::new(tokio::sync::Notify::new());
+
+    let (actor, outgoing_tx) = ConnectionActor::new(config_actor.clone(), reconnect_notify.clone());
     let app_state = AppState::new(
         Arc::new(Mutex::new(db)),
         outgoing_tx.clone(),
         device_id.clone(),
         initial_settings.clone(),
+        config_actor.clone(),
+        reconnect_notify.clone(),
     );
 
     let online_devices_ref = app_state.online_devices.clone();
@@ -78,7 +82,6 @@ pub fn run() {
     let cache_manager_ref = app_state.cache_manager.clone();
     let settings_ref = app_state.settings.clone();
     let self_device_id = device_id.clone();
-    let current_server_url = initial_settings.server_url.clone();
 
     // Map to track inbound offers waiting for transfer token
     let pending_inbound: Arc<Mutex<HashMap<String, (TransferOfferPayload, String)>>> =
@@ -86,6 +89,13 @@ pub fn run() {
     let pending_inbound_ref = pending_inbound.clone();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            log::info!("Another instance attempted to start, focusing existing window");
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .manage(app_state)
@@ -168,8 +178,12 @@ pub fn run() {
 
                                         if let Some((offer, paths)) = outbound_entry {
                                             log::info!("Starting Sender task for session {}", answer.session_id);
+                                            let active_server_url = {
+                                                let s = settings_ref.lock().await;
+                                                s.server_url.clone()
+                                            };
                                             tokio::spawn(TransferEngine::start_sender_task(
-                                                current_server_url.clone(),
+                                                active_server_url,
                                                 answer.session_id.clone(),
                                                 token.clone(),
                                                 self_device_id.clone(),
@@ -187,13 +201,13 @@ pub fn run() {
                                             };
 
                                             if let Some((offer, sender_device)) = inbound_entry {
-                                                let auto_inject = {
+                                                let (auto_inject, active_server_url) = {
                                                     let s = settings_ref.lock().await;
-                                                    s.auto_inject
+                                                    (s.auto_inject, s.server_url.clone())
                                                 };
                                                 log::info!("Starting Receiver task for session {}, auto_inject={}", answer.session_id, auto_inject);
                                                 tokio::spawn(TransferEngine::start_receiver_task(
-                                                    current_server_url.clone(),
+                                                    active_server_url,
                                                     answer.session_id.clone(),
                                                     token,
                                                     sender_device,
@@ -214,6 +228,8 @@ pub fn run() {
                             if let Ok(resp) = serde_json::from_value::<protocol::AuthResponsePayload>(env.payload) {
                                 if !resp.success {
                                     let _ = app_handle.emit("auth-failed", resp.error_message);
+                                } else {
+                                    let _ = app_handle.emit("auth-success", ());
                                 }
                             }
                         }
