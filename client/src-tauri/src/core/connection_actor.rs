@@ -4,7 +4,6 @@ use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tokio::sync::{mpsc, Notify, RwLock};
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
@@ -21,6 +20,57 @@ pub struct ConnectionConfig {
     pub hostname: String,
     pub os_type: String,
     pub app_version: String,
+}
+
+#[derive(Debug)]
+pub struct CustomServerCertVerifier(pub Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for CustomServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+pub fn create_tls_connector() -> tokio_tungstenite::Connector {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .expect("valid tls protocol versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(CustomServerCertVerifier(provider)))
+        .with_no_client_auth();
+
+    tokio_tungstenite::Connector::Rustls(Arc::new(client_config))
 }
 
 pub struct ConnectionActor {
@@ -69,7 +119,8 @@ impl ConnectionActor {
                 cfg.clone()
             };
 
-            let base = current_cfg.server_url.trim().trim_end_matches('/');
+            let clean_url: String = current_cfg.server_url.chars().filter(|c| !c.is_whitespace()).collect();
+            let base = clean_url.trim().trim_end_matches('/');
             let ws_url = if base.starts_with("ws://") || base.starts_with("wss://") {
                 format!("{}/ws/control", base)
             } else {
@@ -77,7 +128,8 @@ impl ConnectionActor {
             };
             log::info!("Connecting to control server: {}", ws_url);
 
-            match connect_async(&ws_url).await {
+            let connector = create_tls_connector();
+            match tokio_tungstenite::connect_async_tls_with_config(&ws_url, None, false, Some(connector)).await {
                 Ok((ws_stream, _)) => {
                     log::info!("Connected to control server");
                     backoff = Duration::from_secs(1); // Reset backoff
@@ -266,3 +318,5 @@ fn fastrand_u64(min: u64, max: u64) -> u64 {
     let nanos = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().subsec_nanos() as u64;
     min + (nanos % (max - min + 1))
 }
+
+

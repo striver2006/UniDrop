@@ -20,11 +20,16 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    let cleanUrl = form.server_url.trim();
+    let cleanUrl = form.server_url.replace(/\s+/g, "");
     if (cleanUrl && !cleanUrl.startsWith("ws://") && !cleanUrl.startsWith("wss://")) {
       cleanUrl = `wss://${cleanUrl}`;
     }
-    onSave({ ...form, server_url: cleanUrl });
+    onSave({
+      ...form,
+      server_url: cleanUrl,
+      account_id: form.account_id.trim(),
+      psk_secret: form.psk_secret.trim(),
+    });
     onClose();
   };
 

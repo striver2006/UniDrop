@@ -25,6 +25,7 @@ use storage::db::init_database;
 
 pub fn run() {
     env_logger::init();
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     // 1. Initialize SQLite local database and persistent identity (P1-4, P1-5)
     let db = init_database(None).expect("Failed to initialize SQLite database");

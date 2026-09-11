@@ -24,7 +24,13 @@ pub async fn cmd_save_settings(
     new_settings: AppSettings,
 ) -> Result<(), String> {
     let mut clean_settings = new_settings;
-    clean_settings.server_url = clean_settings.server_url.trim().trim_end_matches('/').to_string();
+    clean_settings.server_url = clean_settings
+        .server_url
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .trim_end_matches('/')
+        .to_string();
     if !clean_settings.server_url.is_empty()
         && !clean_settings.server_url.starts_with("ws://")
         && !clean_settings.server_url.starts_with("wss://")
