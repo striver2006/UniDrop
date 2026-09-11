@@ -158,10 +158,21 @@ export const App: React.FC = () => {
 
   return (
     <div className="flex flex-col h-screen w-full bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-2xl select-none">
-      {/* Header with data-tauri-drag-region for frameless window dragging */}
+      {/* Header with native drag handling + data-tauri-drag-region fallback */}
       <header
         data-tauri-drag-region
-        className="flex items-center justify-between px-4 py-3 bg-slate-850/80 backdrop-blur border-b border-slate-800 cursor-move"
+        onMouseDown={(e) => {
+          const target = e.target as HTMLElement;
+          if (target.closest("button") || target.closest("input") || target.closest("a")) {
+            return;
+          }
+          if (e.buttons === 1) {
+            invoke("cmd_start_drag").catch((err) => {
+              console.warn("Native drag failed:", err);
+            });
+          }
+        }}
+        className="flex items-center justify-between px-4 py-3 bg-slate-850/80 backdrop-blur border-b border-slate-800 cursor-move select-none"
       >
         <div data-tauri-drag-region className="flex items-center space-x-2 pointer-events-auto">
           <div className="w-7 h-7 rounded-lg bg-teal-500/20 flex items-center justify-center border border-teal-500/40 pointer-events-none">
@@ -200,9 +211,18 @@ export const App: React.FC = () => {
             <span>偏好设置</span>
           </button>
           <button
-            onClick={() => {
-              const win = getCurrentWebviewWindow();
-              win.hide();
+            onClick={async () => {
+              try {
+                await invoke("cmd_hide_window");
+              } catch (e) {
+                console.warn("cmd_hide_window error, fallback to getCurrentWebviewWindow():", e);
+                try {
+                  const win = getCurrentWebviewWindow();
+                  await win.hide();
+                } catch (err) {
+                  console.error("win.hide error:", err);
+                }
+              }
             }}
             className="p-1 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition ml-0.5"
             title="隐藏窗口 (保持后台常驻)"

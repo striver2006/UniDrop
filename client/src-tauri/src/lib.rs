@@ -303,6 +303,12 @@ pub fn run() {
 
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let _ = window.hide();
+                api.prevent_close();
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             commands::cmd_get_online_devices,
             commands::cmd_get_self_info,
@@ -310,6 +316,8 @@ pub fn run() {
             commands::cmd_send_files,
             commands::cmd_get_settings,
             commands::cmd_save_settings,
+            commands::cmd_hide_window,
+            commands::cmd_start_drag,
         ])
         .build(tauri::generate_context!())
         .expect("error while building UniDrop application")
