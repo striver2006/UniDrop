@@ -8,8 +8,9 @@ interface TransferProgressProps {
   onInject?: (sessionId: string) => void;
 }
 
-export const TransferProgress: React.FC<TransferProgressProps> = ({ transfers, onDismiss, onInject }) => {
-  if (transfers.length === 0) return null;
+export const TransferProgress: React.FC<TransferProgressProps> = ({ transfers = [], onDismiss, onInject }) => {
+  const safeTransfers = Array.isArray(transfers) ? transfers : [];
+  if (safeTransfers.length === 0) return null;
 
   const formatBytes = (bytes: number) => {
     if (bytes < 1024) return `${bytes} B`;
@@ -20,9 +21,9 @@ export const TransferProgress: React.FC<TransferProgressProps> = ({ transfers, o
   return (
     <div className="space-y-2 mb-4">
       <div className="flex items-center justify-between text-xs text-slate-400 font-medium">
-        <span>传输任务 ({transfers.length})</span>
+        <span>传输任务 ({safeTransfers.length})</span>
       </div>
-      {transfers.map((t) => {
+      {safeTransfers.map((t) => {
         const isDone = t.status === "COMPLETED";
         const isFailed = t.status === "FAILED";
 

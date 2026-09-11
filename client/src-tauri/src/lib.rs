@@ -120,7 +120,7 @@ pub fn run() {
                             if let Ok(payload) = serde_json::from_value::<DeviceListSyncPayload>(env.payload) {
                                 let mut devs = online_devices_ref.lock().await;
                                 *devs = payload.devices;
-                                let _ = app_handle.emit("devices-updated", ());
+                                let _ = app_handle.emit("devices-updated", &*devs);
                             }
                         }
                         ActionType::DEVICE_ONLINE => {
@@ -128,7 +128,7 @@ pub fn run() {
                                 let mut devs = online_devices_ref.lock().await;
                                 if !devs.iter().any(|d| d.device_id == payload.device.device_id) {
                                     devs.push(payload.device);
-                                    let _ = app_handle.emit("devices-updated", ());
+                                    let _ = app_handle.emit("devices-updated", &*devs);
                                 }
                             }
                         }
@@ -136,7 +136,7 @@ pub fn run() {
                             if let Ok(payload) = serde_json::from_value::<DeviceOfflinePayload>(env.payload) {
                                 let mut devs = online_devices_ref.lock().await;
                                 devs.retain(|d| d.device_id != payload.device_id);
-                                let _ = app_handle.emit("devices-updated", ());
+                                let _ = app_handle.emit("devices-updated", &*devs);
                             }
                         }
                         ActionType::TRANSFER_OFFER => {

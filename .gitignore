@@ -48,3 +48,14 @@ cache/
 .env
 .env.local
 *.secret
+
+# ------------------------------------------------------------------------------
+# TriviumCode 编排器运行时目录 (.trivium/)
+# config.yaml 为团队共享策略，进 Git；其余为本机状态与探针结论，不进 Git
+# 由 `trivium init` 幂等写入
+# ------------------------------------------------------------------------------
+.trivium/bin/
+.trivium/logs/
+.trivium/lock/
+.trivium/state.json
+.trivium/config.local.yaml

@@ -57,7 +57,7 @@ pub async fn cmd_save_settings(
         let mut devs = state.online_devices.lock().await;
         devs.clear();
     }
-    let _ = app.emit("devices-updated", ());
+    let _ = app.emit("devices-updated", Vec::<crate::protocol::OnlineDevice>::new());
 
     // 4. Trigger immediate actor reconnection with new configuration
     state.reconnect_notify.notify_waiters();

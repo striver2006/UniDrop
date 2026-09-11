@@ -73,8 +73,17 @@ export const App: React.FC = () => {
     fetchInitialData();
 
     // 1. Listen for device list updates from control connection
-    const unlistenDevicesPromise = listen<OnlineDevice[]>("devices-updated", (event) => {
-      setDevices(event.payload);
+    const unlistenDevicesPromise = listen<OnlineDevice[] | null>("devices-updated", async (event) => {
+      if (Array.isArray(event.payload)) {
+        setDevices(event.payload);
+      } else {
+        try {
+          const list = await invoke<OnlineDevice[]>("cmd_get_online_devices");
+          setDevices(Array.isArray(list) ? list : []);
+        } catch (err) {
+          console.error("fetch devices error:", err);
+        }
+      }
       setAuthError(null); // Devices updated implies successful authentication
     });
 
@@ -301,9 +310,9 @@ export const App: React.FC = () => {
         <div>
           <div className="flex items-center justify-between mb-2">
             <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400">在线协同设备</h3>
-            <span className="text-xs text-slate-500">{devices.length} 台可用</span>
+            <span className="text-xs text-slate-500">{(devices || []).length} 台可用</span>
           </div>
-          <DeviceList devices={devices} onSendToDevice={handleSendToDevice} />
+          <DeviceList devices={devices || []} onSendToDevice={handleSendToDevice} />
         </div>
       </main>
 

@@ -7,9 +7,11 @@ interface DeviceListProps {
   onSendToDevice: (device: OnlineDevice) => void;
 }
 
-export const DeviceList: React.FC<DeviceListProps> = ({ devices, onSendToDevice }) => {
+export const DeviceList: React.FC<DeviceListProps> = ({ devices = [], onSendToDevice }) => {
+  const safeDevices = Array.isArray(devices) ? devices : [];
+
   const getOSIcon = (os: string) => {
-    switch (os.toLowerCase()) {
+    switch ((os || "").toLowerCase()) {
       case "windows":
         return <Monitor className="w-5 h-5 text-blue-400" />;
       case "macos":
@@ -19,7 +21,7 @@ export const DeviceList: React.FC<DeviceListProps> = ({ devices, onSendToDevice 
     }
   };
 
-  if (devices.length === 0) {
+  if (safeDevices.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-10 text-slate-400 text-sm">
         <div className="w-12 h-12 rounded-full bg-slate-800 flex items-center justify-center mb-3">
@@ -33,7 +35,7 @@ export const DeviceList: React.FC<DeviceListProps> = ({ devices, onSendToDevice 
 
   return (
     <div className="space-y-2">
-      {devices.map((device) => (
+      {safeDevices.map((device) => (
         <div
           key={device.device_id}
           className="flex items-center justify-between p-3 rounded-xl bg-slate-800/80 hover:bg-slate-800 border border-slate-700/60 transition duration-150"
