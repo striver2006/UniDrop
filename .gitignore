@@ -1,0 +1,49 @@
+# Binaries and build artifacts
+bin/
+dist/
+build/
+target/
+*.exe
+*.dll
+*.so
+*.dylib
+*.out
+
+# Node / Frontend
+node_modules/
+.pnpm-store/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.eslintcache
+
+# Rust / Cargo
+Cargo.lock
+**/*.rs.bk
+
+# Go
+vendor/
+*.test
+*.prof
+
+# IDE and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+Thumbs.db
+
+# UniDrop Application Local Cache & Databases
+.cache/
+cache/
+*.db
+*.db-shm
+*.db-wal
+
+# Environment and Secrets
+.env
+.env.local
+*.secret

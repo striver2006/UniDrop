@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-cli/schema.json",
+  "identifier": "default",
+  "description": "Default permissions for UniDrop Webview",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "shell:allow-open",
+    "notification:default"
+  ]
+}

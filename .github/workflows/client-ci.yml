@@ -1,0 +1,36 @@
+name: Client CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    paths:
+      - "client/**"
+      - ".github/workflows/client-ci.yml"
+  pull_request:
+    branches: [ "main", "master" ]
+    paths:
+      - "client/**"
+
+jobs:
+  build-frontend:
+    name: Build Webview Frontend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install Dependencies & Build
+        working-directory: client
+        run: |
+          pnpm install
+          pnpm build
