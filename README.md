@@ -91,8 +91,16 @@
 │       ├── components/             # 设备列表、传输进度条、设置弹窗、文件发送弹窗
 │       └── App.tsx                 # 拖拽移动无边框窗口、信令事件监听与响应
 ├── .github/workflows/              # CI/CD 自动化流水线 (gofmt, go vet, cargo test, build)
-├── REQUIREMENTS.md                 # 系统需求规格 (PRD)
-└── DESIGN.md                       # 系统详细设计说明书 (LLD)
+├── docker-compose.yml              # 容器化部署编排配置
+└── docs/                           # 官方文档、手册与设计规范
+    ├── INSTALL.md                  # 客户端安装与权限配置手册
+    ├── DEPLOY.md                   # 服务端部署与运维手册
+    ├── USER_GUIDE.md               # 客户端使用与排障手册
+    ├── design/                     # 系统需求规格与底层架构设计说明书
+    │   ├── REQUIREMENTS.md         # 需求规格说明书 (PRD)
+    │   └── DESIGN.md               # 系统详细设计说明书 (LLD)
+    ├── reviews/                    # 架构审核与代码复审演进记录
+    └── systemd/                    # Linux Systemd 服务单元模板
 ```
 
 ---
@@ -135,11 +143,15 @@ pnpm tauri build
 
 ## 📖 官方文档与技术手册
 
+### 🚀 用户与运维手册
 * [客户端安装手册 (INSTALL.md)](./docs/INSTALL.md) - macOS / Windows / Linux 安装与权限配置指南
 * [服务端部署运维手册 (DEPLOY.md)](./docs/DEPLOY.md) - Docker、Systemd、Nginx 反代与监控方案
 * [客户端用户使用手册 (USER_GUIDE.md)](./docs/USER_GUIDE.md) - 首次配对、设备发现、文件发送与剪贴板无感粘贴
-* [需求规格说明书 (REQUIREMENTS.md)](./REQUIREMENTS.md) - 产品 PRD 规格
-* [系统详细设计说明书 (DESIGN.md)](./DESIGN.md) - 架构与协议详细设计
+
+### 📐 架构设计与审核演进
+* [需求规格说明书 (REQUIREMENTS.md)](./docs/design/REQUIREMENTS.md) - 产品需求规格说明书 (PRD)
+* [系统详细设计说明书 (DESIGN.md)](./docs/design/DESIGN.md) - 协议定长帧、双通道与滑动窗口详细设计 (LLD)
+* [架构与代码复审记录 (docs/reviews/)](./docs/reviews/) - 包含多轮架构设计审核与生产级代码复审演进报告
 
 ---
 

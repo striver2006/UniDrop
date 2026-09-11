@@ -2,7 +2,7 @@
 
 | 项目 | 内容 |
 | :--- | :--- |
-| 审核对象 | [DESIGN.md](./DESIGN.md)(UniDrop 系统详细设计说明书 v1.0.0,状态:Approved / Ready for Implementation) |
+| 审核对象 | [DESIGN.md](../design/DESIGN.md)(UniDrop 系统详细设计说明书 v1.0.0,状态:Approved / Ready for Implementation) |
 | 审核日期 | 2026-09-11 |
 | 审核人 | GLM |
 | 审核维度 | 架构合理性、协议完备性、安全性、平台实现正确性、可靠性、可测试性、文档自洽性 |
