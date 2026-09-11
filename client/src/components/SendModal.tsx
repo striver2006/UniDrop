@@ -1,8 +1,21 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { X, Send, Plus, Trash2, FileText, FolderPlus, AlertCircle } from "lucide-react";
-import { OnlineDevice } from "../types";
+import {
+  X,
+  Send,
+  Plus,
+  Trash2,
+  FileText,
+  FolderPlus,
+  AlertCircle,
+  RefreshCw,
+  ClipboardPaste,
+  Type,
+  Image as ImageIcon,
+  Files as FilesIcon,
+} from "lucide-react";
+import { ClipboardPreview, OnlineDevice } from "../types";
 
 interface SendModalProps {
   targetDevice: OnlineDevice;
@@ -21,6 +34,23 @@ export const SendModal: React.FC<SendModalProps> = ({
   const [inputPath, setInputPath] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [clipPreview, setClipPreview] = useState<ClipboardPreview | null>(null);
+  const [isClipSending, setIsClipSending] = useState(false);
+
+  const refreshClipPreview = useCallback(async () => {
+    try {
+      const preview = await invoke<ClipboardPreview>("cmd_read_clipboard_preview");
+      setClipPreview(preview);
+    } catch (err) {
+      console.warn("read clipboard preview error:", err);
+      setClipPreview(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    refreshClipPreview();
+  }, [isOpen, refreshClipPreview]);
 
   // Listen to Tauri native window drag & drop
   useEffect(() => {
@@ -93,6 +123,33 @@ export const SendModal: React.FC<SendModalProps> = ({
     }
   };
 
+  const handleSendClipboard = async () => {
+    setIsClipSending(true);
+    setErrorMsg(null);
+    try {
+      const sessionId = await invoke<string>("cmd_send_clipboard", {
+        targetDevice: targetDevice.device_id,
+      });
+      onSuccess(sessionId, 1);
+      onClose();
+    } catch (err: any) {
+      setErrorMsg(typeof err === "string" ? err : err.message || "剪贴板发送失败");
+    } finally {
+      setIsClipSending(false);
+    }
+  };
+
+  const clipIcon =
+    clipPreview?.kind === "TEXT" ? (
+      <Type className="w-4 h-4 text-teal-400" />
+    ) : clipPreview?.kind === "IMAGE" ? (
+      <ImageIcon className="w-4 h-4 text-teal-400" />
+    ) : (
+      <FilesIcon className="w-4 h-4 text-teal-400" />
+    );
+
+  const clipEmpty = !clipPreview || clipPreview.kind === "EMPTY";
+
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
       <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-md p-5 shadow-2xl flex flex-col max-h-[90vh]">
@@ -101,7 +158,7 @@ export const SendModal: React.FC<SendModalProps> = ({
           <div className="flex items-center space-x-2">
             <Send className="w-5 h-5 text-teal-400" />
             <div>
-              <h3 className="font-semibold text-slate-100 text-sm">发送文件</h3>
+              <h3 className="font-semibold text-slate-100 text-sm">发送内容</h3>
               <p className="text-[11px] text-slate-400">
                 目标设备: <span className="text-teal-300 font-medium">{targetDevice.hostname}</span> ({targetDevice.os_type.toUpperCase()})
               </p>
@@ -124,6 +181,42 @@ export const SendModal: React.FC<SendModalProps> = ({
               <span className="truncate">{errorMsg}</span>
             </div>
           )}
+
+          {/* Clipboard Content Section */}
+          <div className="border border-slate-700/80 rounded-xl p-3 bg-slate-850/40">
+            <div className="flex items-center justify-between mb-2">
+              <span className="flex items-center space-x-1.5 text-slate-400 text-xs font-medium">
+                <ClipboardPaste className="w-3.5 h-3.5 text-teal-400" />
+                <span>从本机剪贴板发送</span>
+              </span>
+              <button
+                onClick={refreshClipPreview}
+                className="text-slate-500 hover:text-slate-300 p-1 rounded transition"
+                title="重新识别剪贴板内容"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+              </button>
+            </div>
+            <div className="flex items-center justify-between space-x-2">
+              <div className="flex items-center space-x-2 min-w-0 flex-1">
+                {clipIcon}
+                <span
+                  className={`text-xs truncate ${clipEmpty ? "text-slate-500" : "text-slate-200"}`}
+                  title={clipPreview?.summary}
+                >
+                  {clipEmpty ? "剪贴板为空或不支持的内容" : clipPreview.summary}
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={handleSendClipboard}
+                disabled={clipEmpty || isClipSending}
+                className="px-3 py-1.5 rounded-lg bg-teal-600/80 hover:bg-teal-500 text-white text-[11px] font-medium transition disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+              >
+                {isClipSending ? "发送中..." : "发送剪贴板"}
+              </button>
+            </div>
+          </div>
 
           {/* Path Input Box */}
           <div>

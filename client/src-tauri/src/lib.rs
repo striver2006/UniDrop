@@ -16,12 +16,13 @@ use tokio::sync::{mpsc, Mutex};
 
 use app_state::AppState;
 use core::connection_actor::{ConnectionActor, ConnectionConfig};
-use core::transfer_engine::TransferEngine;
+use core::transfer_engine::{ActiveTransfer, TransferEngine};
 use protocol::{
     ActionType, DeviceListSyncPayload, DeviceOfflinePayload, DeviceOnlinePayload,
     TransferAnswerPayload, TransferOfferPayload,
 };
 use storage::db::init_database;
+use storage::HistoryRepo;
 
 pub fn run() {
     env_logger::init();
@@ -99,6 +100,7 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(app_state)
         .setup(move |app| {
             let app_handle = app.handle().clone();
@@ -165,6 +167,13 @@ pub fn run() {
                                 pending_inbound_ref.lock().await.insert(offer.session_id.clone(), (offer.clone(), env.from_device.clone()));
                                 let _ = outgoing_tx_actor.send(answer_env).await;
                                 let _ = app_handle.emit("transfer-offer-received", &offer);
+
+                                // Persist incoming transfer in history
+                                {
+                                    let state = app_handle.state::<AppState>();
+                                    let conn = state.db_conn.lock().await;
+                                    let _ = HistoryRepo::record_task(&conn, &offer.session_id, &env.from_device, "RECEIVE", &offer, "TRANSFERRING");
+                                }
                             }
                         }
                         ActionType::TRANSFER_ANSWER => {
@@ -177,7 +186,7 @@ pub fn run() {
                                             pending.remove(&answer.session_id)
                                         };
 
-                                        if let Some((offer, paths)) = outbound_entry {
+                                        if let Some((offer, source)) = outbound_entry {
                                             log::info!("Starting Sender task for session {}", answer.session_id);
                                             let active_server_url = {
                                                 let s = settings_ref.lock().await;
@@ -189,7 +198,7 @@ pub fn run() {
                                                 token.clone(),
                                                 self_device_id.clone(),
                                                 env.from_device.clone(),
-                                                paths,
+                                                source,
                                                 offer,
                                                 outgoing_tx_actor.clone(),
                                                 app_handle.clone(),
@@ -223,6 +232,57 @@ pub fn run() {
                                         }
                                     }
                                 }
+                            }
+                        }
+                        ActionType::TRANSFER_FAILURE => {
+                            // Peer-reported failure: flip the corresponding card to FAILED
+                            let session_id = env
+                                .payload
+                                .get("session_id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            let err_msg = env
+                                .payload
+                                .get("error_message")
+                                .or_else(|| env.payload.get("message"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+
+                            if let Some(sid) = session_id {
+                                let brief = {
+                                    let state = app_handle.state::<AppState>();
+                                    let conn = state.db_conn.lock().await;
+                                    let brief = HistoryRepo::get_task_brief(&conn, &sid);
+                                    let _ = HistoryRepo::update_task_status(&conn, &sid, "FAILED", err_msg.as_deref());
+                                    brief
+                                };
+
+                                let (direction, mut summary, total_size, data_type) = match brief {
+                                    Some(b) => (b.direction, b.preview_summary.unwrap_or_else(|| "传输".into()), b.total_size, b.data_type),
+                                    None => ("SEND".to_string(), "传输".into(), 0, "FILES".to_string()),
+                                };
+                                if let Some(m) = &err_msg {
+                                    summary = format!("{} ({})", summary, m);
+                                }
+
+                                let _ = app_handle.emit("transfer-progress", ActiveTransfer {
+                                    session_id: sid,
+                                    preview_summary: summary,
+                                    total_size,
+                                    transferred_size: 0,
+                                    direction,
+                                    progress: 0.0,
+                                    status: "FAILED".to_string(),
+                                    data_type,
+                                });
+                            }
+                        }
+                        ActionType::TRANSFER_COMPLETE => {
+                            // Sender-side completion broadcast. The receiver's own data-plane
+                            // verification path is authoritative for its card, so we only log
+                            // here to avoid racing an in-flight SHA-256 verification.
+                            if let Some(sid) = env.payload.get("session_id").and_then(|v| v.as_str()) {
+                                log::info!("Peer reports TRANSFER_COMPLETE for session {}", sid);
                             }
                         }
                         ActionType::AUTH_RESPONSE => {
@@ -339,6 +399,12 @@ pub fn run() {
             commands::cmd_save_settings,
             commands::cmd_hide_window,
             commands::cmd_start_drag,
+            commands::cmd_read_clipboard_preview,
+            commands::cmd_send_clipboard,
+            commands::cmd_inject_session,
+            commands::cmd_list_history,
+            commands::cmd_save_transfer_as,
+            commands::cmd_reveal_session,
         ])
         .build(tauri::generate_context!())
         .expect("error while building UniDrop application")

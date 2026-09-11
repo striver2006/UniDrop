@@ -105,16 +105,28 @@ export const TransferProgress: React.FC<TransferProgressProps> = ({ transfers = 
               <div className="mt-2 pt-2 border-t border-slate-700/60 flex items-center justify-between">
                 <span className="text-[11px] text-emerald-400/90 flex items-center space-x-1">
                   <CheckCircle2 className="w-3 h-3" />
-                  <span>文件已就绪</span>
+                  <span>
+                    {t.data_type === "TEXT"
+                      ? "文本已写入剪贴板"
+                      : t.data_type === "IMAGE"
+                      ? "图片已写入剪贴板"
+                      : "文件已就绪"}
+                  </span>
                 </span>
                 <button
                   type="button"
                   onClick={() => onInject(t.session_id)}
                   className="flex items-center space-x-1 px-2.5 py-1 rounded-lg bg-teal-600/30 hover:bg-teal-600/50 text-teal-300 text-[11px] font-medium transition duration-150 cursor-pointer"
-                  title="装载此文件至系统剪贴板"
+                  title="重新写入系统剪贴板"
                 >
                   <Clipboard className="w-3 h-3" />
-                  <span>装载到剪贴板</span>
+                  <span>
+                    {t.data_type === "TEXT"
+                      ? "重新复制文本"
+                      : t.data_type === "IMAGE"
+                      ? "重新复制图片"
+                      : "装载到剪贴板"}
+                  </span>
                 </button>
               </div>
             )}

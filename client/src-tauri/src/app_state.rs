@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use rusqlite::Connection;
 use tokio::sync::{mpsc, Mutex, Notify, RwLock};
@@ -7,7 +6,7 @@ use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use crate::commands::settings_cmd::AppSettings;
 use crate::core::cache_manager::CacheManager;
 use crate::core::connection_actor::ConnectionConfig;
-use crate::core::transfer_engine::TransferEngine;
+use crate::core::transfer_engine::{TransferEngine, TransferSource};
 use crate::protocol::{ControlEnvelope, OnlineDevice, TransferOfferPayload};
 
 pub struct AppState {
@@ -21,7 +20,7 @@ pub struct AppState {
     pub online_devices: Arc<Mutex<Vec<OnlineDevice>>>,
     pub settings: Arc<Mutex<AppSettings>>,
     pub outgoing_tx: mpsc::Sender<ControlEnvelope>,
-    pub pending_outbound: Arc<Mutex<HashMap<String, (TransferOfferPayload, Vec<PathBuf>)>>>,
+    pub pending_outbound: Arc<Mutex<HashMap<String, (TransferOfferPayload, TransferSource)>>>,
     pub config_actor: Arc<RwLock<ConnectionConfig>>,
     pub reconnect_notify: Arc<Notify>,
 }
@@ -60,7 +59,16 @@ impl AppState {
     }
 }
 
+/// Resolves the real host name via gethostname (works for GUI-launched apps on
+/// macOS where the HOSTNAME env var is never set), trimming the mDNS ".local"
+/// suffix. Env vars are only a fallback for containerized environments.
 pub fn whoami_hostname() -> String {
+    if let Ok(name) = whoami::fallible::hostname() {
+        let trimmed = name.trim_end_matches(".local").trim().to_string();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "localhost".to_string())

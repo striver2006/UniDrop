@@ -22,4 +22,26 @@ export interface ActiveTransfer {
   direction: "SEND" | "RECEIVE";
   progress: number; // 0..100
   status: "TRANSFERRING" | "COMPLETED" | "FAILED";
+  data_type?: "FILES" | "TEXT" | "IMAGE" | string;
+}
+
+export interface ClipboardPreview {
+  kind: "TEXT" | "IMAGE" | "FILES" | "EMPTY" | string;
+  summary: string;
+  count: number;
+  size_bytes: number;
+}
+
+export interface TransferHistoryEntry {
+  session_id: string;
+  direction: "SEND" | "RECEIVE" | string;
+  data_type: "FILES" | "TEXT" | "IMAGE" | string;
+  preview_summary: string | null;
+  total_size: number;
+  total_items: number;
+  status: string;
+  error_message: string | null;
+  created_at: string | null;
+  completed_at: string | null;
+  cached_count: number;
 }

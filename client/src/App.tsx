@@ -17,6 +17,7 @@ import { DeviceList } from "./components/DeviceList";
 import { TransferProgress } from "./components/TransferProgress";
 import { SettingsModal } from "./components/SettingsModal";
 import { SendModal } from "./components/SendModal";
+import { HistoryPanel } from "./components/HistoryPanel";
 
 const defaultSettings: AppSettings = {
   server_url: "wss://drop.yourdomain.com:58921",
@@ -122,7 +123,13 @@ export const App: React.FC = () => {
     // 4. Listen for inbound transfer offer notifications
     const unlistenOfferPromise = listen<any>("transfer-offer-received", (event) => {
       const payload = event.payload;
-      showNotification(`收到传输请求: ${payload.items?.length || 1} 个文件`, "info");
+      const typeLabel =
+        payload?.data_type === "TEXT" ? "文本" : payload?.data_type === "IMAGE" ? "图片" : "文件";
+      const summary: string = payload?.preview_summary || "";
+      showNotification(
+        summary ? `收到${typeLabel}: ${summary}` : `收到${typeLabel}传输请求`,
+        "info"
+      );
     });
 
     // 5. Listen for open-settings event from system tray
@@ -169,10 +176,10 @@ export const App: React.FC = () => {
 
   const handleInjectTransfer = async (sessionId: string) => {
     try {
-      await invoke("cmd_inject_files", { sessionId, paths: null });
-      showNotification("文件已装载至系统剪贴板，可直接按 Ctrl+V / Cmd+V 粘贴！", "success");
+      const msg = await invoke<string>("cmd_inject_session", { sessionId });
+      showNotification(msg || "已装载至系统剪贴板，可直接按 Ctrl+V / Cmd+V 粘贴！", "success");
     } catch (err: any) {
-      console.error("inject files error:", err);
+      console.error("inject session error:", err);
       showNotification(typeof err === "string" ? err : "装载剪贴板失败", "error");
     }
   };
@@ -314,6 +321,9 @@ export const App: React.FC = () => {
           </div>
           <DeviceList devices={devices || []} onSendToDevice={handleSendToDevice} />
         </div>
+
+        {/* Transfer History */}
+        <HistoryPanel onNotify={showNotification} />
       </main>
 
       {/* Footer Info */}

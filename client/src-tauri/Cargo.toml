@@ -18,6 +18,10 @@ tauri = { version = "2.0.0", features = ["tray-icon"] }
 tauri-plugin-shell = "2.0.0"
 tauri-plugin-notification = "2.0.0"
 tauri-plugin-single-instance = "2.0.0"
+tauri-plugin-dialog = "2.0.0"
+
+whoami = "1"
+image = { version = "0.25", default-features = false, features = ["png", "bmp", "tiff"] }
 
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -45,5 +49,5 @@ windows = { version = "0.58", features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
-objc2-foundation = { version = "0.2", features = ["NSString", "NSArray", "NSURL"] }
-objc2-app-kit = { version = "0.2", features = ["NSPasteboard"] }
+objc2-foundation = { version = "0.2", features = ["NSString", "NSArray", "NSURL", "NSData"] }
+objc2-app-kit = { version = "0.2", features = ["NSPasteboard", "NSPasteboardItem"] }

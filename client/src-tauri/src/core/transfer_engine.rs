@@ -7,13 +7,16 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tauri::{AppHandle, Emitter};
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
+use crate::app_state::AppState;
 use crate::core::cache_manager::CacheManager;
+use crate::core::connection_actor::create_tls_connector;
 use crate::core::path_guard::PathGuard;
 use crate::core::sliding_window::SlidingWindow;
 use crate::platform::show_transfer_notification;
@@ -21,6 +24,7 @@ use crate::protocol::{
     ActionType, BinaryHeader, ChunkType, ControlEnvelope, HEADER_SIZE, MAX_PAYLOAD_LENGTH,
     TransferItemPayload, TransferOfferPayload,
 };
+use crate::storage::HistoryRepo;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveTransfer {
@@ -31,6 +35,25 @@ pub struct ActiveTransfer {
     pub direction: String, // "SEND" | "RECEIVE"
     pub progress: f64,     // 0..100
     pub status: String,    // "TRANSFERRING" | "COMPLETED" | "FAILED"
+    #[serde(default)]
+    pub data_type: String, // "FILES" | "TEXT" | "IMAGE"
+}
+
+/// Where the sender reads chunk payloads from: real files on disk or an
+/// in-memory buffer (clipboard text / image).
+#[derive(Debug, Clone)]
+pub enum TransferSource {
+    Files(Vec<PathBuf>),
+    Memory(Vec<u8>),
+}
+
+/// Best-effort history status update; failures are logged only.
+async fn update_history_status(app_handle: &AppHandle, session_id: &str, status: &str, error: Option<&str>) {
+    let state = app_handle.state::<AppState>();
+    let conn = state.db_conn.lock().await;
+    if let Err(e) = HistoryRepo::update_task_status(&conn, session_id, status, error) {
+        log::warn!("Failed to update history status for {}: {}", session_id, e);
+    }
 }
 
 pub struct TransferEngine {
@@ -123,6 +146,66 @@ impl TransferEngine {
         ))
     }
 
+    /// Prepares an offer for in-memory content (clipboard text / image) without touching disk.
+    pub fn prepare_offer_from_bytes(
+        session_id: Uuid,
+        data_type: &str,
+        name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(TransferOfferPayload, TransferSource), String> {
+        if bytes.is_empty() {
+            return Err("Empty payload".into());
+        }
+
+        let size = bytes.len() as i64;
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let hash = hex::encode(hasher.finalize());
+
+        let total_chunks = ((size + (MAX_PAYLOAD_LENGTH as i64) - 1) / (MAX_PAYLOAD_LENGTH as i64)) as u32;
+
+        let preview_summary = match data_type {
+            "TEXT" => {
+                let text = String::from_utf8_lossy(&bytes);
+                let truncated: String = text.chars().take(50).collect();
+                if text.chars().count() > 50 {
+                    format!("文本: {}…", truncated)
+                } else {
+                    format!("文本: {}", truncated)
+                }
+            }
+            "IMAGE" => {
+                let kb = size as f64 / 1024.0;
+                if kb >= 1024.0 {
+                    format!("图片 ({:.1} MB)", kb / 1024.0)
+                } else {
+                    format!("图片 ({:.0} KB)", kb)
+                }
+            }
+            _ => name.to_string(),
+        };
+
+        let offer = TransferOfferPayload {
+            session_id: session_id.to_string(),
+            data_type: data_type.to_string(),
+            total_size: size,
+            total_items: 1,
+            preview_summary,
+            encrypted: false,
+            encrypted_metadata: None,
+            items: vec![TransferItemPayload {
+                item_index: 0,
+                relative_path: name.to_string(),
+                size,
+                is_dir: false,
+                sha256: hash,
+                total_chunks,
+            }],
+        };
+
+        Ok((offer, TransferSource::Memory(bytes)))
+    }
+
     /// Connects to /ws/data as Sender and executes Sliding Window ARQ transfer (P0-3).
     pub async fn start_sender_task(
         server_url: String,
@@ -130,7 +213,7 @@ impl TransferEngine {
         token: String,
         from_device: String,
         to_device: String,
-        file_paths: Vec<PathBuf>,
+        source: TransferSource,
         offer: TransferOfferPayload,
         outgoing_tx: mpsc::Sender<ControlEnvelope>,
         app_handle: AppHandle,
@@ -150,10 +233,43 @@ impl TransferEngine {
 
         log::info!("Sender connecting to data plane: {}", ws_data_url);
 
-        let (ws_stream, _) = match connect_async(&ws_data_url).await {
+        // Same TLS policy as the control plane (supports self-signed / direct-IP deployments)
+        let (ws_stream, _) = match connect_async_tls_with_config(
+            &ws_data_url,
+            None,
+            false,
+            Some(create_tls_connector()),
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
                 log::error!("Sender failed to connect to /ws/data: {}", e);
+                let _ = app_handle.emit("transfer-progress", ActiveTransfer {
+                    session_id: session_id.clone(),
+                    preview_summary: offer.preview_summary.clone(),
+                    total_size: offer.total_size,
+                    transferred_size: 0,
+                    direction: "SEND".to_string(),
+                    progress: 0.0,
+                    status: "FAILED".to_string(),
+                    data_type: offer.data_type.clone(),
+                });
+                update_history_status(&app_handle, &session_id, "FAILED", Some(&format!("数据通道连接失败: {}", e))).await;
+                let fail_env = ControlEnvelope {
+                    version: 1,
+                    trace_id: Uuid::new_v4().to_string(),
+                    action: ActionType::TRANSFER_FAILURE,
+                    from_device: from_device.clone(),
+                    to_device: Some(to_device.clone()),
+                    timestamp: crate::core::connection_actor::current_time_ms(),
+                    payload: serde_json::json!({
+                        "session_id": session_id,
+                        "error_code": "DATA_CONNECT_FAILED",
+                        "error_message": format!("Sender failed to connect to data plane: {}", e)
+                    }),
+                };
+                let _ = outgoing_tx.send(fail_env).await;
                 return;
             }
         };
@@ -168,29 +284,57 @@ impl TransferEngine {
             total_chunks: u32,
             offset: u64,
             length: usize,
-            file_path: PathBuf,
+            source: ChunkOrigin,
         }
+
+        enum ChunkOrigin {
+            File(PathBuf),
+            Memory(Arc<Vec<u8>>),
+        }
+
+        fn read_chunk_payload(desc: &ChunkDescriptor) -> std::io::Result<Vec<u8>> {
+            match &desc.source {
+                ChunkOrigin::File(path) => read_file_chunk(path, desc.offset, desc.length),
+                ChunkOrigin::Memory(buf) => {
+                    let start = desc.offset as usize;
+                    Ok(buf[start..start + desc.length].to_vec())
+                }
+            }
+        }
+
+        let (mem_buf, file_paths) = match source {
+            TransferSource::Memory(bytes) => (Some(Arc::new(bytes)), None),
+            TransferSource::Files(paths) => (None, Some(paths)),
+        };
 
         let mut all_chunks = Vec::new();
         for (item_idx, item) in offer.items.iter().enumerate() {
-            if let Some(path) = file_paths.get(item_idx) {
-                let file_size = item.size as u64;
-                for c in 0..item.total_chunks {
-                    let offset = (c as u64) * (MAX_PAYLOAD_LENGTH as u64);
-                    let length = if offset + (MAX_PAYLOAD_LENGTH as u64) > file_size {
-                        (file_size.saturating_sub(offset)) as usize
-                    } else {
-                        MAX_PAYLOAD_LENGTH as usize
-                    };
-                    all_chunks.push(ChunkDescriptor {
-                        item_index: item.item_index,
-                        chunk_index: c,
-                        total_chunks: item.total_chunks,
-                        offset,
-                        length,
-                        file_path: path.clone(),
-                    });
-                }
+            let file_size = item.size as u64;
+            for c in 0..item.total_chunks {
+                let offset = (c as u64) * (MAX_PAYLOAD_LENGTH as u64);
+                let length = if offset + (MAX_PAYLOAD_LENGTH as u64) > file_size {
+                    (file_size.saturating_sub(offset)) as usize
+                } else {
+                    MAX_PAYLOAD_LENGTH as usize
+                };
+                let origin = if let Some(mem) = &mem_buf {
+                    ChunkOrigin::Memory(mem.clone())
+                } else if let Some(paths) = &file_paths {
+                    match paths.get(item_idx) {
+                        Some(p) => ChunkOrigin::File(p.clone()),
+                        None => continue,
+                    }
+                } else {
+                    continue;
+                };
+                all_chunks.push(ChunkDescriptor {
+                    item_index: item.item_index,
+                    chunk_index: c,
+                    total_chunks: item.total_chunks,
+                    offset,
+                    length,
+                    source: origin,
+                });
             }
         }
 
@@ -209,6 +353,7 @@ impl TransferEngine {
             direction: "SEND".to_string(),
             progress: 0.0,
             status: "TRANSFERRING".to_string(),
+            data_type: offer.data_type.clone(),
         });
 
         let mut check_interval = tokio::time::interval(Duration::from_millis(200));
@@ -223,11 +368,11 @@ impl TransferEngine {
             // 1. Send chunks allowed by window
             while window.can_send(next_chunk_to_send) {
                 let desc = &all_chunks[next_chunk_to_send as usize];
-                // Read payload chunk from disk
-                let payload = match read_file_chunk(&desc.file_path, desc.offset, desc.length) {
+                // Read payload chunk from disk or memory
+                let payload = match read_chunk_payload(desc) {
                     Ok(data) => data,
                     Err(e) => {
-                        log::error!("Failed to read chunk from {:?}: {}", desc.file_path, e);
+                        log::error!("Failed to read chunk for session {}: {}", session_id, e);
                         break;
                     }
                 };
@@ -279,15 +424,16 @@ impl TransferEngine {
                                                 direction: "SEND".to_string(),
                                                 progress: pct,
                                                 status: if window.is_complete() { "COMPLETED".to_string() } else { "TRANSFERRING".to_string() },
+                                                data_type: offer.data_type.clone(),
                                             });
                                         }
                                     } else if ack_hdr.chunk_type == ChunkType::Nack {
                                         // R3 / N1: Fast retransmit on NACK
                                         if let Some(pos) = all_chunks.iter().position(|c| c.item_index == ack_hdr.item_index && c.chunk_index == ack_hdr.chunk_index) {
-                                            if let Some(retransmit_idx) = window.on_nack(pos as u32) {
-                                                log::warn!("Received NACK for chunk {}, immediately fast-retransmitting", retransmit_idx);
-                                                let desc = &all_chunks[retransmit_idx as usize];
-                                                if let Ok(payload) = read_file_chunk(&desc.file_path, desc.offset, desc.length) {
+                                        if let Some(retransmit_idx) = window.on_nack(pos as u32) {
+                                            log::warn!("Received NACK for chunk {}, immediately fast-retransmitting", retransmit_idx);
+                                            let desc = &all_chunks[retransmit_idx as usize];
+                                            if let Ok(payload) = read_chunk_payload(desc) {
                                                     let header = BinaryHeader::new_data(
                                                         session_uuid,
                                                         desc.item_index,
@@ -315,7 +461,7 @@ impl TransferEngine {
                     let timeouts = window.check_timeouts(Instant::now());
                     for timed_out_idx in timeouts {
                         let desc = &all_chunks[timed_out_idx as usize];
-                        if let Ok(payload) = read_file_chunk(&desc.file_path, desc.offset, desc.length) {
+                        if let Ok(payload) = read_chunk_payload(desc) {
                             let header = BinaryHeader::new_data(
                                 session_uuid,
                                 desc.item_index,
@@ -355,7 +501,9 @@ impl TransferEngine {
                 direction: "SEND".to_string(),
                 progress: 100.0,
                 status: "COMPLETED".to_string(),
+                data_type: offer.data_type.clone(),
             });
+            update_history_status(&app_handle, &session_id, "COMPLETED", None).await;
         } else {
             // N4: Emit FAILED status and send TRANSFER_FAILURE on interrupted/aborted transfer
             log::error!("Sender transfer failed or was interrupted for session {}", session_id);
@@ -367,7 +515,9 @@ impl TransferEngine {
                 direction: "SEND".to_string(),
                 progress: if total_size > 0 { ((transferred_bytes as f64) / (total_size as f64) * 100.0).clamp(0.0, 100.0) } else { 0.0 },
                 status: "FAILED".to_string(),
+                data_type: offer.data_type.clone(),
             });
+            update_history_status(&app_handle, &session_id, "FAILED", Some("传输中断或超出重试上限")).await;
 
             let fail_env = ControlEnvelope {
                 version: 1,
@@ -379,7 +529,7 @@ impl TransferEngine {
                 payload: serde_json::json!({
                     "session_id": session_id,
                     "error_code": "TRANSFER_ABORTED",
-                    "message": "Sender transfer connection terminated before completion or exceeded retries",
+                    "error_message": "Sender transfer connection terminated before completion or exceeded retries"
                 }),
             };
             let _ = outgoing_tx.send(fail_env).await;
@@ -414,10 +564,44 @@ impl TransferEngine {
 
         log::info!("Receiver connecting to data plane: {}", ws_data_url);
 
-        let (ws_stream, _) = match connect_async(&ws_data_url).await {
+        // Same TLS policy as the control plane (supports self-signed / direct-IP deployments)
+        let (ws_stream, _) = match connect_async_tls_with_config(
+            &ws_data_url,
+            None,
+            false,
+            Some(create_tls_connector()),
+        )
+        .await
+        {
             Ok(s) => s,
             Err(e) => {
                 log::error!("Receiver failed to connect to /ws/data: {}", e);
+                let _ = app_handle.emit("transfer-progress", ActiveTransfer {
+                    session_id: session_id.clone(),
+                    preview_summary: offer.preview_summary.clone(),
+                    total_size: offer.total_size,
+                    transferred_size: 0,
+                    direction: "RECEIVE".to_string(),
+                    progress: 0.0,
+                    status: "FAILED".to_string(),
+                    data_type: offer.data_type.clone(),
+                });
+                let _ = show_transfer_notification(&app_handle, "UniDrop 接收失败", "数据通道连接失败，请检查服务器地址与证书配置");
+                update_history_status(&app_handle, &session_id, "FAILED", Some(&format!("数据通道连接失败: {}", e))).await;
+                let fail_env = ControlEnvelope {
+                    version: 1,
+                    trace_id: Uuid::new_v4().to_string(),
+                    action: ActionType::TRANSFER_FAILURE,
+                    from_device: to_device.clone(),
+                    to_device: Some(from_device.clone()),
+                    timestamp: crate::core::connection_actor::current_time_ms(),
+                    payload: serde_json::json!({
+                        "session_id": session_id,
+                        "error_code": "DATA_CONNECT_FAILED",
+                        "error_message": format!("Receiver failed to connect to data plane: {}", e)
+                    }),
+                };
+                let _ = outgoing_tx.send(fail_env).await;
                 return;
             }
         };
@@ -439,6 +623,7 @@ impl TransferEngine {
             direction: "RECEIVE".to_string(),
             progress: 0.0,
             status: "TRANSFERRING".to_string(),
+            data_type: offer.data_type.clone(),
         });
 
         let mut fully_completed = false;
@@ -524,6 +709,7 @@ impl TransferEngine {
                     direction: "RECEIVE".to_string(),
                     progress: pct,
                     status: "TRANSFERRING".to_string(),
+                    data_type: offer.data_type.clone(),
                 });
             }
 
@@ -569,25 +755,68 @@ impl TransferEngine {
                         direction: "RECEIVE".to_string(),
                         progress: 100.0,
                         status: "COMPLETED".to_string(),
+                        data_type: offer.data_type.clone(),
                     });
 
-                    // P1-9 / R4: Show transfer notification reflecting injection mode
-                    let notification_body = if auto_inject {
-                        format!("{} (已自动装载至剪贴板)", offer.preview_summary)
-                    } else {
-                        format!("{} (已保存在沙盒，可在面板中点击装载)", offer.preview_summary)
-                    };
-                    let _ = show_transfer_notification(&app_handle, "UniDrop 文件接收完成", &notification_body);
+                    match offer.data_type.as_str() {
+                        "TEXT" => {
+                            // Clipboard text: write directly into the system clipboard
+                            if let Some(path) = completed_paths.first() {
+                                if let Ok(bytes) = fs::read(path) {
+                                    let text = String::from_utf8_lossy(&bytes).to_string();
+                                    let write_result = tokio::task::spawn_blocking(move || {
+                                        crate::platform::write_text_to_clipboard(&text)
+                                    })
+                                    .await
+                                    .unwrap_or_else(|_| Err("clipboard task panicked".to_string()));
+                                    if let Err(e) = write_result {
+                                        log::error!("Failed to write received text to clipboard: {}", e);
+                                    }
+                                }
+                            }
+                            let _ = show_transfer_notification(&app_handle, "UniDrop 文本已同步", "已写入系统剪贴板，可直接粘贴");
+                            let _ = cache_manager.mark_clipboard_injected(&session_id).await;
+                        }
+                        "IMAGE" => {
+                            // Clipboard image: write PNG directly into the system clipboard
+                            if let Some(path) = completed_paths.first() {
+                                if let Ok(bytes) = fs::read(path) {
+                                    let write_result = tokio::task::spawn_blocking(move || {
+                                        crate::platform::write_image_to_clipboard(&bytes)
+                                    })
+                                    .await
+                                    .unwrap_or_else(|_| Err("clipboard task panicked".to_string()));
+                                    if let Err(e) = write_result {
+                                        log::error!("Failed to write received image to clipboard: {}", e);
+                                    }
+                                }
+                            }
+                            let _ = show_transfer_notification(&app_handle, "UniDrop 图片已同步", "已写入系统剪贴板，可直接粘贴");
+                            let _ = cache_manager.mark_clipboard_injected(&session_id).await;
+                        }
+                        _ => {
+                            // P1-9 / R4: Show transfer notification reflecting injection mode
+                            let notification_body = if auto_inject {
+                                format!("{} (已自动装载至剪贴板)", offer.preview_summary)
+                            } else {
+                                format!("{} (已保存在沙盒，可在面板中点击装载)", offer.preview_summary)
+                            };
+                            let _ = show_transfer_notification(&app_handle, "UniDrop 文件接收完成", &notification_body);
 
-                    // P1-9: Auto inject into clipboard if configured
-                    if auto_inject && !completed_paths.is_empty() {
-                        let paths_clone = completed_paths.clone();
-                        tokio::task::spawn_blocking(move || {
-                            crate::platform::inject_files_to_clipboard(&paths_clone)
-                        }).await.ok();
-                        // M2: Mark 2h immunity lock for auto-injected files
-                        let _ = cache_manager.mark_clipboard_injected(&session_id).await;
+                            // P1-9: Auto inject into clipboard if configured
+                            if auto_inject && !completed_paths.is_empty() {
+                                let paths_clone = completed_paths.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    crate::platform::inject_files_to_clipboard(&paths_clone)
+                                })
+                                .await
+                                .ok();
+                                // M2: Mark 2h immunity lock for auto-injected files
+                                let _ = cache_manager.mark_clipboard_injected(&session_id).await;
+                            }
+                        }
                     }
+                    update_history_status(&app_handle, &session_id, "COMPLETED", None).await;
                 } else {
                     let fail_env = ControlEnvelope {
                         version: 1,
@@ -621,7 +850,9 @@ impl TransferEngine {
                 direction: "RECEIVE".to_string(),
                 progress: if total_size > 0 { ((total_received_bytes as f64) / (total_size as f64) * 100.0).clamp(0.0, 100.0) } else { 0.0 },
                 status: "FAILED".to_string(),
+                data_type: offer.data_type.clone(),
             });
+            update_history_status(&app_handle, &session_id, "FAILED", Some("接收连接中断或校验失败")).await;
 
             let fail_env = ControlEnvelope {
                 version: 1,
@@ -716,5 +947,36 @@ mod tests {
         assert_eq!(offer.items[1].relative_path, "file2.txt");
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_prepare_offer_from_bytes_text_and_chunking() {
+        let session_id = Uuid::new_v4();
+
+        // Small text: single chunk, TEXT summary present
+        let (offer, source) =
+            TransferEngine::prepare_offer_from_bytes(session_id, "TEXT", "clipboard.txt", b"hello clipboard".to_vec())
+                .unwrap();
+        assert_eq!(offer.data_type, "TEXT");
+        assert_eq!(offer.total_items, 1);
+        assert_eq!(offer.total_size, b"hello clipboard".len() as i64);
+        assert_eq!(offer.items[0].total_chunks, 1);
+        assert!(offer.preview_summary.contains("文本"));
+        assert!(matches!(source, TransferSource::Memory(_)));
+
+        // Expected SHA-256 of the payload
+        let mut hasher = Sha256::new();
+        hasher.update(b"hello clipboard");
+        assert_eq!(offer.items[0].sha256, hex::encode(hasher.finalize()));
+
+        // Payload larger than one chunk (>4MB) splits into the right number of chunks
+        let big = vec![7u8; (MAX_PAYLOAD_LENGTH as usize) * 2 + 1024];
+        let (offer_big, _) =
+            TransferEngine::prepare_offer_from_bytes(session_id, "IMAGE", "clipboard.png", big).unwrap();
+        assert_eq!(offer_big.items[0].total_chunks, 3);
+        assert!(offer_big.preview_summary.contains("图片"));
+
+        // Empty payload is rejected
+        assert!(TransferEngine::prepare_offer_from_bytes(session_id, "TEXT", "clipboard.txt", Vec::new()).is_err());
     }
 }

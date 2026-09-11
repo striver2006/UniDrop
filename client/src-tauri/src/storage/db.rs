@@ -14,7 +14,17 @@ pub fn init_database(db_path: Option<PathBuf>) -> Result<Connection, rusqlite::E
     // Enable WAL mode for concurrent performance
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
 
-    // Execute Schema DDL
+    create_schema(&conn)?;
+
+    // Lightweight migration for databases created before preview_summary existed.
+    // Errors (duplicate column) are intentionally ignored.
+    let _ = conn.execute_batch("ALTER TABLE transfer_tasks ADD COLUMN preview_summary TEXT;");
+
+    Ok(conn)
+}
+
+/// Creates all tables if missing. Also usable on in-memory connections in tests.
+pub fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         r#"
         -- 1. Transfer Tasks
@@ -28,7 +38,8 @@ pub fn init_database(db_path: Option<PathBuf>) -> Result<Connection, rusqlite::E
             status TEXT CHECK(status IN ('PENDING', 'TRANSFERRING', 'COMPLETED', 'FAILED', 'CANCELLED')) NOT NULL,
             error_message TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            completed_at DATETIME
+            completed_at DATETIME,
+            preview_summary TEXT
         );
 
         -- 2. Transfer Items
@@ -85,7 +96,7 @@ pub fn init_database(db_path: Option<PathBuf>) -> Result<Connection, rusqlite::E
         "#,
     )?;
 
-    Ok(conn)
+    Ok(())
 }
 
 /// Retrieves the existing device_id from SQLite or generates and persists a new one (P1-4).
