@@ -19,7 +19,7 @@ import { SettingsModal } from "./components/SettingsModal";
 import { SendModal } from "./components/SendModal";
 
 const defaultSettings: AppSettings = {
-  server_url: "ws://127.0.0.1:8080",
+  server_url: "wss://drop.yourdomain.com:58921",
   account_id: "default_user",
   psk_secret: "dev-insecure-psk-secret",
   auto_inject: false,
@@ -57,6 +57,9 @@ export const App: React.FC = () => {
       setDevices(list);
 
       const s = await invoke<AppSettings>("cmd_get_settings");
+      if (s.server_url === "ws://127.0.0.1:8080") {
+        s.server_url = "wss://drop.yourdomain.com:58921";
+      }
       setSettings(s);
     } catch (err: any) {
       console.error("fetch initial data error:", err);

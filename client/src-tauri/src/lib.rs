@@ -31,18 +31,22 @@ pub fn run() {
     let device_id = storage::db::get_or_create_device_id(&db).expect("Failed to get/create device_id");
 
     let initial_settings = if let Some(json_str) = storage::db::get_persisted_settings(&db) {
-        serde_json::from_str::<commands::settings_cmd::AppSettings>(&json_str).unwrap_or_else(|_| {
+        let mut loaded = serde_json::from_str::<commands::settings_cmd::AppSettings>(&json_str).unwrap_or_else(|_| {
             commands::settings_cmd::AppSettings {
-                server_url: "ws://127.0.0.1:8080".to_string(),
+                server_url: "wss://drop.yourdomain.com:58921".to_string(),
                 account_id: "default_user".to_string(),
                 psk_secret: "dev-insecure-psk-secret".to_string(),
                 auto_inject: false,
                 rate_limit_mb: 10,
             }
-        })
+        });
+        if loaded.server_url == "ws://127.0.0.1:8080" {
+            loaded.server_url = "wss://drop.yourdomain.com:58921".to_string();
+        }
+        loaded
     } else {
         commands::settings_cmd::AppSettings {
-            server_url: "ws://127.0.0.1:8080".to_string(),
+            server_url: "wss://drop.yourdomain.com:58921".to_string(),
             account_id: "default_user".to_string(),
             psk_secret: "dev-insecure-psk-secret".to_string(),
             auto_inject: false,

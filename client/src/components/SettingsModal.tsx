@@ -20,7 +20,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    onSave(form);
+    let cleanUrl = form.server_url.trim();
+    if (cleanUrl && !cleanUrl.startsWith("ws://") && !cleanUrl.startsWith("wss://")) {
+      cleanUrl = `wss://${cleanUrl}`;
+    }
+    onSave({ ...form, server_url: cleanUrl });
     onClose();
   };
 
@@ -45,7 +49,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
               value={form.server_url}
               onChange={(e) => setForm({ ...form, server_url: e.target.value })}
               className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-teal-500"
-              placeholder="ws://127.0.0.1:8080"
+              placeholder="wss://drop.yourdomain.com:58921"
               required
             />
           </div>

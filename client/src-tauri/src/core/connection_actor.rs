@@ -57,7 +57,12 @@ impl ConnectionActor {
         let max_backoff = Duration::from_secs(30);
 
         loop {
-            let ws_url = format!("{}/ws/control", self.config.server_url);
+            let base = self.config.server_url.trim().trim_end_matches('/');
+            let ws_url = if base.starts_with("ws://") || base.starts_with("wss://") {
+                format!("{}/ws/control", base)
+            } else {
+                format!("wss://{}/ws/control", base)
+            };
             log::info!("Connecting to control server: {}", ws_url);
 
             match connect_async(&ws_url).await {

@@ -135,10 +135,18 @@ impl TransferEngine {
         outgoing_tx: mpsc::Sender<ControlEnvelope>,
         app_handle: AppHandle,
     ) {
-        let ws_data_url = format!(
-            "{}/ws/data?session_id={}&role=sender&device_id={}&target_device_id={}&token={}",
-            server_url, session_id, from_device, to_device, token
-        );
+        let base = server_url.trim().trim_end_matches('/');
+        let ws_data_url = if base.starts_with("ws://") || base.starts_with("wss://") {
+            format!(
+                "{}/ws/data?session_id={}&role=sender&device_id={}&target_device_id={}&token={}",
+                base, session_id, from_device, to_device, token
+            )
+        } else {
+            format!(
+                "wss://{}/ws/data?session_id={}&role=sender&device_id={}&target_device_id={}&token={}",
+                base, session_id, from_device, to_device, token
+            )
+        };
 
         log::info!("Sender connecting to data plane: {}", ws_data_url);
 
@@ -391,10 +399,18 @@ impl TransferEngine {
         outgoing_tx: mpsc::Sender<ControlEnvelope>,
         app_handle: AppHandle,
     ) {
-        let ws_data_url = format!(
-            "{}/ws/data?session_id={}&role=receiver&device_id={}&target_device_id={}&token={}",
-            server_url, session_id, to_device, from_device, token
-        );
+        let base = server_url.trim().trim_end_matches('/');
+        let ws_data_url = if base.starts_with("ws://") || base.starts_with("wss://") {
+            format!(
+                "{}/ws/data?session_id={}&role=receiver&device_id={}&target_device_id={}&token={}",
+                base, session_id, to_device, from_device, token
+            )
+        } else {
+            format!(
+                "wss://{}/ws/data?session_id={}&role=receiver&device_id={}&target_device_id={}&token={}",
+                base, session_id, to_device, from_device, token
+            )
+        };
 
         log::info!("Receiver connecting to data plane: {}", ws_data_url);
 

@@ -19,12 +19,21 @@ pub async fn cmd_get_settings(state: State<'_, AppState>) -> Result<AppSettings,
 
 #[tauri::command]
 pub async fn cmd_save_settings(state: State<'_, AppState>, new_settings: AppSettings) -> Result<(), String> {
-    let json_str = serde_json::to_string(&new_settings).map_err(|e| e.to_string())?;
+    let mut clean_settings = new_settings;
+    clean_settings.server_url = clean_settings.server_url.trim().trim_end_matches('/').to_string();
+    if !clean_settings.server_url.is_empty()
+        && !clean_settings.server_url.starts_with("ws://")
+        && !clean_settings.server_url.starts_with("wss://")
+    {
+        clean_settings.server_url = format!("wss://{}", clean_settings.server_url);
+    }
+
+    let json_str = serde_json::to_string(&clean_settings).map_err(|e| e.to_string())?;
     {
         let conn = state.db_conn.lock().await;
         crate::storage::db::save_persisted_settings(&conn, &json_str).map_err(|e| e.to_string())?;
     }
     let mut s = state.settings.lock().await;
-    *s = new_settings;
+    *s = clean_settings;
     Ok(())
 }
