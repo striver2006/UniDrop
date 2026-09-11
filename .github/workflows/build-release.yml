@@ -53,9 +53,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectPath: client
-          tagName: ${{ github.ref_name }}
-          releaseName: 'UniDrop ${{ github.ref_name }}'
-          releaseBody: '跨平台原生剪贴板与文件分发系统 / Cross-platform native clipboard and file distribution'
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.1.0' }}
+          releaseName: 'UniDrop ${{ github.ref_type == 'tag' && github.ref_name || 'v0.1.0' }}'
+          releaseBody: '瞬贴 (UniDrop) - 跨平台原生剪贴板与文件分发系统 / Cross-platform native clipboard and file distribution'
           releaseDraft: false
           prerelease: false
 
