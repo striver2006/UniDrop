@@ -1,0 +1,33 @@
+[Unit]
+Description=UniDrop Relay Server Daemon
+Documentation=https://github.com/unidrop/unidrop
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=unidrop
+Group=unidrop
+WorkingDirectory=/opt/unidrop
+ExecStart=/opt/unidrop/unidrop-server
+Restart=always
+RestartSec=5s
+
+# Environment settings
+Environment=UNIDROP_LISTEN_ADDR=:8080
+Environment=UNIDROP_STUN_ADDR=:3478
+# Strongly recommend setting secret in /etc/default/unidrop or via EnvironmentFile
+EnvironmentFile=-/etc/default/unidrop
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictRealtime=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

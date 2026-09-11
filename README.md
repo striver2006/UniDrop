@@ -1,4 +1,4 @@
-# UniDrop (UniClip)
+<h1 align="center">UniDrop (UniClip)</h1>
 
 <p align="center">
   <strong>无缝、高效、安全的跨平台剪贴板与文件流转系统</strong><br>
@@ -133,10 +133,13 @@ pnpm tauri build
 
 ---
 
-## 📖 设计文档
+## 📖 官方文档与技术手册
 
-* [需求规格说明书 (REQUIREMENTS.md)](./REQUIREMENTS.md)
-* [系统详细设计说明书 (DESIGN.md)](./DESIGN.md)
+* [客户端安装手册 (INSTALL.md)](./docs/INSTALL.md) - macOS / Windows / Linux 安装与权限配置指南
+* [服务端部署运维手册 (DEPLOY.md)](./docs/DEPLOY.md) - Docker、Systemd、Nginx 反代与监控方案
+* [客户端用户使用手册 (USER_GUIDE.md)](./docs/USER_GUIDE.md) - 首次配对、设备发现、文件发送与剪贴板无感粘贴
+* [需求规格说明书 (REQUIREMENTS.md)](./REQUIREMENTS.md) - 产品 PRD 规格
+* [系统详细设计说明书 (DESIGN.md)](./DESIGN.md) - 架构与协议详细设计
 
 ---
 

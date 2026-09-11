@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"strconv"
 )
 
 // Config stores application configuration settings.
@@ -33,6 +34,11 @@ func Load() *Config {
 	}
 	if stun := os.Getenv("UNIDROP_STUN_ADDR"); stun != "" {
 		cfg.STUNAddr = stun
+	}
+	if timeoutStr := os.Getenv("UNIDROP_HEARTBEAT_TIMEOUT"); timeoutStr != "" {
+		if val, err := strconv.Atoi(timeoutStr); err == nil && val > 0 {
+			cfg.HeartbeatTimeout = val
+		}
 	}
 
 	return cfg
