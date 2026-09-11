@@ -24,14 +24,16 @@ pub struct ConnectionConfig {
 
 pub struct ConnectionActor {
     config: ConnectionConfig,
+    #[allow(dead_code)]
     outgoing_tx: mpsc::Sender<ControlEnvelope>,
+    #[allow(dead_code)]
     incoming_rx: Arc<Mutex<mpsc::Receiver<ControlEnvelope>>>,
 }
 
 impl ConnectionActor {
     pub fn new(config: ConnectionConfig) -> (Self, mpsc::Sender<ControlEnvelope>, mpsc::Receiver<ControlEnvelope>) {
         let (out_tx, out_rx) = mpsc::channel(128);
-        let (in_tx, in_rx) = mpsc::channel(128);
+        let (_in_tx, in_rx) = mpsc::channel(128);
 
         let actor = Self {
             config,

@@ -1,14 +1,12 @@
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::PathBuf;
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::core::cache_manager::CacheManager;
 use crate::core::path_guard::PathGuard;
-use crate::protocol::{BinaryHeader, ChunkType, TransferItemPayload, TransferOfferPayload, MAX_PAYLOAD_LENGTH};
+use crate::protocol::{BinaryHeader, TransferItemPayload, TransferOfferPayload, MAX_PAYLOAD_LENGTH};
 
 pub struct TransferEngine {
     cache_manager: CacheManager,

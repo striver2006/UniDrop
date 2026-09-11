@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use rusqlite::Connection;
 use tokio::sync::Mutex;
 
@@ -17,7 +17,7 @@ pub struct CacheManager {
 }
 
 impl CacheManager {
-    pub fn new(db_conn: Arc<Mutex<Connection>>) -> io_result::Result<Self, String> {
+    pub fn new(db_conn: Arc<Mutex<Connection>>) -> Result<Self, String> {
         let cache_root = Self::resolve_default_cache_dir();
         fs::create_dir_all(&cache_root).map_err(|e| format!("failed to create cache dir: {}", e))?;
 

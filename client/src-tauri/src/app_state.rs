@@ -1,10 +1,11 @@
 use std::sync::Arc;
 use rusqlite::Connection;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::commands::settings_cmd::AppSettings;
 use crate::core::cache_manager::CacheManager;
-use crate::protocol::OnlineDevice;
+use crate::core::transfer_engine::TransferEngine;
+use crate::protocol::{ControlEnvelope, OnlineDevice};
 
 pub struct AppState {
     pub device_id: String,
@@ -13,13 +14,16 @@ pub struct AppState {
     pub app_version: String,
     pub db_conn: Arc<Mutex<Connection>>,
     pub cache_manager: CacheManager,
+    pub transfer_engine: Arc<TransferEngine>,
     pub online_devices: Arc<Mutex<Vec<OnlineDevice>>>,
     pub settings: Arc<Mutex<AppSettings>>,
+    pub outgoing_tx: mpsc::Sender<ControlEnvelope>,
 }
 
 impl AppState {
-    pub fn new(db_conn: Arc<Mutex<Connection>>) -> Self {
+    pub fn new(db_conn: Arc<Mutex<Connection>>, outgoing_tx: mpsc::Sender<ControlEnvelope>) -> Self {
         let cache_manager = CacheManager::new(db_conn.clone()).expect("Failed to initialize CacheManager");
+        let transfer_engine = Arc::new(TransferEngine::new(cache_manager.clone()));
 
         let device_id = uuid::Uuid::new_v4().to_string();
         let hostname = whoami_hostname();
@@ -41,8 +45,10 @@ impl AppState {
             app_version,
             db_conn,
             cache_manager,
+            transfer_engine,
             online_devices: Arc::new(Mutex::new(Vec::new())),
             settings: Arc::new(Mutex::new(default_settings)),
+            outgoing_tx,
         }
     }
 }

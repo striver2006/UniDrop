@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(non_camel_case_types)]
 pub enum ActionType {
     AUTH_CHALLENGE,
     AUTH_REQUEST,

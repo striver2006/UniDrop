@@ -1,4 +1,5 @@
 use objc2::rc::autoreleasepool;
+use objc2::runtime::ProtocolObject;
 use objc2_app_kit::NSPasteboard;
 use objc2_foundation::{NSArray, NSString, NSURL};
 use std::path::PathBuf;
@@ -20,7 +21,8 @@ pub fn inject_files_to_clipboard(paths: &[PathBuf]) -> Result<(), String> {
             // Safe NSString conversion with internal null termination
             let ns_path = NSString::from_str(path_str);
             let ns_url = unsafe { NSURL::fileURLWithPath(&ns_path) };
-            url_vec.push(ns_url);
+            let proto_obj = ProtocolObject::from_retained(ns_url);
+            url_vec.push(proto_obj);
         }
 
         let ns_array = NSArray::from_vec(url_vec);

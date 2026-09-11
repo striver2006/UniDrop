@@ -34,3 +34,22 @@ jobs:
         run: |
           pnpm install
           pnpm build
+
+  check-rust:
+    name: Check Rust Backend
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install System Dependencies (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Setup Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Check Rust Code
+        working-directory: client/src-tauri
+        run: cargo check

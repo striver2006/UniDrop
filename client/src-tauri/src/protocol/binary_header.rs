@@ -28,13 +28,14 @@ impl TryFrom<u8> for ChunkType {
     }
 }
 
-bitflags::bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct FrameFlags: u32 {
-        const ENCRYPTED = 1 << 0;
-        const COMPRESSED = 1 << 1;
-        const LAST_CHUNK = 1 << 2;
-    }
+pub const FLAG_ENCRYPTED: u32 = 1 << 0;
+pub const FLAG_COMPRESSED: u32 = 1 << 1;
+pub const FLAG_LAST_CHUNK: u32 = 1 << 2;
+
+pub fn compute_crc32(data: &[u8]) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(data);
+    hasher.finalize()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,10 +56,10 @@ pub struct BinaryHeader {
 
 impl BinaryHeader {
     pub fn new_data(session_id: Uuid, item_index: u32, chunk_index: u32, total_chunks: u32, payload: &[u8]) -> Self {
-        let checksum = crc32fast::Hasher::to_checksum(payload);
+        let checksum = compute_crc32(payload);
         let mut flags = 0u32;
         if chunk_index + 1 == total_chunks {
-            flags |= FrameFlags::LAST_CHUNK.bits();
+            flags |= FLAG_LAST_CHUNK;
         }
 
         Self {
@@ -190,7 +191,7 @@ impl BinaryHeader {
         if payload.len() as u32 != self.payload_len {
             return Err(Error::new(ErrorKind::InvalidData, "Payload length mismatch"));
         }
-        let actual = crc32fast::Hasher::to_checksum(payload);
+        let actual = compute_crc32(payload);
         if actual != self.checksum {
             return Err(Error::new(ErrorKind::InvalidData, format!("CRC32 mismatch: declared=0x{:08x}, actual=0x{:08x}", self.checksum, actual)));
         }

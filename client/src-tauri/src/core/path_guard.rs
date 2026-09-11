@@ -26,9 +26,22 @@ pub struct PathGuard;
 impl PathGuard {
     /// Sanitizes an untrusted relative path and resolves it safely within base_cache_dir.
     pub fn sanitize_and_resolve(base_cache_dir: &Path, untrusted_path: &str) -> Result<PathBuf, PathSecurityError> {
-        let path = Path::new(untrusted_path);
+        let trimmed_str = untrusted_path.trim_start();
 
-        // 1. Disallow absolute paths
+        // 1. Disallow absolute paths (POSIX / or Windows C: or UNC \\)
+        if trimmed_str.starts_with('/')
+            || trimmed_str.starts_with('\\')
+            || (trimmed_str.len() >= 2
+                && trimmed_str.chars().next().map_or(false, |c| c.is_ascii_alphabetic())
+                && trimmed_str.chars().nth(1) == Some(':'))
+        {
+            return Err(PathSecurityError::AbsolutePathForbidden);
+        }
+
+        // Normalize backslashes to forward slashes for uniform cross-platform parsing
+        let normalized = untrusted_path.replace('\\', "/");
+        let path = Path::new(&normalized);
+
         if path.is_absolute() {
             return Err(PathSecurityError::AbsolutePathForbidden);
         }
