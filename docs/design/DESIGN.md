@@ -1279,7 +1279,7 @@ unidrop-client/
         │   ├── TrayMenu.tsx         # 托盘菜单面板
         │   ├── DeviceCard.tsx       # 在线设备状态卡片
         │   ├── TransferToast.tsx    # 传输进度浮动悬浮窗
-        │   └── SettingsModal.tsx    # 自启动、限流与 E2EE 偏好设置
+        │   └── SettingsModal.tsx    # 连接/密钥、自动装载、开机自启与启动最小化偏好设置
         └── hooks/                   # Tauri 事件总线订阅 Hooks
 ```
 
@@ -1287,7 +1287,9 @@ unidrop-client/
 解决审查 P3-3（客户端安全软件误报与系统级分发合规）：
 1. **Windows 平台**：
    * 采用 EV 代码签名证书对生成的 `.exe` / `.msi` 安装包进行数字签名，杜绝 Windows Defender 与 SmartScreen 阻拦；
-   * 安装包注册自启动注册表项：`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`。
+   * 自启动**不由安装包注册**：由应用内「开机自动启动」开关经 `tauri-plugin-autostart`
+     运行时写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`。
+     安装包一并写入会与应用内开关双写冲突，且卸载残留难清理。
 2. **macOS 平台**：
    * 必须申请 Apple Developer 证书，使用 `codesign` 实施 Hardened Runtime 签名；
    * 通过 Apple Notary 服务完成公证（Notarization）并执行 `xcrun stapler staple`；

@@ -24,6 +24,24 @@ use protocol::{
 use storage::db::init_database;
 use storage::HistoryRepo;
 
+/// 唤起主窗口的唯一入口。
+///
+/// 「隐藏到托盘」与「最小化到任务栏」是两种不同的形态：后者窗口仍是 visible，
+/// 只调 show() + set_focus() 在 Windows 上无法还原，必须先 unminimize()。
+/// 托盘菜单、托盘点击、第二实例、macOS Reopen 全部走这里，避免各处行为不一致。
+fn reveal_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    match app.get_webview_window("main") {
+        Some(win) => {
+            if win.is_minimized().unwrap_or(false) {
+                let _ = win.unminimize();
+            }
+            let _ = win.show();
+            let _ = win.set_focus();
+        }
+        None => log::warn!("Requested to reveal main window but it is gone"),
+    }
+}
+
 pub fn run() {
     env_logger::init();
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -33,27 +51,18 @@ pub fn run() {
     let device_id = storage::db::get_or_create_device_id(&db).expect("Failed to get/create device_id");
 
     let initial_settings = if let Some(json_str) = storage::db::get_persisted_settings(&db) {
-        let mut loaded = serde_json::from_str::<commands::settings_cmd::AppSettings>(&json_str).unwrap_or_else(|_| {
-            commands::settings_cmd::AppSettings {
-                server_url: "wss://drop.yourdomain.com:58921".to_string(),
-                account_id: "default_user".to_string(),
-                psk_secret: "dev-insecure-psk-secret".to_string(),
-                auto_inject: false,
-                rate_limit_mb: 10,
-            }
-        });
+        let mut loaded = serde_json::from_str::<commands::settings_cmd::AppSettings>(&json_str)
+            .unwrap_or_else(|e| {
+                // 走到这里意味着用户已存的配置会被全量丢弃，必须留下痕迹
+                log::warn!("Failed to parse persisted settings ({}), falling back to defaults", e);
+                commands::settings_cmd::AppSettings::default_config()
+            });
         if loaded.server_url == "ws://127.0.0.1:8080" {
             loaded.server_url = "wss://drop.yourdomain.com:58921".to_string();
         }
         loaded
     } else {
-        commands::settings_cmd::AppSettings {
-            server_url: "wss://drop.yourdomain.com:58921".to_string(),
-            account_id: "default_user".to_string(),
-            psk_secret: "dev-insecure-psk-secret".to_string(),
-            auto_inject: false,
-            rate_limit_mb: 10,
-        }
+        commands::settings_cmd::AppSettings::default_config()
     };
 
     let config = ConnectionConfig {
@@ -89,15 +98,24 @@ pub fn run() {
     let pending_inbound: Arc<Mutex<HashMap<String, (TransferOfferPayload, String)>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let pending_inbound_ref = pending_inbound.clone();
+    let start_minimized_on_launch = initial_settings.start_minimized;
 
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            log::info!("Another instance attempted to start, focusing existing window");
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.show();
-                let _ = win.set_focus();
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            // 系统拉起的第二实例（带 --silent）不该抢焦点；用户双击图标的必须唤起
+            if !core::startup::should_focus_second_instance(&args) {
+                log::info!("Second instance is an autostart launch, keeping window state");
+                return;
             }
+            log::info!("Another instance attempted to start, focusing existing window");
+            reveal_main_window(app);
         }))
+        // 自启注册项固定带 --silent，只作为「系统拉起」的标记；
+        // 是否显示窗口由 AppSettings.start_minimized 决定，与拉起方式无关。
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec![core::startup::AUTOSTART_FLAG]),
+        ))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
@@ -351,15 +369,11 @@ pub fn run() {
                         app.exit(0);
                     }
                     "show" => {
-                        if let Some(win) = app.get_webview_window("main") {
-                            let _ = win.show();
-                            let _ = win.set_focus();
-                        }
+                        reveal_main_window(app);
                     }
                     "settings" => {
+                        reveal_main_window(app);
                         if let Some(win) = app.get_webview_window("main") {
-                            let _ = win.show();
-                            let _ = win.set_focus();
                             let _ = win.emit("open-settings", ());
                         }
                     }
@@ -374,20 +388,25 @@ pub fn run() {
                     {
                         let app = tray.app_handle();
                         if let Some(win) = app.get_webview_window("main") {
-                            if win.is_visible().unwrap_or(false) {
+                            // 最小化到任务栏时窗口仍是 visible，此时应还原而不是隐藏
+                            if win.is_visible().unwrap_or(false)
+                                && !win.is_minimized().unwrap_or(false)
+                            {
                                 let _ = win.hide();
                             } else {
-                                let _ = win.show();
-                                let _ = win.set_focus();
+                                reveal_main_window(app);
                             }
                         }
                     }
                 })
                 .build(app)?;
 
-            if let Some(win) = app.get_webview_window("main") {
-                let _ = win.show();
-                let _ = win.set_focus();
+            // 8. 冷启动显隐：只取决于用户配置，手动启动与开机自启一视同仁。
+            // 窗口在 tauri.conf.json 里初始 visible:false，避免 minimized 时的闪窗。
+            if core::startup::should_show_on_launch(start_minimized_on_launch) {
+                reveal_main_window(app.handle());
+            } else {
+                log::info!("Starting minimized to tray per user setting");
             }
 
             Ok(())
@@ -405,6 +424,8 @@ pub fn run() {
             commands::cmd_send_files,
             commands::cmd_get_settings,
             commands::cmd_save_settings,
+            commands::cmd_get_autostart,
+            commands::cmd_set_autostart,
             commands::cmd_hide_window,
             commands::cmd_read_clipboard_preview,
             commands::cmd_send_clipboard,
@@ -418,10 +439,7 @@ pub fn run() {
         .run(|app_handle, event| {
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event {
-                if let Some(win) = app_handle.get_webview_window("main") {
-                    let _ = win.show();
-                    let _ = win.set_focus();
-                }
+                reveal_main_window(app_handle);
             }
             #[cfg(not(target_os = "macos"))]
             let _ = (app_handle, event);

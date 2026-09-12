@@ -25,6 +25,7 @@ const defaultSettings: AppSettings = {
   psk_secret: "dev-insecure-psk-secret",
   auto_inject: false,
   rate_limit_mb: 10,
+  start_minimized: false,
 };
 
 export const App: React.FC = () => {
@@ -159,6 +160,8 @@ export const App: React.FC = () => {
     } catch (err: any) {
       console.error("save settings error:", err);
       showNotification(typeof err === "string" ? err : "保存设置失败", "error");
+      // 向上抛出，让设置弹窗保持打开、保留用户已填内容
+      throw err;
     }
   };
 

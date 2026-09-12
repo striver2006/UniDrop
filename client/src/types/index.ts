@@ -12,6 +12,8 @@ export interface AppSettings {
   psk_secret: string;
   auto_inject: boolean;
   rate_limit_mb: number;
+  /** 启动时不弹出主窗口，仅托盘常驻。对手动启动与开机自启同样生效。 */
+  start_minimized: boolean;
 }
 
 export interface ActiveTransfer {

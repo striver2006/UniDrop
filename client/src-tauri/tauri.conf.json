@@ -20,7 +20,7 @@
         "decorations": false,
         "center": true,
         "alwaysOnTop": false,
-        "visible": true,
+        "visible": false,
         "skipTaskbar": false
       }
     ],
