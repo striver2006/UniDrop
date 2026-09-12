@@ -8,6 +8,7 @@ target/
 *.so
 *.dylib
 *.out
+/server/diag-*
 
 # Node / Frontend
 node_modules/
