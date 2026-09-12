@@ -25,10 +25,20 @@ review:
   failure_policy: strict
   allow_single_flag: true
   timeout_s:
-    plan: 900
-    code: 1200
+    # plan 从 900 提到 1500，对齐 TriviumCode。那边实测 GLM-5.3-Flash 跑一次计划审
+    # 要 682~900+ 秒（74 次工具调用、含子 Agent），900s 卡在边缘；本项目 default 档
+    # 的 plan 侧现在也是更慢的非 Flash GLM-5.3。
+    plan: 1500
+    # code 从 1200 提到 2700，对齐 TriviumCode。那边实测 GLM-5.3-Flash 审 258KB
+    # 补丁用了 1063s、277KB 的那次直接撞满 1200s；本项目 default 档的 code 侧现在
+    # 换成了更慢的非 Flash GLM-5.3，1200s 余量不足。
+    # 注意：2700 是借来的经验值，不是本仓库的实测结果，撞到再按实测调。
+    code: 2700
     bug: 1200
-  wait_timeout_s: 540
+  # 每次 --wait 的窗口，也是用户能收到进度的最小间隔（Bash 工具在命令退出前
+  # 不回传 stdout，窗口内 Driver 说不了话）。540→180 对齐 TriviumCode：
+  # 9 分钟一声等于没有反馈。
+  wait_timeout_s: 180
   heartbeat_stale_s: 120
   retry:
     transient_max: 1
@@ -71,9 +81,12 @@ critics:
     vendor: antigravity
     bin: null
     agent: trivium-critic
+    # slug 后缀才是权威：模型名带 -high/-medium/-low 时编排器不传 --effort
+    # （agy 1.2.0 会报冲突，坑 P-16）。当前两档 slug 全是 -high，此处三项均随之写 high，
+    # 否则归档 front-matter 会记下一个从未生效的 effort 值。
     effort:
       plan: high
-      code: medium
+      code: high
       bug: high
     readonly_commands:
       - git log
@@ -94,45 +107,29 @@ critics:
     entry: null
     max_turns: 40
     unsupported_override: reject
+# 两档的差异只在 GLM 侧用不用 Flash——gemini 侧两档相同。
+# 不写 profile 级 effort：该字段无任何读取点，且 slug 自带后缀时 effort 本就不生效。
+# 注意配置是递归合并的：这里写了哪些档，就在内置默认的两档之上叠加哪些档，
+# 所以旧档位必须从这里删掉，光改内置默认不够。
 profiles:
   default:
     gemini:
-      plan: gemini-3.1-pro-high
+      plan: gemini-3.8-flash-high
       code: gemini-3.8-flash-high
-      bug: gemini-3.1-pro-high
-    glm:
-      plan: GLM-5.3
-      code: GLM-5.3-Flash
-      bug: GLM-5.3
-  architecture:
-    gemini:
-      plan: gemini-3.1-pro-high
-      code: gemini-3.1-pro-high
-      bug: gemini-3.1-pro-high
-      effort: high
+      bug: gemini-3.8-flash-high
     glm:
       plan: GLM-5.3
       code: GLM-5.3
       bug: GLM-5.3
-  hotfix:
+  flash:
     gemini:
-      plan: gemini-3.8-flash-low
-      code: gemini-3.8-flash-low
-      bug: gemini-3.8-flash-low
+      plan: gemini-3.8-flash-high
+      code: gemini-3.8-flash-high
+      bug: gemini-3.8-flash-high
     glm:
       plan: GLM-5.3-Flash
       code: GLM-5.3-Flash
       bug: GLM-5.3-Flash
-  security:
-    gemini:
-      plan: gemini-3.1-pro-high
-      code: gemini-3.1-pro-high
-      bug: gemini-3.1-pro-high
-      effort: high
-    glm:
-      plan: GLM-5.3
-      code: GLM-5.3
-      bug: GLM-5.3
 active_profile: default
 gate:
   require_adjudication: true
