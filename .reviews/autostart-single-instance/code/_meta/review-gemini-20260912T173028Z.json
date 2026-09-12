@@ -1,0 +1,58 @@
+{
+  "agreed": [
+    "开机自启与本地持久化配置彻底解耦：自启状态以操作系统为唯一事实源（不进 AppSettings / 不落 SQLite），消除了内存、本地库与 OS 状态的三方漂移问题。",
+    "自启写操作具备严格幂等性与校验闭环：cmd_set_autostart 写入前比对 OS 实时值避免无意义重写，写入后复查状态保证返回成功即代表 OS 状态生效。",
+    "老版本配置反序列化兼容保护完备：AppSettings.start_minimized 添加 #[serde(default)] 并配套单元测试，有效防范老库升级时用户既有网络与密钥配置被静默冲掉。",
+    "多实例与窗口还原调用链统一：抽离 reveal_main_window 统一处理 unminimize、show、set_focus，第二实例回调正确识别 --silent 参数避免系统拉起时误抢焦点。",
+    "启动显隐策略抽成纯函数：core::startup 封装无副作用判定函数并提供完整的四状态真值表单测，tauri.conf.json 改为初始 visible:false 彻底消除冷启动闪窗。",
+    "设置弹窗错误处理闭环：保存配置失败时向外冒泡保持弹窗开启并显示错误，自启修改失败即时回滚 UI 开关。"
+  ],
+  "consulted": [
+    ".github/workflows/build-release.yml",
+    ".github/workflows/client-ci.yml",
+    ".reviews/autostart-single-instance/code/_meta/changes-20260912T173028Z.diff",
+    ".reviews/autostart-single-instance/plan/2026-09-13-autostart-single-instance-revised-claude.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "README.md",
+    "client/package.json",
+    "client/src-tauri/Cargo.lock",
+    "client/src-tauri/Cargo.toml",
+    "client/src-tauri/capabilities/default.json",
+    "client/src-tauri/src/app_state.rs",
+    "client/src-tauri/src/commands/mod.rs",
+    "client/src-tauri/src/commands/settings_cmd.rs",
+    "client/src-tauri/src/core/mod.rs",
+    "client/src-tauri/src/core/startup.rs",
+    "client/src-tauri/src/lib.rs",
+    "client/src-tauri/src/storage/db.rs",
+    "client/src-tauri/tauri.conf.json",
+    "client/src/App.tsx",
+    "client/src/components/SettingsModal.tsx",
+    "client/src/types/index.ts",
+    "docs/design/DESIGN.md",
+    "docs/需求.md"
+  ],
+  "findings": [
+    {
+      "confidence": "medium",
+      "evidence": "在 client/src/components/SettingsModal.tsx:29-40 中，useEffect 在 isOpen 变为 true 时通过 invoke(\"cmd_get_autostart\") 异步拉取操作系统自启状态，但在请求发出到完成期间并未设置 autostartBusy。组件初始状态 autostart 为 false，若系统实际已开启自启且读取稍有延迟，复选框在加载完成前保持可点击且显示为关闭；用户若在此窗口期快速点击复选框，不仅会触发与预期相反的写入，随后的读取结果 resolve 还会再次覆盖用户的最新操作。",
+      "id": "AGY-01",
+      "kind": "concurrency",
+      "layer": "code",
+      "location": "client/src/components/SettingsModal.tsx:29-40",
+      "problem": "SettingsModal 打开时异步拉取 OS 自启状态期间未置 busy/loading 态，存在竞态覆盖与陈旧值闪烁隐患。",
+      "severity": "nit",
+      "suggestion": "在拉取自启状态前将 autostartBusy 设为 true，在 Promise 的 finally 中恢复为 false，保证加载期间开关禁用且状态变更不可插队。"
+    }
+  ],
+  "not_covered": [
+    "未在真实的 Windows 10/11 实体机环境实测 HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run 注册表键读写及从任务栏还原窗口的交互。",
+    "未在 Linux 桌面环境（GNOME / KDE）实测 ~/.config/autostart/*.desktop 文件读写与 AppImage 移动后路径的稳定性。",
+    "未在 macOS Ventura+ 实体系统上验证 LaunchAgent 注册后的系统设置通知及 Background Items 授权管理交互。",
+    "未对托盘后台长期常驻运行时的内存开销进行长时间压测。"
+  ],
+  "schema": "trivium.review.v1",
+  "summary": "本代码变更严格落实了已批准修订计划（plan §3-§4）中的全部设计，整体架构清晰稳健。\n自启事实源与本地存储彻底解耦，幂等系统调用配合复查机制杜绝了状态漂移。\n老库反序列化兼容性及四状态真值表均有完备单测护航，窗口还原与单实例交互逻辑健全。\n仅在 SettingsModal 打开时初次拉取自启状态的异步期间存在一处微小的交互竞态（未置 loading 禁用态），属 nit 级别，不影响整体上线安全性。\n判定为 approve-with-nits。",
+  "verdict": "approve-with-nits"
+}

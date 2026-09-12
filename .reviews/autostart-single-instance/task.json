@@ -1,0 +1,43 @@
+{
+  "schema": "trivium.task.v1",
+  "topic": "autostart-single-instance",
+  "goal": "增加配置项：是否开机启动；实现一台主机只能运行一个实例。",
+  "created_at": "2026-09-12T17:18:56.413Z",
+  "updated_at": "2026-09-12T17:40:41.683Z",
+  "runs": [
+    {
+      "run_id": "20260912T171855Z",
+      "stage": "plan",
+      "rerun_index": 1,
+      "status": "success",
+      "review_mode": "dual",
+      "started_at": "2026-09-12T17:18:56.404Z"
+    },
+    {
+      "run_id": "20260912T173028Z",
+      "stage": "code",
+      "rerun_index": 1,
+      "status": "success",
+      "review_mode": "dual",
+      "started_at": "2026-09-12T17:30:28.622Z"
+    },
+    {
+      "run_id": "20260912T174039Z",
+      "stage": "verify",
+      "rerun_index": 1,
+      "status": "success",
+      "review_mode": "dual",
+      "started_at": "2026-09-12T17:40:41.683Z"
+    }
+  ],
+  "gate": {
+    "stage": null,
+    "state": "idle",
+    "since": null,
+    "run_id": null
+  },
+  "approvals": [],
+  "degradations": [],
+  "disputed": false,
+  "disputes": []
+}

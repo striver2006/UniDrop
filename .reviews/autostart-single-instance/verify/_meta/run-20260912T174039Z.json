@@ -1,0 +1,20 @@
+{
+  "schema": "trivium.verify-run.v1",
+  "run_id": "20260912T174039Z",
+  "topic": "autostart-single-instance",
+  "stage": "verify",
+  "rerun_index": 1,
+  "status": "success",
+  "started_at": "2026-09-12T17:40:39.087Z",
+  "finished_at": "2026-09-12T17:40:41.676Z",
+  "artifacts": [
+    {
+      "path": "autostart-single-instance/verify/2026-09-13-autostart-single-instance-verify.md",
+      "sha256": "6a937c041bcc71bd80a683eb7d929208f92421fca8c285dc41948dc3f2c365c3"
+    },
+    {
+      "path": "autostart-single-instance/verify/_meta/verify-20260912T174039Z.json",
+      "sha256": "0c8735b82006af9d162f62d1c9c1de9f37073e0220fd7090f87470765d2f32d1"
+    }
+  ]
+}

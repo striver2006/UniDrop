@@ -1,0 +1,87 @@
+{
+  "schema": "trivium.review.v1",
+  "verdict": "approve-with-nits",
+  "summary": "最危险一条：自启开关的「状态」语义弱于 UI 承诺——auto-launch 的 is_enabled 只检查注册项/plist 是否存在，不校验其中路径是否仍指向当前可执行文件；应用被移动或注册路径过期后，开关显示开启、cmd_set_autostart 复查也通过，但开机自启实际失效（GLM-02）。其余为前端自启开关初始拉取与用户操作的竞态（GLM-01，UI 层面自愈）、依赖在特殊路径下的转义/引号缺陷（GLM-03）与供应链噪音（GLM-04）。核心设计经源码逐层核实是正确的：serde(default) 防老库配置被冲、OS 为自启唯一事实源、--silent 契约在 Windows/Linux/macOS 三平台均成立、reveal_main_window 统一了最小化窗口还原。建议合入，GLM-01/02 可作后续小修。",
+  "findings": [
+    {
+      "id": "GLM-01",
+      "severity": "minor",
+      "layer": "code",
+      "kind": "concurrency",
+      "location": "client/src/components/SettingsModal.tsx:29-57",
+      "problem": "打开设置弹窗时发起的 cmd_get_autostart 拉取没有任何过期防护，且拉取期间复选框未被禁用（autostartBusy 只在 handleAutostartChange 内置位）。若用户在拉取返回前切换开关，迟到的 .then(setAutostart) 会用过期值覆盖用户刚设置的值，复选框显示与 OS 实际状态相反，直到下次重开弹窗才自愈；handleAutostartChange 失败回滚用的 previous 快照同样可能取到这个过期值。快速关开弹窗时两次 in-flight 拉取也可能乱序回填。",
+      "evidence": "实读 client/src/components/SettingsModal.tsx：第 29-39 行 useEffect 在 isOpen 时无条件 invoke 并 setAutostart；第 151-157 行复选框仅 disabled={autostartBusy}；初始拉取不置 busy。后端 cmd_get/set_autostart（client/src-tauri/src/commands/settings_cmd.rs:104-148）是幂等直读直写，OS 状态不会被破坏，故影响限于 UI 显示。",
+      "suggestion": "给初始拉取加陈旧响应防护：置位 busy（同时禁用复选框）直到状态确定，或用递增序号/cancelled 标志丢弃过期回调；toggle 失败回滚时以 cmd_get_autostart 重读真实值而非快照。",
+      "confidence": "high"
+    },
+    {
+      "id": "GLM-02",
+      "severity": "minor",
+      "layer": "code",
+      "kind": "contract",
+      "location": "client/src-tauri/src/commands/settings_cmd.rs:104-148",
+      "problem": "cmd_get_autostart 与 cmd_set_autostart 的复查把「注册项存在」当作「自启已生效」，但依赖的 is_enabled 不校验注册路径是否仍指向当前可执行文件：Windows 只查 Run 值与 StartupApproved 是否存在，macOS 只查 plist 文件是否存在。应用被移动/换路径（或先在 dev 二进制上开启、后安装正式版）后，开关显示开启、复查也返回成功，而开机自启实际指向失效路径。",
+      "evidence": "实读 ~/.cargo/registry/.../auto-launch-0.5.0/src/windows.rs:73-83（is_enabled = Run 值存在 && StartupApproved 未禁用，不比对路径）与 macos.rs:161-176（plist 文件存在即 enabled）；tauri-plugin-autostart-2.5.1/src/lib.rs:186-211 注册路径取自 current_exe（仅在插件 setup 时取一次）。settings_cmd.rs:135-144 的复查同样只调 is_enabled，无法发现路径漂移。",
+      "suggestion": "应用层补一层校验：读取状态时解析注册值/plist 中的路径并与 current_exe 比对，不一致时自愈重写或返回带警告的状态；至少把「存在 ≠ 会生效」这一语义差距写进 cmd_get_autostart 的文档注释，避免后来者以为返回 true 即等价于自启可用。",
+      "confidence": "medium"
+    },
+    {
+      "id": "GLM-03",
+      "severity": "nit",
+      "layer": "code",
+      "kind": "correctness",
+      "location": "依赖 auto-launch-0.5.0（经 client/src-tauri/Cargo.toml:21 tauri-plugin-autostart 引入）",
+      "problem": "依赖在边界路径下脆弱且静默失败：macOS LaunchAgent plist 用 format! 直接内插 app_path 与 args，无 XML 转义，路径含 & 等字符会生成非法 plist，launchd 拒绝加载，而 enable 后 is_enabled 仍返回 true；Windows Run 值写成「路径 参数」且路径不加引号，含空格路径依赖 CreateProcess 前缀探测，官方语义上不可靠。两种情形用户侧均表现为「开关已开但开机不自启」。",
+      "evidence": "实读 auto-launch-0.5.0/src/macos.rs:87-111（section 直接 format!(\"<string>{}</string>\", x)，无转义）与 windows.rs:40-43（set_value(format!(\"{} {}\", app_path, args.join(\" \")))，无引号）。触发条件罕见（用户目录含特殊字符/特定安装位置），故仅 nit。",
+      "suggestion": "记录为已知依赖缺陷并跟进上游 issue；若目标用户群路径环境复杂，可考虑应用层自行写注册值/plist（带引号与转义）替代 manager.enable 的对应分支。不需要在本补丁内修复。",
+      "confidence": "low"
+    },
+    {
+      "id": "GLM-04",
+      "severity": "nit",
+      "layer": "code",
+      "kind": "security",
+      "location": "client/src-tauri/Cargo.lock（auto-launch 0.5.0 新增传递依赖）",
+      "problem": "引入 tauri-plugin-autostart 拖入 auto-launch 0.5.0 → winreg 0.10.1 → winapi（已停止维护，RUSTSEC-2020-0017，informational 级），并使 dirs（4.0.0/6.0.0）、redox_users（0.4.6/0.5.2）、winreg（0.10.1/0.55.0）三组 crate 双版本共存。无已知漏洞，但若 CI 启用 unmaintained 告警会开始命中，需预先登记以免噪音掩盖真问题。",
+      "evidence": "实读被审 diff 的 Cargo.lock 段：新增 auto-launch 块（依赖 dirs 4.0.0 / thiserror 1.0.69 / winreg 0.10.1）、新增 winreg 0.10.1 块（依赖 winapi）、新增 redox_users 0.4.6 块，且原单版本引用改为带版本号消歧。这是官方插件的既有依赖树，非本补丁可自行选择。",
+      "suggestion": "在 cargo audit 基线中登记该 informational 告警（或显式 --ignore 对应 advisory ID 并注明原因），其余无需动作。",
+      "confidence": "medium"
+    }
+  ],
+  "agreed": [
+    "#[serde(default)] start_minimized 加老库 JSON 回归测试是实打实的数据丢失防护；已核实设置确实以单条 JSON 存于 SQLite local_config 表 app_settings 键（client/src-tauri/src/storage/db.rs:122-134），注释里的失败路径描述准确，测试会在删掉 default 时变红，符合「能失败的测试才有价值」。",
+    "自启状态以操作系统为唯一事实源、不在 AppSettings 留副本的架构正确，且用测试固化（autostart_is_not_part_of_persisted_settings）；cmd_set_autostart 的幂等短路基准取 OS 实时值而非前端旧值，注释理由成立。",
+    "AppSettings::default_config() 收敛了 lib.rs 原本两处重复字面量，并为解析失败兜底补了 log::warn，比原来的静默回落可观测。",
+    "core/startup.rs 把启动形态判定抽成纯函数并给出真值表测试，负例覆盖到位（--SILENT、-silent、--no-silent、--silently 均不误判）。",
+    "reveal_main_window 统一唤起入口并先 unminimize 再 show，修复了 Windows 最小化窗口只调 show/set_focus 无法还原的真实缺陷；托盘点击分支相应区分了「可见但最小化」。",
+    "跨平台契约经依赖源码核实成立：single-instance 2.4.4 在 macOS 经 Unix socket 通知首实例并转发第二实例完整 argv（含 --silent），autostart 的 LaunchAgent plist ProgramArguments 携带 --silent 且 macOS 用原始二进制路径启动，正好落进 socket 通知路径；Finder/Dock 激活走 Reopen 无参数、按用户意图唤起，两条路径互不误伤。",
+    "auto-launch 的 Windows is_enabled 额外尊重任务管理器 StartupApproved 禁用位（windows.rs:73-95），与本补丁「用户可能在系统设置里改它」的设计假设吻合。",
+    "前端保存失败不再关窗且回滚自启开关、保存按钮防重复提交，错误处理比原来的 fire-and-forget 完善。"
+  ],
+  "not_covered": [
+    "纯静态审查：未运行 cargo build/test、未构建前端、未做运行时手工验证（冷启动闪窗、托盘交互、三平台焦点行为均靠代码与依赖源码推断）。",
+    "auto-launch 的 Linux .desktop 实现源码未读（Windows/macOS 已读），GLM-02/GLM-03 的结论未在 Linux 上逐一核实。",
+    "安装器侧仅核对了 tauri.conf.json（bundle 无自启注册），未深挖 WiX 模板是否存在其他写 Run 键的入口；DESIGN.md 声明的「不由安装包注册」以文档为准。",
+    "前端无测试基建，SettingsModal 的状态机（含 GLM-01 竞态）没有自动化回归手段，本审查也未提出前端测试方案。",
+    "cargo audit / 供应链扫描未实际执行，GLM-04 的告警存在性为基于 advisory 数据库的推断。",
+    "服务端、传输链路与本次补丁无关的客户端模块未审。"
+  ],
+  "consulted": [
+    ".reviews/autostart-single-instance/code/_meta/changes-20260912T173028Z.diff",
+    "CLAUDE.md",
+    "AGENTS.md",
+    "README.md",
+    "client/src-tauri/src/lib.rs",
+    "client/src-tauri/src/commands/settings_cmd.rs",
+    "client/src-tauri/src/commands/mod.rs",
+    "client/src-tauri/src/core/startup.rs",
+    "client/src-tauri/src/app_state.rs",
+    "client/src-tauri/src/storage/db.rs",
+    "client/src-tauri/Cargo.toml",
+    "client/src-tauri/tauri.conf.json",
+    "client/src-tauri/capabilities/default.json",
+    "client/src/App.tsx",
+    "client/src/components/SettingsModal.tsx",
+    "client/src/types/index.ts"
+  ]
+}

@@ -1,0 +1,163 @@
+---
+schema: trivium.review.v1
+topic: autostart-single-instance
+stage: plan
+role: gemini
+vendor: antigravity
+agent_cli: agy/1.2.2
+model_requested: gemini-3.8-flash-high
+model_effective: gemini-3.8-flash-high
+model_effective_source: envelope
+effort: high
+run_id: 20260912T171855Z
+rerun_index: 1
+snapshot_hash: sha256:69f749fe00fb39863157477872b094302ca55bc36ce7ebaeb10d42b7fddf4b7e
+blind: true
+started_at: 2026-09-12T17:18:56.540Z
+finished_at: 2026-09-12T17:26:53.377Z
+duration_s: 149
+tool_calls:
+  read: 21
+  grep: 0
+  glob: 1
+  run_command: 0
+  project_reads: 17
+evidence_ok: true
+verdict: request-changes
+findings_count:
+  blocker: 1
+  major: 2
+  minor: 1
+  nit: 1
+degraded: false
+parse_fallback: false
+peer_deny: false
+drift: false
+heterogeneous: true
+session_id: 7c83e9e8-0032-45d0-b789-f7c9a881ea1f
+---
+
+# 计划审查：autostart-single-instance
+
+> Critic-A · Google Antigravity ｜ 模型 `gemini-3.8-flash-high`
+> ｜ 运行 `20260912T171855Z`
+
+> ⚠️ **路径级 deny 未生效**：本机该侧 CLI 不支持路径级读取拒绝，对方历史产出的屏蔽仅依赖任务书禁读清单与事后轨迹核验。
+
+## 总判断
+
+整体方案对老配置反序列化兼容和启动闪窗防范考虑周全，但存在核心逻辑与契约割裂：最危险的问题是 Plan §3.2/§3.3 中 should_show_window 硬编码「手动启动永远弹窗」，导致前端声称支持的「手动启动时最小化到托盘」完全失效，产品契约与底层实现自相矛盾（AGY-01）。此外，cmd_save_settings 缺乏 Dirty Check 且将 OS 自启动操作与核心业务参数入库捆绑为 fail-all 事务，存在系统横幅骚扰与全量保存失败风险（AGY-02）；单实例加固遗漏了从任务栏最小化状态恢复窗口（Unminimize）的必要逻辑（AGY-03）。建议统一最小化语义、细化保存失败策略后再行实施。
+
+**结论**：`request-changes`
+
+## 审查意见（共 5 条：阻断 1 ｜ 重要 2 ｜ 次要 1 ｜ 吹毛求疵 1）
+
+### AGY-01 · 阻断（blocker）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `plan §3.2, §3.3, §4.2` |
+| 类别 | correctness ｜ 层次 plan |
+| 置信度 | high |
+
+**问题**：start_minimized 的判定逻辑与前端配置承诺存在严重的内部矛盾，导致手动冷启动时该配置完全失效。Plan 一边在前端向用户承诺手动启动也可最小化且不置灰开关，另一边在底层代码写死「手动启动永远显示窗口」，产品契约与实现割裂。
+
+**依据**：读过被审计划 .reviews/autostart-single-instance/plan/2026-09-13-autostart-single-instance-claude.md §3.2、§3.3 与 §4.2，并对照 client/src/components/SettingsModal.tsx:84-95。Plan §4.2 明确声称「start_minimized 在 autostart_enabled 关闭时不置灰（手动启动也可能想最小化）」，但在 §3.2 表格与 §3.3 should_show_window 函数中却强制要求 !is_autostart_launch(args) || !start_minimized。当用户手动启动（无 --silent）时，!is_autostart_launch 恒为 true，导致该函数恒为 true，窗口永远弹出，使手动冷启动最小化功能完全失效。
+
+**建议**：必须在产品定义与实现逻辑间做出二选一的明确决策并统一契约：若支持冷启动最小化（推荐，符合后台托盘工具软件通用行为），应让 start_minimized 在冷启动时全局生效（无 --silent 时也遵从配置），仅在第二实例（second-instance 二次唤起）时强制呼出主窗口；若仅允许开机自启时静默，则必须将字段改名为 autostart_minimized，且在前端与 autostart_enabled 联动禁用（置灰），不可给用户「手动启动也能最小化」的虚假承诺。
+
+### AGY-02 · 重要（major）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `plan §3.1, §4.1; client/src-tauri/src/commands/settings_cmd.rs:21-72` |
+| 类别 | maintainability ｜ 层次 plan |
+| 置信度 | high |
+
+**问题**：cmd_save_settings 将系统级自启注册操作与业务配置持久化强行绑定为 fail-all 事务，且缺乏变更检测（Dirty Check）与幂等防护。用户修改任何无关配置都会无条件重新调用 OS 级自启动写操作，在 macOS 13+ 上频繁重写 LaunchAgent 会反复触发系统后台项横幅通知，在 Windows 上也会徒增杀软拦截风险；且一旦 OS 调用失败，会导致核心连接与密码配置全部无法保存。
+
+**依据**：读过 client/src-tauri/src/commands/settings_cmd.rs:21-72 与被审计划 §3.1、§4.1。cmd_save_settings 保存的是包含网络配置与安全参数的完整 AppSettings。Plan 规定「OS 调用失败要向前端返回明确错误」，且未做新旧状态比对，导致即使用户仅修改 PSK 或服务器地址，也会反复触发 OS 自启写操作；若系统层调用出错，整个保存直接失败，阻止业务配置入库。
+
+**建议**：在 cmd_save_settings 中引入自启开关变更比对，仅当 autostart_enabled 实际发生变化时才调用 manager.enable() 或 disable()；并对错误粒度进行解耦，若 OS 自启动配置失败，不应阻断核心连接配置的入库与生效，应返回精细化警告或局部状态。
+
+### AGY-03 · 重要（major）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `plan §1.1, §3.5; client/src-tauri/src/lib.rs:94-100` |
+| 类别 | correctness ｜ 层次 plan |
+| 置信度 | high |
+
+**问题**：单实例窗口唤起机制遗漏了从系统最小化（Minimized）状态恢复窗口的必经步骤。若已有实例的窗口已被用户最小化到任务栏，单纯调用 win.show() 与 win.set_focus() 无法解除最小化状态，导致用户二次双击图标时界面无法正常弹出。
+
+**依据**：读过 client/src-tauri/src/lib.rs:94-100 与被审计划 §1.1、§3.5。Plan 将单实例加固列为目标 G5，但在 second-instance 回调中仅处理了 --silent 参数忽略与日志打印，未处理已运行窗口处于最小化（Minimized）状态的情况。在 Windows 等平台上对已最小化窗口仅调用 win.show() 与 win.set_focus() 无法恢复窗口。
+
+**建议**：在 second-instance 回调唤起窗口的逻辑中，补充窗口最小化状态检查与恢复调用（例如若 win.is_minimized() 为 true 则调用 win.unminimize()），确保托盘隐藏和任务栏最小化两种形态下均能可靠唤起。
+
+### AGY-04 · 次要（minor）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `plan §3.1, §4.1; client/src-tauri/src/commands/settings_cmd.rs:15-18; client/src-tauri/src/lib.rs:35-80` |
+| 类别 | contract ｜ 层次 plan |
+| 置信度 | high |
+
+**问题**：Plan §3.1 声称「OS 是权威事实源」，但在读取与启动流程中存在状态同步断层。cmd_get_settings 读取的是内存锁 state.settings（Plan 误述为从 SQLite 读取），若查询 OS 状态覆盖返回给前端后未回写 state.settings；且应用在 setup 初始化时完全没有比对 OS 事实源，导致若用户在系统设置中更改自启状态，应用内存与数据库中的状态将长期陈旧不一致。
+
+**依据**：读过 client/src-tauri/src/commands/settings_cmd.rs:15-18 与 client/src-tauri/src/lib.rs:35-80。cmd_get_settings 原本直接返回 state.settings.lock().await.clone()。Plan §3.1 仅描述在返回前端前局部覆盖字段，缺失了向 state.settings 及持久化层的同步回写机制。
+
+**建议**：明确事实源同步时机：在应用启动 setup 阶段以及 cmd_get_settings 发现 OS 实际状态与缓存不一致时，主动将 OS 权威状态回写至 state.settings 与 SQLite，保持内存模型与事实源一致。
+
+### AGY-05 · 吹毛求疵（nit）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `plan §4.3` |
+| 类别 | scope-drift ｜ 层次 plan |
+| 置信度 | high |
+
+**问题**：Plan §4.3 提议修改流水线配置 .trivium/config.yaml 追加 Rust 校验命令，超出了业务功能主题边界，且触碰编排系统受控元数据。
+
+**依据**：读过被审计划 §4.3 与 BRIEF 第 8 节。BRIEF 第 8 节明确将 .trivium/ 列为受控禁止读取范围，Driver 本人也在 §4.3 标注「若审查认为应独立成轮，可驳回」。
+
+**建议**：驳回对 .trivium/config.yaml 的改动建议；将 cargo check 和 cargo test 保持在 Driver 本地验证与现有 client-ci.yml 中执行即可。
+
+## 认为正确的部分
+
+- 精准识别出 AppSettings 缺少 #[serde(default)] 会导致老版本 SQLite 中既有 JSON 反序列化失败并冲掉关键网络配置（server_url、account_id、psk_secret）的高危缺陷，防御设计得当。
+- 将启动参数解析与显隐决策抽取为纯函数 core::startup 并在 setup 与 second-instance 复用，设计清晰且具备良好的单测隔离性。
+- 将 tauri.conf.json 默认 visible 置为 false 并由 setup 根据参数决策显隐，有效避免了开机静默启动时的闪窗缺陷。
+- 明确放弃安装包写注册表方案，统一收敛至运行时插件 API，避免了双写冲突与残留问题。
+
+## 未覆盖范围（本侧盲区）
+
+- 跨多平台（尤其是各主流 Linux 发行版 Wayland/X11 环境、以及各版本 Windows 权限隔离）下 tauri-plugin-autostart 生成的实际桌面自启动项执行环境与工作目录差异。
+- 多操作系统用户切换（Fast User Switching）或并发登录场景下单实例命名管道与自启 LaunchAgent 的隔离表现。
+- 杀毒软件（如火绒、360、Windows Defender）对自启注册表写入的实时拦截率及误报处置方案。
+
+## 实际查阅的项目文件
+
+- `CLAUDE.md`
+- `AGENTS.md`
+- `README.md`
+- `docs/需求.md`
+- `docs/design/DESIGN.md`
+- `client/src-tauri/Cargo.toml`
+- `client/src-tauri/tauri.conf.json`
+- `client/src-tauri/capabilities/default.json`
+- `client/src-tauri/src/lib.rs`
+- `client/src-tauri/src/commands/settings_cmd.rs`
+- `client/src-tauri/src/storage/db.rs`
+- `client/src-tauri/src/core/mod.rs`
+- `client/src/types/index.ts`
+- `client/src/App.tsx`
+- `client/src/components/SettingsModal.tsx`
+- `.github/workflows/client-ci.yml`
+- `.reviews/autostart-single-instance/plan/2026-09-13-autostart-single-instance-claude.md`
+
+> 编排器从工具轨迹中记录到的读取次数：{"read":21,"grep":0,"glob":1,"run_command":0,"project_reads":17}
+
+---
+
+*本文档由 TriviumCode 编排器从 `gemini` 侧的结构化输出渲染而成。
+审查员无写仓库权限，全部落盘由编排器完成。*

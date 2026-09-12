@@ -1,0 +1,145 @@
+{
+  "schema": "trivium.run.v1",
+  "run_id": "20260912T173028Z",
+  "topic": "autostart-single-instance",
+  "stage": "code",
+  "rerun_index": 1,
+  "command": "trivium review --start --stage code",
+  "prompt_hint": null,
+  "task_goal": "增加配置项：是否开机启动；实现一台主机只能运行一个实例。",
+  "entry": "A",
+  "snapshot": {
+    "git_head": "3be8d6e2be7f30c9e45a9895d03790f45010fb5d",
+    "tree_hash": "cf5cd8d8916d6e374126600c6082099957398176",
+    "dirty": true,
+    "subject_sha256": "21eabc71353e6784148345070a8a9b27735f7272578724f8cd0623c06c779568",
+    "drift": {
+      "changed": false,
+      "files": [],
+      "policy": "warn"
+    }
+  },
+  "started_at": "2026-09-12T17:30:28.622Z",
+  "finished_at": "2026-09-12T17:39:27.783Z",
+  "review_mode": "dual",
+  "degraded_reason": null,
+  "critics": {
+    "gemini": {
+      "vendor": "antigravity",
+      "cli_version": "1.2.2",
+      "model_requested": "gemini-3.8-flash-high",
+      "model_effective": "gemini-3.8-flash-high",
+      "model_effective_source": "envelope",
+      "effort": "high",
+      "status": "ok",
+      "exit_code": 0,
+      "duration_s": 224.167,
+      "tool_calls": {
+        "read": 39,
+        "grep": 7,
+        "glob": 6,
+        "run_command": 0,
+        "project_reads": 22
+      },
+      "evidence_ok": true,
+      "usage": {
+        "input_tokens": 271652,
+        "output_tokens": 48443,
+        "thinking_tokens": 43112,
+        "cache_read_tokens": 4259322,
+        "total_tokens": 320095
+      },
+      "heterogeneous": true,
+      "fail_reason": null,
+      "empty_review": false,
+      "parse_fallback": false,
+      "session_id": "d62b7a2f-ff37-4992-9541-1b2a2f3b84fb",
+      "peer_deny_applied": false
+    },
+    "glm": {
+      "vendor": "zcode",
+      "cli_version": "0.16.5",
+      "model_requested": "GLM-5.3",
+      "model_effective": "bigmodel-coding-plan/GLM-5.3",
+      "model_effective_source": "trace",
+      "model_route": "config_copy",
+      "status": "ok",
+      "exit_code": 0,
+      "duration_s": 539.024,
+      "tool_calls": {
+        "read": 20,
+        "grep": 1,
+        "glob": 4,
+        "run_command": 0,
+        "project_reads": 14
+      },
+      "evidence_ok": true,
+      "usage": {
+        "source": "provider",
+        "modelRequestCount": 15,
+        "inputTokens": 919623,
+        "outputTokens": 27749,
+        "totalTokens": 947372,
+        "cacheReadTokens": 849024,
+        "cacheWriteTokens": 0,
+        "reasoningTokens": 0,
+        "webFetchRequests": 0,
+        "webSearchRequests": 0
+      },
+      "heterogeneous": true,
+      "fail_reason": null,
+      "empty_review": false,
+      "parse_fallback": false,
+      "session_id": "sess_ee3dcc97-4617-414e-a654-e19990d873e8",
+      "peer_deny_applied": false
+    }
+  },
+  "deny_paths": [
+    ".reviews/autostart-single-instance/plan/2026-09-13-autostart-single-instance-glm.md"
+  ],
+  "guard": {
+    "readonly_breach": false,
+    "peer_artifact_read": false,
+    "peer_deny_applied": {
+      "gemini": false,
+      "glm": false
+    },
+    "forged_role_file": false,
+    "breached_files": []
+  },
+  "artifacts": [
+    {
+      "path": "autostart-single-instance/code/_meta/changes-20260912T173028Z.diff",
+      "sha256": "21eabc71353e6784148345070a8a9b27735f7272578724f8cd0623c06c779568"
+    },
+    {
+      "path": "autostart-single-instance/code/_meta/brief-gemini-20260912T173028Z.md",
+      "sha256": "0157465de8aa1cc10ac28ab8d0af99ddc6bae3c456267cc80f962aa3784a7e25"
+    },
+    {
+      "path": "autostart-single-instance/code/_meta/brief-glm-20260912T173028Z.md",
+      "sha256": "e8351514bdb6efe88a7e407739ba1e76edf642527c9e9b79ef8395b9912ee1c9"
+    },
+    {
+      "path": "autostart-single-instance/code/_meta/review-gemini-20260912T173028Z.json",
+      "sha256": "e409acf3953bfa44646bc6b80e0a03f6830b3dd3e0db01f2870fa6b1aac3ed5f"
+    },
+    {
+      "path": "autostart-single-instance/code/_meta/review-glm-20260912T173028Z.json",
+      "sha256": "3dd0ec463cd0e5c5b34566caf19c725a7c554bf80fde8605fcee5e73f62819fc"
+    },
+    {
+      "path": "autostart-single-instance/code/2026-09-13-autostart-single-instance-gemini.md",
+      "sha256": "0ef0d4ce73822c32483a7f35dab445e251122fbfd1f644dca2c510188d1a471f"
+    },
+    {
+      "path": "autostart-single-instance/code/2026-09-13-autostart-single-instance-glm.md",
+      "sha256": "7980d7ed1ee7fe9ae5cdbfe61b1209d7083f379931db85f6280a93afd6f02d86"
+    }
+  ],
+  "gate": {
+    "adjudication_complete": false,
+    "state": "review_done_awaiting_disposition"
+  },
+  "status": "success"
+}

@@ -1,0 +1,877 @@
+# trivium changes.diff
+# run_id: 20260912T173028Z
+# base: HEAD
+# head: 3be8d6e2be7f30c9e45a9895d03790f45010fb5d
+# files: 12
+#   client/src-tauri/Cargo.lock
+#   client/src-tauri/Cargo.toml
+#   client/src-tauri/src/commands/settings_cmd.rs
+#   client/src-tauri/src/core/mod.rs
+#   client/src-tauri/src/core/startup.rs
+#   client/src-tauri/src/lib.rs
+#   client/src-tauri/tauri.conf.json
+#   client/src/App.tsx
+#   client/src/components/SettingsModal.tsx
+#   client/src/types/index.ts
+#   docs/design/DESIGN.md
+#   docs/需求.md
+diff --git a/client/src-tauri/Cargo.lock b/client/src-tauri/Cargo.lock
+index 3ebe9e1..3ec7ed1 100644
+--- a/client/src-tauri/Cargo.lock
++++ b/client/src-tauri/Cargo.lock
+@@ -269,6 +269,17 @@ version = "1.1.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
+ 
++[[package]]
++name = "auto-launch"
++version = "0.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1f012b8cc0c850f34117ec8252a44418f2e34a2cf501de89e29b241ae5f79471"
++dependencies = [
++ "dirs 4.0.0",
++ "thiserror 1.0.69",
++ "winreg 0.10.1",
++]
++
+ [[package]]
+ name = "autocfg"
+ version = "1.5.1"
+@@ -894,13 +905,33 @@ dependencies = [
+  "subtle",
+ ]
+ 
++[[package]]
++name = "dirs"
++version = "4.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ca3aa72a6f96ea37bbc5aa912f6788242832f75369bdfdadcb0e38423f100059"
++dependencies = [
++ "dirs-sys 0.3.7",
++]
++
+ [[package]]
+ name = "dirs"
+ version = "6.0.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+ dependencies = [
+- "dirs-sys",
++ "dirs-sys 0.5.0",
++]
++
++[[package]]
++name = "dirs-sys"
++version = "0.3.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "1b1d1d91c932ef41c0f2663aa8b0ca0342d444d842c06914aa0a7e352d0bada6"
++dependencies = [
++ "libc",
++ "redox_users 0.4.6",
++ "winapi",
+ ]
+ 
+ [[package]]
+@@ -911,7 +942,7 @@ checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
+ dependencies = [
+  "libc",
+  "option-ext",
+- "redox_users",
++ "redox_users 0.5.2",
+  "windows-sys 0.61.2",
+ ]
+ 
+@@ -1038,7 +1069,7 @@ dependencies = [
+  "rustc_version",
+  "toml 1.1.6+spec-1.1.0",
+  "vswhom",
+- "winreg",
++ "winreg 0.55.0",
+ ]
+ 
+ [[package]]
+@@ -3313,6 +3344,17 @@ dependencies = [
+  "bitflags 2.13.2",
+ ]
+ 
++[[package]]
++name = "redox_users"
++version = "0.4.6"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
++dependencies = [
++ "getrandom 0.2.17",
++ "libredox",
++ "thiserror 1.0.69",
++]
++
+ [[package]]
+ name = "redox_users"
+ version = "0.5.2"
+@@ -4126,7 +4168,7 @@ dependencies = [
+  "anyhow",
+  "bytes",
+  "cookie",
+- "dirs",
++ "dirs 6.0.0",
+  "dunce",
+  "embed_plist",
+  "getrandom 0.3.4",
+@@ -4176,7 +4218,7 @@ checksum = "bc9ce40b16101cb6ea63d3e221567affd1c3a9205f95d7bc574941a10636b632"
+ dependencies = [
+  "anyhow",
+  "cargo_toml",
+- "dirs",
++ "dirs 6.0.0",
+  "glob",
+  "heck 0.5.0",
+  "json-patch",
+@@ -4246,6 +4288,20 @@ dependencies = [
+  "walkdir",
+ ]
+ 
++[[package]]
++name = "tauri-plugin-autostart"
++version = "2.5.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "459383cebc193cdd03d1ba4acc40f2c408a7abce419d64bdcd2d745bc2886f70"
++dependencies = [
++ "auto-launch",
++ "serde",
++ "serde_json",
++ "tauri",
++ "tauri-plugin",
++ "thiserror 2.0.20",
++]
++
+ [[package]]
+ name = "tauri-plugin-dialog"
+ version = "2.7.3"
+@@ -4856,7 +4912,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "045979e3f037cd18ad1cb2a419dfda133c5c29c9f3453370079f2255d46c257e"
+ dependencies = [
+  "crossbeam-channel",
+- "dirs",
++ "dirs 6.0.0",
+  "libappindicator",
+  "muda",
+  "objc2 0.6.4",
+@@ -4994,6 +5050,7 @@ dependencies = [
+  "sha2",
+  "tauri",
+  "tauri-build",
++ "tauri-plugin-autostart",
+  "tauri-plugin-dialog",
+  "tauri-plugin-notification",
+  "tauri-plugin-shell",
+@@ -5872,6 +5929,15 @@ dependencies = [
+  "memchr",
+ ]
+ 
++[[package]]
++name = "winreg"
++version = "0.10.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "80d0f4e272c85def139476380b12f9ac60926689dd2e01d4923222f40580869d"
++dependencies = [
++ "winapi",
++]
++
+ [[package]]
+ name = "winreg"
+ version = "0.55.0"
+@@ -5904,7 +5970,7 @@ dependencies = [
+  "block2 0.6.2",
+  "cookie",
+  "crossbeam-channel",
+- "dirs",
++ "dirs 6.0.0",
+  "dom_query",
+  "dpi",
+  "dunce",
+diff --git a/client/src-tauri/Cargo.toml b/client/src-tauri/Cargo.toml
+index 507301c..180f5cc 100644
+--- a/client/src-tauri/Cargo.toml
++++ b/client/src-tauri/Cargo.toml
+@@ -18,6 +18,7 @@ tauri = { version = "2.0.0", features = ["tray-icon"] }
+ tauri-plugin-shell = "2.0.0"
+ tauri-plugin-notification = "2.0.0"
+ tauri-plugin-single-instance = "2.0.0"
++tauri-plugin-autostart = "2.0.0"
+ tauri-plugin-dialog = "2.0.0"
+ 
+ whoami = "1"
+diff --git a/client/src-tauri/src/commands/settings_cmd.rs b/client/src-tauri/src/commands/settings_cmd.rs
+index a87763c..a325916 100644
+--- a/client/src-tauri/src/commands/settings_cmd.rs
++++ b/client/src-tauri/src/commands/settings_cmd.rs
+@@ -1,5 +1,6 @@
+ use serde::{Deserialize, Serialize};
+ use tauri::{AppHandle, Emitter, State};
++use tauri_plugin_autostart::ManagerExt;
+ use crate::app_state::AppState;
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+@@ -9,6 +10,28 @@ pub struct AppSettings {
+     pub psk_secret: String,
+     pub auto_inject: bool,
+     pub rate_limit_mb: u32,
++    /// 启动时不弹出主窗口，仅在托盘常驻。对手动启动与开机自启同样生效。
++    ///
++    /// `#[serde(default)]` 不可删除：整份设置以一条 JSON 存在 SQLite 的
++    /// `local_config` 表里，老库的 JSON 没有本字段。缺了 default，
++    /// 反序列化会整条失败并走 `lib.rs` 的 `unwrap_or_else` 静默回落到全部默认值，
++    /// 把用户已配置的 server_url / account_id / psk_secret 一起冲掉。
++    #[serde(default)]
++    pub start_minimized: bool,
++}
++
++impl AppSettings {
++    /// 首次启动与反序列化失败时的兜底配置（唯一定义点，避免多处字面量漏改）
++    pub fn default_config() -> Self {
++        Self {
++            server_url: "wss://drop.yourdomain.com:58921".to_string(),
++            account_id: "default_user".to_string(),
++            psk_secret: "dev-insecure-psk-secret".to_string(),
++            auto_inject: false,
++            rate_limit_mb: 10,
++            start_minimized: false,
++        }
++    }
+ }
+ 
+ #[tauri::command]
+@@ -71,3 +94,107 @@ pub async fn cmd_save_settings(
+ 
+     Ok(())
+ }
++
++/// 读取开机自启的**操作系统实时状态**。
++///
++/// 自启状态的唯一事实源是操作系统（Windows 注册表 Run 键 / macOS LaunchAgent /
++/// Linux ~/.config/autostart），不在 AppSettings 里保留副本——用户完全可能绕过
++/// 本应用、在系统设置里改它，有副本就必然漂移。
++#[tauri::command]
++pub async fn cmd_get_autostart(app: AppHandle) -> Result<bool, String> {
++    app.autolaunch()
++        .is_enabled()
++        .map_err(|e| format!("读取开机自启状态失败: {}", e))
++}
++
++/// 设置开机自启。幂等：目标态与 OS 现值一致时直接返回，不触碰系统。
++#[tauri::command]
++pub async fn cmd_set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
++    let manager = app.autolaunch();
++
++    // 比对基准必须是 OS 实时值而不是前端提交时的旧值：用户可能在本次会话中途
++    // 于系统设置里改过它，按旧值写回会把用户的操作悄悄覆盖掉。
++    let current = manager
++        .is_enabled()
++        .map_err(|e| format!("读取开机自启状态失败: {}", e))?;
++    if current == enabled {
++        log::info!("Autostart already {}, skipping OS write", enabled);
++        return Ok(());
++    }
++
++    if enabled {
++        manager
++            .enable()
++            .map_err(|e| format!("开启开机自启失败: {}", e))?;
++    } else {
++        manager
++            .disable()
++            .map_err(|e| format!("关闭开机自启失败: {}", e))?;
++    }
++
++    // 复查：让「返回成功」严格等于「OS 里确实是这个状态」
++    let applied = manager
++        .is_enabled()
++        .map_err(|e| format!("校验开机自启状态失败: {}", e))?;
++    if applied != enabled {
++        return Err(format!(
++            "开机自启设置未生效：期望 {}，实际 {}",
++            enabled, applied
++        ));
++    }
++
++    log::info!("Autostart set to {}", enabled);
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// 老库里的 JSON 没有 start_minimized 字段。本测试守护的是
++    /// `#[serde(default)]`：删掉它，这里会红，而不是等到用户配置被静默冲掉。
++    #[test]
++    fn legacy_settings_json_deserializes_without_data_loss() {
++        let legacy = r#"{
++            "server_url": "wss://relay.example.com:58921",
++            "account_id": "alice",
++            "psk_secret": "user-configured-secret",
++            "auto_inject": true,
++            "rate_limit_mb": 42
++        }"#;
++
++        let parsed: AppSettings =
++            serde_json::from_str(legacy).expect("老格式设置必须能反序列化，否则用户配置会被冲掉");
++
++        assert_eq!(parsed.server_url, "wss://relay.example.com:58921");
++        assert_eq!(parsed.account_id, "alice");
++        assert_eq!(parsed.psk_secret, "user-configured-secret");
++        assert!(parsed.auto_inject);
++        assert_eq!(parsed.rate_limit_mb, 42);
++        assert!(!parsed.start_minimized, "缺失的新字段应取默认值 false");
++    }
++
++    #[test]
++    fn current_settings_json_round_trips() {
++        let settings = AppSettings {
++            start_minimized: true,
++            ..AppSettings::default_config()
++        };
++        let json = serde_json::to_string(&settings).expect("序列化失败");
++        let parsed: AppSettings = serde_json::from_str(&json).expect("反序列化失败");
++
++        assert_eq!(parsed.server_url, settings.server_url);
++        assert_eq!(parsed.account_id, settings.account_id);
++        assert_eq!(parsed.psk_secret, settings.psk_secret);
++        assert_eq!(parsed.auto_inject, settings.auto_inject);
++        assert_eq!(parsed.rate_limit_mb, settings.rate_limit_mb);
++        assert!(parsed.start_minimized);
++    }
++
++    #[test]
++    fn autostart_is_not_part_of_persisted_settings() {
++        // 自启状态只存在于操作系统，不得出现在落库的 JSON 里
++        let json = serde_json::to_string(&AppSettings::default_config()).expect("序列化失败");
++        assert!(!json.contains("autostart"));
++    }
++}
+diff --git a/client/src-tauri/src/core/mod.rs b/client/src-tauri/src/core/mod.rs
+index 35bacc7..6d6cfaa 100644
+--- a/client/src-tauri/src/core/mod.rs
++++ b/client/src-tauri/src/core/mod.rs
+@@ -2,10 +2,12 @@ pub mod cache_manager;
+ pub mod connection_actor;
+ pub mod path_guard;
+ pub mod sliding_window;
++pub mod startup;
+ pub mod transfer_engine;
+ 
+ pub use cache_manager::*;
+ pub use connection_actor::*;
+ pub use path_guard::*;
+ pub use sliding_window::*;
++pub use startup::*;
+ pub use transfer_engine::*;
+diff --git a/client/src-tauri/src/core/startup.rs b/client/src-tauri/src/core/startup.rs
+new file mode 100644
+index 0000000..a993348
+--- /dev/null
++++ b/client/src-tauri/src/core/startup.rs
+@@ -0,0 +1,88 @@
++//! 启动形态判定（无副作用的纯函数，便于单测）
++//!
++//! 自启注册项永远带 `--silent`，它只表示「本次是系统拉起的、不是用户主动点的」。
++//! 主窗口是否显示由用户配置 `start_minimized` 决定，与拉起方式无关——
++//! 两个开关必须能自由组合，否则 `start_minimized` 就成了自启的子选项。
++
++/// 自启注册项携带的标记参数
++pub const AUTOSTART_FLAG: &str = "--silent";
++
++/// 启动参数中是否含自启标记
++pub fn is_autostart_launch<S: AsRef<str>>(args: &[S]) -> bool {
++    args.iter().any(|a| a.as_ref() == AUTOSTART_FLAG)
++}
++
++/// 冷启动时是否显示主窗口：只取决于用户配置，手动启动同样遵从
++pub fn should_show_on_launch(start_minimized: bool) -> bool {
++    !start_minimized
++}
++
++/// 第二实例是否应唤起并抢焦点：用户点的要抢，系统拉起的不抢
++pub fn should_focus_second_instance<S: AsRef<str>>(args: &[S]) -> bool {
++    !is_autostart_launch(args)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn args(v: &[&str]) -> Vec<String> {
++        v.iter().map(|s| s.to_string()).collect()
++    }
++
++    // --- 真值表第 1、2 行：冷启动只看配置 ---
++
++    #[test]
++    fn cold_launch_shows_window_when_not_minimized() {
++        assert!(should_show_on_launch(false));
++    }
++
++    #[test]
++    fn cold_launch_hides_window_when_minimized() {
++        assert!(!should_show_on_launch(true));
++    }
++
++    // --- 真值表第 3、4 行：第二实例看 --silent ---
++
++    #[test]
++    fn second_instance_from_user_takes_focus() {
++        assert!(should_focus_second_instance(&args(&[
++            "/Applications/UniDrop.app/Contents/MacOS/UniDrop"
++        ])));
++    }
++
++    #[test]
++    fn second_instance_from_autostart_keeps_window_state() {
++        assert!(!should_focus_second_instance(&args(&["UniDrop.exe", "--silent"])));
++    }
++
++    // --- 边界 ---
++
++    #[test]
++    fn empty_args_is_not_autostart() {
++        let empty: [String; 0] = [];
++        assert!(!is_autostart_launch(&empty));
++        assert!(should_focus_second_instance(&empty));
++    }
++
++    #[test]
++    fn flag_is_detected_anywhere_in_args() {
++        assert!(is_autostart_launch(&args(&["exe", "--silent", "--other"])));
++        assert!(is_autostart_launch(&args(&["exe", "--other", "--silent"])));
++    }
++
++    #[test]
++    fn similar_args_are_not_mistaken_for_the_flag() {
++        // 前缀/后缀/大小写/少一个横杠都不算，避免把用户参数误判成自启
++        assert!(!is_autostart_launch(&args(&["exe", "--silently"])));
++        assert!(!is_autostart_launch(&args(&["exe", "--no-silent"])));
++        assert!(!is_autostart_launch(&args(&["exe", "--SILENT"])));
++        assert!(!is_autostart_launch(&args(&["exe", "-silent"])));
++        assert!(!is_autostart_launch(&args(&["exe", "silent"])));
++    }
++
++    #[test]
++    fn accepts_str_slices_too() {
++        assert!(is_autostart_launch(&["exe", "--silent"]));
++    }
++}
+diff --git a/client/src-tauri/src/lib.rs b/client/src-tauri/src/lib.rs
+index 1edc4c0..0100fc0 100644
+--- a/client/src-tauri/src/lib.rs
++++ b/client/src-tauri/src/lib.rs
+@@ -24,6 +24,24 @@ use protocol::{
+ use storage::db::init_database;
+ use storage::HistoryRepo;
+ 
++/// 唤起主窗口的唯一入口。
++///
++/// 「隐藏到托盘」与「最小化到任务栏」是两种不同的形态：后者窗口仍是 visible，
++/// 只调 show() + set_focus() 在 Windows 上无法还原，必须先 unminimize()。
++/// 托盘菜单、托盘点击、第二实例、macOS Reopen 全部走这里，避免各处行为不一致。
++fn reveal_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
++    match app.get_webview_window("main") {
++        Some(win) => {
++            if win.is_minimized().unwrap_or(false) {
++                let _ = win.unminimize();
++            }
++            let _ = win.show();
++            let _ = win.set_focus();
++        }
++        None => log::warn!("Requested to reveal main window but it is gone"),
++    }
++}
++
+ pub fn run() {
+     env_logger::init();
+     let _ = rustls::crypto::ring::default_provider().install_default();
+@@ -33,27 +51,18 @@ pub fn run() {
+     let device_id = storage::db::get_or_create_device_id(&db).expect("Failed to get/create device_id");
+ 
+     let initial_settings = if let Some(json_str) = storage::db::get_persisted_settings(&db) {
+-        let mut loaded = serde_json::from_str::<commands::settings_cmd::AppSettings>(&json_str).unwrap_or_else(|_| {
+-            commands::settings_cmd::AppSettings {
+-                server_url: "wss://drop.yourdomain.com:58921".to_string(),
+-                account_id: "default_user".to_string(),
+-                psk_secret: "dev-insecure-psk-secret".to_string(),
+-                auto_inject: false,
+-                rate_limit_mb: 10,
+-            }
+-        });
++        let mut loaded = serde_json::from_str::<commands::settings_cmd::AppSettings>(&json_str)
++            .unwrap_or_else(|e| {
++                // 走到这里意味着用户已存的配置会被全量丢弃，必须留下痕迹
++                log::warn!("Failed to parse persisted settings ({}), falling back to defaults", e);
++                commands::settings_cmd::AppSettings::default_config()
++            });
+         if loaded.server_url == "ws://127.0.0.1:8080" {
+             loaded.server_url = "wss://drop.yourdomain.com:58921".to_string();
+         }
+         loaded
+     } else {
+-        commands::settings_cmd::AppSettings {
+-            server_url: "wss://drop.yourdomain.com:58921".to_string(),
+-            account_id: "default_user".to_string(),
+-            psk_secret: "dev-insecure-psk-secret".to_string(),
+-            auto_inject: false,
+-            rate_limit_mb: 10,
+-        }
++        commands::settings_cmd::AppSettings::default_config()
+     };
+ 
+     let config = ConnectionConfig {
+@@ -89,15 +98,24 @@ pub fn run() {
+     let pending_inbound: Arc<Mutex<HashMap<String, (TransferOfferPayload, String)>>> =
+         Arc::new(Mutex::new(HashMap::new()));
+     let pending_inbound_ref = pending_inbound.clone();
++    let start_minimized_on_launch = initial_settings.start_minimized;
+ 
+     tauri::Builder::default()
+-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+-            log::info!("Another instance attempted to start, focusing existing window");
+-            if let Some(win) = app.get_webview_window("main") {
+-                let _ = win.show();
+-                let _ = win.set_focus();
++        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
++            // 系统拉起的第二实例（带 --silent）不该抢焦点；用户双击图标的必须唤起
++            if !core::startup::should_focus_second_instance(&args) {
++                log::info!("Second instance is an autostart launch, keeping window state");
++                return;
+             }
++            log::info!("Another instance attempted to start, focusing existing window");
++            reveal_main_window(app);
+         }))
++        // 自启注册项固定带 --silent，只作为「系统拉起」的标记；
++        // 是否显示窗口由 AppSettings.start_minimized 决定，与拉起方式无关。
++        .plugin(tauri_plugin_autostart::init(
++            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
++            Some(vec![core::startup::AUTOSTART_FLAG]),
++        ))
+         .plugin(tauri_plugin_shell::init())
+         .plugin(tauri_plugin_notification::init())
+         .plugin(tauri_plugin_dialog::init())
+@@ -351,15 +369,11 @@ pub fn run() {
+                         app.exit(0);
+                     }
+                     "show" => {
+-                        if let Some(win) = app.get_webview_window("main") {
+-                            let _ = win.show();
+-                            let _ = win.set_focus();
+-                        }
++                        reveal_main_window(app);
+                     }
+                     "settings" => {
++                        reveal_main_window(app);
+                         if let Some(win) = app.get_webview_window("main") {
+-                            let _ = win.show();
+-                            let _ = win.set_focus();
+                             let _ = win.emit("open-settings", ());
+                         }
+                     }
+@@ -374,20 +388,25 @@ pub fn run() {
+                     {
+                         let app = tray.app_handle();
+                         if let Some(win) = app.get_webview_window("main") {
+-                            if win.is_visible().unwrap_or(false) {
++                            // 最小化到任务栏时窗口仍是 visible，此时应还原而不是隐藏
++                            if win.is_visible().unwrap_or(false)
++                                && !win.is_minimized().unwrap_or(false)
++                            {
+                                 let _ = win.hide();
+                             } else {
+-                                let _ = win.show();
+-                                let _ = win.set_focus();
++                                reveal_main_window(app);
+                             }
+                         }
+                     }
+                 })
+                 .build(app)?;
+ 
+-            if let Some(win) = app.get_webview_window("main") {
+-                let _ = win.show();
+-                let _ = win.set_focus();
++            // 8. 冷启动显隐：只取决于用户配置，手动启动与开机自启一视同仁。
++            // 窗口在 tauri.conf.json 里初始 visible:false，避免 minimized 时的闪窗。
++            if core::startup::should_show_on_launch(start_minimized_on_launch) {
++                reveal_main_window(app.handle());
++            } else {
++                log::info!("Starting minimized to tray per user setting");
+             }
+ 
+             Ok(())
+@@ -405,6 +424,8 @@ pub fn run() {
+             commands::cmd_send_files,
+             commands::cmd_get_settings,
+             commands::cmd_save_settings,
++            commands::cmd_get_autostart,
++            commands::cmd_set_autostart,
+             commands::cmd_hide_window,
+             commands::cmd_read_clipboard_preview,
+             commands::cmd_send_clipboard,
+@@ -418,10 +439,7 @@ pub fn run() {
+         .run(|app_handle, event| {
+             #[cfg(target_os = "macos")]
+             if let tauri::RunEvent::Reopen { .. } = event {
+-                if let Some(win) = app_handle.get_webview_window("main") {
+-                    let _ = win.show();
+-                    let _ = win.set_focus();
+-                }
++                reveal_main_window(app_handle);
+             }
+             #[cfg(not(target_os = "macos"))]
+             let _ = (app_handle, event);
+diff --git a/client/src-tauri/tauri.conf.json b/client/src-tauri/tauri.conf.json
+index 268e7cc..ce6e1c8 100644
+--- a/client/src-tauri/tauri.conf.json
++++ b/client/src-tauri/tauri.conf.json
+@@ -20,7 +20,7 @@
+         "decorations": false,
+         "center": true,
+         "alwaysOnTop": false,
+-        "visible": true,
++        "visible": false,
+         "skipTaskbar": false
+       }
+     ],
+diff --git a/client/src/App.tsx b/client/src/App.tsx
+index 5703402..116bd8e 100644
+--- a/client/src/App.tsx
++++ b/client/src/App.tsx
+@@ -25,6 +25,7 @@ const defaultSettings: AppSettings = {
+   psk_secret: "dev-insecure-psk-secret",
+   auto_inject: false,
+   rate_limit_mb: 10,
++  start_minimized: false,
+ };
+ 
+ export const App: React.FC = () => {
+@@ -159,6 +160,8 @@ export const App: React.FC = () => {
+     } catch (err: any) {
+       console.error("save settings error:", err);
+       showNotification(typeof err === "string" ? err : "保存设置失败", "error");
++      // 向上抛出，让设置弹窗保持打开、保留用户已填内容
++      throw err;
+     }
+   };
+ 
+diff --git a/client/src/components/SettingsModal.tsx b/client/src/components/SettingsModal.tsx
+index eb4b12b..64b2a46 100644
+--- a/client/src/components/SettingsModal.tsx
++++ b/client/src/components/SettingsModal.tsx
+@@ -1,36 +1,85 @@
+ import React, { useState, useEffect } from "react";
+-import { X, Save, Shield } from "lucide-react";
++import { invoke } from "@tauri-apps/api/core";
++import { X, Save, Shield, AlertCircle } from "lucide-react";
+ import { AppSettings } from "../types";
+ 
+ interface SettingsModalProps {
+   settings: AppSettings;
+   isOpen: boolean;
+   onClose: () => void;
+-  onSave: (newSettings: AppSettings) => void;
++  onSave: (newSettings: AppSettings) => void | Promise<void>;
+ }
+ 
+ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, onClose, onSave }) => {
+   const [form, setForm] = useState<AppSettings>(settings);
++  const [saving, setSaving] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++
++  // 开机自启不属于 AppSettings：它的事实源是操作系统，本地不留副本，
++  // 因此独立拉取、独立写入，与表单保存的失败域互不污染。
++  const [autostart, setAutostart] = useState(false);
++  const [autostartBusy, setAutostartBusy] = useState(false);
++  const [autostartError, setAutostartError] = useState<string | null>(null);
+ 
+   useEffect(() => {
+     setForm(settings);
++    setError(null);
+   }, [settings, isOpen]);
+ 
++  useEffect(() => {
++    if (!isOpen) return;
++    // 每次打开都读操作系统实时状态：用户可能在系统设置里改过它
++    setAutostartError(null);
++    invoke<boolean>("cmd_get_autostart")
++      .then(setAutostart)
++      .catch((err: any) => {
++        console.error("get autostart error:", err);
++        setAutostartError(typeof err === "string" ? err : "读取开机自启状态失败");
++      });
++  }, [isOpen]);
++
+   if (!isOpen) return null;
+ 
+-  const handleSubmit = (e: React.FormEvent) => {
++  const handleAutostartChange = async (next: boolean) => {
++    const previous = autostart;
++    setAutostart(next);
++    setAutostartBusy(true);
++    setAutostartError(null);
++    try {
++      await invoke("cmd_set_autostart", { enabled: next });
++    } catch (err: any) {
++      console.error("set autostart error:", err);
++      setAutostart(previous); // 系统调用失败，开关回到真实状态
++      setAutostartError(typeof err === "string" ? err : "设置开机自启失败");
++    } finally {
++      setAutostartBusy(false);
++    }
++  };
++
++  const handleSubmit = async (e: React.FormEvent) => {
+     e.preventDefault();
++    if (saving) return;
++
+     let cleanUrl = form.server_url.replace(/\s+/g, "");
+     if (cleanUrl && !cleanUrl.startsWith("ws://") && !cleanUrl.startsWith("wss://")) {
+       cleanUrl = `wss://${cleanUrl}`;
+     }
+-    onSave({
+-      ...form,
+-      server_url: cleanUrl,
+-      account_id: form.account_id.trim(),
+-      psk_secret: form.psk_secret.trim(),
+-    });
+-    onClose();
++
++    setSaving(true);
++    setError(null);
++    try {
++      await onSave({
++        ...form,
++        server_url: cleanUrl,
++        account_id: form.account_id.trim(),
++        psk_secret: form.psk_secret.trim(),
++      });
++      onClose(); // 只有保存成功才关窗，失败时保留用户已填内容
++    } catch (err: any) {
++      setError(typeof err === "string" ? err : "保存设置失败，请检查后重试");
++    } finally {
++      setSaving(false);
++    }
+   };
+ 
+   return (
+@@ -94,6 +143,47 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen,
+             />
+           </div>
+ 
++          <div className="flex items-center justify-between pt-2">
++            <div>
++              <span className="font-medium text-slate-200">开机自动启动</span>
++              <p className="text-[11px] text-slate-500">登录系统后自动运行，修改立即生效</p>
++            </div>
++            <input
++              type="checkbox"
++              checked={autostart}
++              disabled={autostartBusy}
++              onChange={(e) => handleAutostartChange(e.target.checked)}
++              className="w-4 h-4 rounded text-teal-500 focus:ring-teal-400 bg-slate-800 border-slate-700 disabled:opacity-50"
++            />
++          </div>
++
++          {autostartError && (
++            <div className="flex items-start space-x-1.5 text-[11px] text-amber-400">
++              <AlertCircle className="w-3.5 h-3.5 mt-px shrink-0" />
++              <span>{autostartError}</span>
++            </div>
++          )}
++
++          <div className="flex items-center justify-between pt-2">
++            <div>
++              <span className="font-medium text-slate-200">启动时最小化到托盘</span>
++              <p className="text-[11px] text-slate-500">启动后不弹出主窗口；点击托盘图标可随时唤起</p>
++            </div>
++            <input
++              type="checkbox"
++              checked={form.start_minimized}
++              onChange={(e) => setForm({ ...form, start_minimized: e.target.checked })}
++              className="w-4 h-4 rounded text-teal-500 focus:ring-teal-400 bg-slate-800 border-slate-700"
++            />
++          </div>
++
++          {error && (
++            <div className="flex items-start space-x-1.5 text-[11px] text-rose-400">
++              <AlertCircle className="w-3.5 h-3.5 mt-px shrink-0" />
++              <span>{error}</span>
++            </div>
++          )}
++
+           <div className="pt-3 flex space-x-2">
+             <button
+               type="button"
+@@ -104,10 +194,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen,
+             </button>
+             <button
+               type="submit"
+-              className="flex-1 flex items-center justify-center space-x-1.5 py-2 rounded-lg bg-teal-600 hover:bg-teal-500 text-white font-medium transition"
++              disabled={saving}
++              className="flex-1 flex items-center justify-center space-x-1.5 py-2 rounded-lg bg-teal-600 hover:bg-teal-500 disabled:bg-teal-800 disabled:cursor-not-allowed text-white font-medium transition"
+             >
+               <Save className="w-4 h-4" />
+-              <span>保存配置</span>
++              <span>{saving ? "保存中..." : "保存配置"}</span>
+             </button>
+           </div>
+         </form>
+diff --git a/client/src/types/index.ts b/client/src/types/index.ts
+index 023fd77..b1d5ce9 100644
+--- a/client/src/types/index.ts
++++ b/client/src/types/index.ts
+@@ -12,6 +12,8 @@ export interface AppSettings {
+   psk_secret: string;
+   auto_inject: boolean;
+   rate_limit_mb: number;
++  /** 启动时不弹出主窗口，仅托盘常驻。对手动启动与开机自启同样生效。 */
++  start_minimized: boolean;
+ }
+ 
+ export interface ActiveTransfer {
+diff --git a/docs/design/DESIGN.md b/docs/design/DESIGN.md
+index 4dd8c57..5dc507b 100644
+--- a/docs/design/DESIGN.md
++++ b/docs/design/DESIGN.md
+@@ -1279,7 +1279,7 @@ unidrop-client/
+         │   ├── TrayMenu.tsx         # 托盘菜单面板
+         │   ├── DeviceCard.tsx       # 在线设备状态卡片
+         │   ├── TransferToast.tsx    # 传输进度浮动悬浮窗
+-        │   └── SettingsModal.tsx    # 自启动、限流与 E2EE 偏好设置
++        │   └── SettingsModal.tsx    # 连接/密钥、自动装载、开机自启与启动最小化偏好设置
+         └── hooks/                   # Tauri 事件总线订阅 Hooks
+ ```
+ 
+@@ -1287,7 +1287,9 @@ unidrop-client/
+ 解决审查 P3-3（客户端安全软件误报与系统级分发合规）：
+ 1. **Windows 平台**：
+    * 采用 EV 代码签名证书对生成的 `.exe` / `.msi` 安装包进行数字签名，杜绝 Windows Defender 与 SmartScreen 阻拦；
+-   * 安装包注册自启动注册表项：`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`。
++   * 自启动**不由安装包注册**：由应用内「开机自动启动」开关经 `tauri-plugin-autostart`
++     运行时写入 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`。
++     安装包一并写入会与应用内开关双写冲突，且卸载残留难清理。
+ 2. **macOS 平台**：
+    * 必须申请 Apple Developer 证书，使用 `codesign` 实施 Hardened Runtime 签名；
+    * 通过 Apple Notary 服务完成公证（Notarization）并执行 `xcrun stapler staple`；
+diff --git a/docs/需求.md b/docs/需求.md
+index 431da8e..8111883 100644
+--- a/docs/需求.md
++++ b/docs/需求.md
+@@ -3,7 +3,12 @@
+ ## 20260912
+ 
+ 1. 一台主机只运行一个实例。
++   — **已实现**（原由 `tauri-plugin-single-instance` 提供，2026-09-13 加固：
++   第二实例区分是否系统拉起、补齐最小化窗口还原）。
+ 2. 可以设置开机启动。
++   — **已实现**（2026-09-13）。拆为两个独立开关：「开机自动启动」（事实源是操作系统，
++   经 `cmd_get_autostart` / `cmd_set_autostart` 直读直写，本地不留副本）与
++   「启动时最小化到托盘」（`AppSettings.start_minimized`，对手动启动与开机自启同样生效）。
+ 3. 服务端可以设置最大可以传输的文件或者剪贴板内容最大多大。
+ 4. 可以设置传输历史保存最新的多少条，超出的删除（界面提醒和缓存的内容）。
+ 5. 可以设置传输任务完成后在界面中保持多久，一段时间后自动在界面中消失。

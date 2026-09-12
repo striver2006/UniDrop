@@ -1,0 +1,139 @@
+{
+  "schema": "trivium.run.v1",
+  "run_id": "20260912T171855Z",
+  "topic": "autostart-single-instance",
+  "stage": "plan",
+  "rerun_index": 1,
+  "command": "trivium review --start --stage plan",
+  "prompt_hint": null,
+  "task_goal": "增加配置项：是否开机启动；实现一台主机只能运行一个实例。",
+  "entry": "A",
+  "snapshot": {
+    "git_head": "3be8d6e2be7f30c9e45a9895d03790f45010fb5d",
+    "tree_hash": "54bc14b8ac17c3215b141eea243dd6ad6e10ef9f",
+    "dirty": true,
+    "subject_sha256": "69f749fe00fb39863157477872b094302ca55bc36ce7ebaeb10d42b7fddf4b7e",
+    "drift": {
+      "changed": false,
+      "files": [],
+      "policy": "warn"
+    }
+  },
+  "started_at": "2026-09-12T17:18:56.404Z",
+  "finished_at": "2026-09-12T17:26:53.377Z",
+  "review_mode": "dual",
+  "degraded_reason": null,
+  "critics": {
+    "gemini": {
+      "vendor": "antigravity",
+      "cli_version": "1.2.2",
+      "model_requested": "gemini-3.8-flash-high",
+      "model_effective": "gemini-3.8-flash-high",
+      "model_effective_source": "envelope",
+      "effort": "high",
+      "status": "ok",
+      "exit_code": 0,
+      "duration_s": 148.702,
+      "tool_calls": {
+        "read": 21,
+        "grep": 0,
+        "glob": 1,
+        "run_command": 0,
+        "project_reads": 17
+      },
+      "evidence_ok": true,
+      "usage": {
+        "input_tokens": 147340,
+        "output_tokens": 35863,
+        "thinking_tokens": 29356,
+        "cache_read_tokens": 848106,
+        "total_tokens": 183203
+      },
+      "heterogeneous": true,
+      "fail_reason": null,
+      "empty_review": false,
+      "parse_fallback": false,
+      "session_id": "7c83e9e8-0032-45d0-b789-f7c9a881ea1f",
+      "peer_deny_applied": false
+    },
+    "glm": {
+      "vendor": "zcode",
+      "cli_version": "0.16.5",
+      "model_requested": "GLM-5.3",
+      "model_effective": "bigmodel-coding-plan/GLM-5.3",
+      "model_effective_source": "trace",
+      "model_route": "config_copy",
+      "status": "ok",
+      "exit_code": 0,
+      "duration_s": 476.827,
+      "tool_calls": {
+        "read": 17,
+        "grep": 2,
+        "glob": 1,
+        "run_command": 0,
+        "project_reads": 19
+      },
+      "evidence_ok": true,
+      "usage": {
+        "source": "provider",
+        "modelRequestCount": 6,
+        "inputTokens": 227412,
+        "outputTokens": 24681,
+        "totalTokens": 252093,
+        "cacheReadTokens": 183488,
+        "cacheWriteTokens": 0,
+        "reasoningTokens": 0,
+        "webFetchRequests": 0,
+        "webSearchRequests": 0
+      },
+      "heterogeneous": true,
+      "fail_reason": null,
+      "empty_review": false,
+      "parse_fallback": false,
+      "session_id": "sess_913d362e-e62e-4d9f-83b2-9d2c29636bdf",
+      "peer_deny_applied": false
+    }
+  },
+  "deny_paths": [],
+  "guard": {
+    "readonly_breach": false,
+    "peer_artifact_read": false,
+    "peer_deny_applied": {
+      "gemini": false,
+      "glm": false
+    },
+    "forged_role_file": false,
+    "breached_files": []
+  },
+  "artifacts": [
+    {
+      "path": "autostart-single-instance/plan/_meta/brief-gemini-20260912T171855Z.md",
+      "sha256": "b4b257fe4f877909cca0cfb68d08bb3444d7d0f866ac77df346e8bf746a6a865"
+    },
+    {
+      "path": "autostart-single-instance/plan/_meta/brief-glm-20260912T171855Z.md",
+      "sha256": "f667e1627b26285338292f3c0ab8c00c48a02b7572f132ed8a9821d2468b2b9e"
+    },
+    {
+      "path": "autostart-single-instance/plan/_meta/review-gemini-20260912T171855Z.json",
+      "sha256": "8afc6cbcc8eedb165fe07ce47728034da21678b43c02e2de8ff19320c43246a2"
+    },
+    {
+      "path": "autostart-single-instance/plan/_meta/review-glm-20260912T171855Z.json",
+      "sha256": "7d3cae5bac5e2147bae5dd166d27eb60ed4f901d9e67a6d7b7c4bd3242613b17"
+    },
+    {
+      "path": "autostart-single-instance/plan/2026-09-13-autostart-single-instance-gemini.md",
+      "sha256": "acbaeef1760b72b02154e903a84704fb739a97a8c146004afa011f564feb697e"
+    },
+    {
+      "path": "autostart-single-instance/plan/2026-09-13-autostart-single-instance-glm.md",
+      "sha256": "fc0dae87747ce4cbb01f923ff512ddbfa8b639aaa2b05782fd842db4c0b8f084"
+    }
+  ],
+  "gate": {
+    "adjudication_complete": false,
+    "state": "review_done_awaiting_disposition"
+  },
+  "status": "success"
+}
