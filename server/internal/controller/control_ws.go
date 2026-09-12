@@ -274,6 +274,7 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					5*time.Minute,
 				)
 				if authErr == nil {
+					slog.Info("transfer session authorized", "session", answer.SessionID, "sender", env.ToDevice, "receiver", session.DeviceID)
 					answer.Token = token
 					env.Payload, _ = json.Marshal(answer)
 					// Echo authorized token back to the receiver as well
@@ -281,6 +282,8 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					echoEnv.ToDevice = session.DeviceID
 					echoBytes, _ := json.Marshal(echoEnv)
 					session.Send(echoBytes)
+				} else {
+					slog.Warn("failed to authorize transfer session", "session", answer.SessionID, "error", authErr)
 				}
 			}
 			h.routeToPeer(session, env)
@@ -294,6 +297,7 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					SessionID string `json:"session_id"`
 				}
 				if err := json.Unmarshal(env.Payload, &termPayload); err == nil && termPayload.SessionID != "" {
+					slog.Info("relay pipe removed", "action", string(env.Action), "session", termPayload.SessionID, "from", session.DeviceID)
 					h.relayManager.RemovePipe(termPayload.SessionID)
 				}
 			}

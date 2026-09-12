@@ -33,7 +33,7 @@ func NewRelayPipe(sessionID, fromDevice, toDevice string) *RelayPipe {
 		SessionID:    sessionID,
 		FromDevice:   fromDevice,
 		ToDevice:     toDevice,
-		ForwardChan:  make(chan *[]byte, 2),  // Up to ~8MB buffered
+		ForwardChan:  make(chan *[]byte, 4),  // Buffered so a sender that dials before the receiver is not immediately congested
 		BackwardChan: make(chan *[]byte, 16), // Light ACK/NACK frames
 		DoneChan:     make(chan struct{}),
 		LastActiveAt: now.UnixNano(),

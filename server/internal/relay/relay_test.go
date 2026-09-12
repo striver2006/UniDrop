@@ -66,11 +66,12 @@ func TestRelayPipeCongestionTimeout(t *testing.T) {
 	pipe := NewRelayPipe("sess2", "devA", "devB")
 	pool := NewBufferPool()
 
-	// Fill channel (cap = 2)
-	_ = pipe.PushForward(pool.Get(), 10*time.Millisecond)
-	_ = pipe.PushForward(pool.Get(), 10*time.Millisecond)
+	// Fill the ForwardChan buffer (cap = 4)
+	for i := 0; i < 4; i++ {
+		_ = pipe.PushForward(pool.Get(), 10*time.Millisecond)
+	}
 
-	// Third push should timeout
+	// Push beyond capacity should timeout
 	start := time.Now()
 	err := pipe.PushForward(pool.Get(), 50*time.Millisecond)
 	elapsed := time.Since(start)

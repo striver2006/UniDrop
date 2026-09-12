@@ -71,6 +71,8 @@ func (h *DataWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	slog.Info("data plane connected", "session", sessionID, "role", role, "device", deviceID, "target", targetDeviceID)
+
 	pool := h.relayManager.BufferPool()
 
 	if role == "sender" {
@@ -78,6 +80,8 @@ func (h *DataWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		h.handleReceiver(ctx, ws, pipe, pool)
 	}
+
+	slog.Info("data plane disconnected", "session", sessionID, "role", role, "device", deviceID)
 }
 
 // handleSender reads data frames from sender and delivers ACKs/NACKs back to sender.
@@ -94,6 +98,8 @@ func (h *DataWSHandler) handleSender(ctx context.Context, ws *websocket.Conn, pi
 			case <-senderCtx.Done():
 				return
 			case <-pipe.DoneChan:
+				// Propagate pipe closure so the client stops waiting on a dead session
+				_ = ws.Close(websocket.StatusGoingAway, "relay pipe closed")
 				return
 			case ackBuf, ok := <-pipe.BackwardChan:
 				if !ok {
@@ -171,6 +177,8 @@ func (h *DataWSHandler) handleReceiver(ctx context.Context, ws *websocket.Conn, 
 			case <-receiverCtx.Done():
 				return
 			case <-pipe.DoneChan:
+				// Propagate pipe closure so the client stops waiting on a dead session
+				_ = ws.Close(websocket.StatusGoingAway, "relay pipe closed")
 				return
 			case dataBuf, ok := <-pipe.ForwardChan:
 				if !ok {
