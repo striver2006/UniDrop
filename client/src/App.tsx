@@ -202,7 +202,7 @@ export const App: React.FC = () => {
               <span>瞬贴</span>
               <span className="text-[11px] text-slate-400 font-normal">UniDrop</span>
               <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-teal-500/20 text-teal-300 font-normal">
-                v0.1.0
+                v0.1.1
               </span>
             </h1>
             <p className="text-[11px] text-slate-400 pointer-events-none">

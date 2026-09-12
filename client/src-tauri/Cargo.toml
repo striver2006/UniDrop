@@ -1,6 +1,6 @@
 [package]
 name = "unidrop-client"
-version = "0.1.0"
+version = "0.1.1"
 description = "UniDrop Cross-Platform Native Clipboard & File Distribution Client"
 edition = "2021"
 authors = ["UniDrop Team"]
