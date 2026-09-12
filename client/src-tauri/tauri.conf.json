@@ -24,10 +24,6 @@
         "skipTaskbar": false
       }
     ],
-    "trayIcon": {
-      "iconPath": "icons/icon.png",
-      "tooltip": "瞬贴 (UniDrop) - 跨平台剪贴板与文件分发"
-    },
     "security": {
       "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' asset: https://asset.localhost blob: data:; font-src 'self' data:; connect-src 'self' ipc: http: https: ws: wss:;"
     }

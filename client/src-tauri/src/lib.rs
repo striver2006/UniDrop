@@ -336,8 +336,16 @@ pub fn run() {
             let tray_menu = Menu::with_items(app, &[&show_item, &settings_item, &quit_item])?;
 
             // 7. Setup system tray icon and click handling
-            let _tray = TrayIconBuilder::new()
+            // Do NOT re-declare `trayIcon` in tauri.conf.json: Tauri would auto-create a
+            // second tray (icon but no menu/handlers) alongside this one, shifting the
+            // clickable area off the visible icon on Windows.
+            let mut tray_builder = TrayIconBuilder::new()
                 .menu(&tray_menu)
+                .tooltip("瞬贴 (UniDrop) - 跨平台剪贴板与文件分发");
+            if let Some(icon) = app.default_window_icon() {
+                tray_builder = tray_builder.icon(icon.clone());
+            }
+            let _tray = tray_builder
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "quit" => {
                         app.exit(0);
@@ -398,7 +406,6 @@ pub fn run() {
             commands::cmd_get_settings,
             commands::cmd_save_settings,
             commands::cmd_hide_window,
-            commands::cmd_start_drag,
             commands::cmd_read_clipboard_preview,
             commands::cmd_send_clipboard,
             commands::cmd_inject_session,

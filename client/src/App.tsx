@@ -186,20 +186,11 @@ export const App: React.FC = () => {
 
   return (
     <div className="flex flex-col h-screen w-full bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-2xl select-none">
-      {/* Header with native drag handling + data-tauri-drag-region fallback */}
+      {/* Draggable header. Keep a single drag path (data-tauri-drag-region):
+          an extra manual start_dragging call on the same mousedown breaks
+          dragging on Windows (second ReleaseCapture cancels the move loop). */}
       <header
         data-tauri-drag-region
-        onMouseDown={(e) => {
-          const target = e.target as HTMLElement;
-          if (target.closest("button") || target.closest("input") || target.closest("a")) {
-            return;
-          }
-          if (e.buttons === 1) {
-            invoke("cmd_start_drag").catch((err) => {
-              console.warn("Native drag failed:", err);
-            });
-          }
-        }}
         className="flex items-center justify-between px-4 py-3 bg-slate-850/80 backdrop-blur border-b border-slate-800 cursor-move select-none"
       >
         <div data-tauri-drag-region className="flex items-center space-x-2 pointer-events-auto">
