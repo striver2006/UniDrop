@@ -1,0 +1,146 @@
+{
+  "schema": "trivium.run.v1",
+  "run_id": "20260913T033609Z",
+  "topic": "server-transfer-limits",
+  "stage": "plan",
+  "rerun_index": 1,
+  "command": "trivium review --start --stage plan",
+  "prompt_hint": "重点核实 env 解析失败返回 0 落入不限制语义的防护、limits 缺失时的三选一退化行为与兜底常量取值、文本两个 4 MB 相等是巧合不得合并、剪贴板与文件限额是否同时适用、拒绝信回送方向、预检与 offer 落库的时序",
+  "task_goal": null,
+  "entry": "B",
+  "snapshot": {
+    "git_head": "309926f949c21a70b30a33631812db8d348f1ce9",
+    "tree_hash": "9d8d5a965cce6d46bf2e347dcf4452f80a36951e",
+    "dirty": true,
+    "subject_sha256": "f9acfb53b88e9bbe17d3151f390a7588bc75d216cdfece8f9307f5bfc3d7c34d",
+    "drift": {
+      "changed": false,
+      "files": [],
+      "policy": "warn"
+    }
+  },
+  "started_at": "2026-09-13T03:36:10.620Z",
+  "finished_at": "2026-09-13T03:44:10.356Z",
+  "review_mode": "dual",
+  "degraded_reason": null,
+  "critics": {
+    "gemini": {
+      "vendor": "antigravity",
+      "cli_version": "1.2.2",
+      "model_requested": "gemini-3.8-flash-high",
+      "model_effective": "gemini-3.8-flash-high",
+      "model_effective_source": "envelope",
+      "effort": "high",
+      "status": "ok",
+      "exit_code": 0,
+      "duration_s": 151.781,
+      "tool_calls": {
+        "read": 27,
+        "grep": 2,
+        "glob": 0,
+        "run_command": 0,
+        "project_reads": 16
+      },
+      "evidence_ok": true,
+      "usage": {
+        "input_tokens": 170580,
+        "output_tokens": 27814,
+        "thinking_tokens": 22910,
+        "cache_read_tokens": 1669305,
+        "total_tokens": 198394
+      },
+      "heterogeneous": true,
+      "fail_reason": null,
+      "empty_review": false,
+      "parse_fallback": false,
+      "session_id": "b69f7d2a-88c7-406c-abf1-1edde5a21f1b",
+      "peer_deny_applied": false
+    },
+    "glm": {
+      "vendor": "zcode",
+      "cli_version": "0.16.5",
+      "model_requested": "GLM-5.3",
+      "model_effective": "bigmodel-coding-plan/GLM-5.3",
+      "model_effective_source": "trace",
+      "model_route": "config_copy",
+      "status": "ok",
+      "exit_code": 0,
+      "duration_s": 479.599,
+      "tool_calls": {
+        "read": 24,
+        "grep": 7,
+        "glob": 2,
+        "run_command": 0,
+        "project_reads": 29
+      },
+      "evidence_ok": true,
+      "usage": {
+        "source": "provider",
+        "modelRequestCount": 11,
+        "inputTokens": 697184,
+        "outputTokens": 29284,
+        "totalTokens": 726468,
+        "cacheReadTokens": 612800,
+        "cacheWriteTokens": 0,
+        "reasoningTokens": 0,
+        "webFetchRequests": 0,
+        "webSearchRequests": 0
+      },
+      "heterogeneous": true,
+      "fail_reason": null,
+      "empty_review": false,
+      "parse_fallback": false,
+      "session_id": "sess_b9268422-7a42-431b-bb23-f3de10079f98",
+      "peer_deny_applied": false
+    }
+  },
+  "deny_paths": [
+    ".reviews/autostart-single-instance/code/2026-09-13-autostart-single-instance-glm.md",
+    ".reviews/autostart-single-instance/plan/2026-09-13-autostart-single-instance-glm.md",
+    ".reviews/cache-cleanup-configurable/code/2026-09-13-cache-cleanup-configurable-glm.md",
+    ".reviews/cache-cleanup-configurable/plan/2026-09-13-cache-cleanup-configurable-glm.md",
+    ".reviews/history-retention-autodismiss/code/2026-09-13-history-retention-autodismiss-glm.md",
+    ".reviews/history-retention-autodismiss/plan/2026-09-13-history-retention-autodismiss-glm.md"
+  ],
+  "guard": {
+    "readonly_breach": false,
+    "peer_artifact_read": false,
+    "peer_deny_applied": {
+      "gemini": false,
+      "glm": false
+    },
+    "forged_role_file": false,
+    "breached_files": []
+  },
+  "artifacts": [
+    {
+      "path": "server-transfer-limits/plan/_meta/brief-gemini-20260913T033609Z.md",
+      "sha256": "e57f84fec3ebc3380f1eb2bde3c3e9b8fdc744f7c1ff64e7200471771c98ff91"
+    },
+    {
+      "path": "server-transfer-limits/plan/_meta/brief-glm-20260913T033609Z.md",
+      "sha256": "4da59278ef4aec17caff16d165ad34325498914e1a114fcc6d97b164cd2af2e2"
+    },
+    {
+      "path": "server-transfer-limits/plan/_meta/review-gemini-20260913T033609Z.json",
+      "sha256": "f40536efc477342ac18c827638f03f0fa3e0b02816d32d539b76aa9501108b4b"
+    },
+    {
+      "path": "server-transfer-limits/plan/_meta/review-glm-20260913T033609Z.json",
+      "sha256": "8afbb37329ca2e1bdf8e2c702da0222804dc3bcc435e43f1714fed52f16820d9"
+    },
+    {
+      "path": "server-transfer-limits/plan/2026-09-13-server-transfer-limits-gemini.md",
+      "sha256": "cd3674c96fa91d6b32b69141504517dc3ff890fec428b53aedf8ec5941efad54"
+    },
+    {
+      "path": "server-transfer-limits/plan/2026-09-13-server-transfer-limits-glm.md",
+      "sha256": "2b68ccb34385824787b8a6a39db91e17581f39cd92032a64519db8f9d9f77e83"
+    }
+  ],
+  "gate": {
+    "adjudication_complete": false,
+    "state": "review_done_awaiting_disposition"
+  },
+  "status": "success"
+}

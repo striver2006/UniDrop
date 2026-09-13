@@ -1,0 +1,239 @@
+---
+schema: trivium.review.v1
+topic: server-transfer-limits
+stage: plan
+role: glm
+vendor: zcode
+agent_cli: zcode/0.16.5
+model_requested: GLM-5.3
+model_effective: bigmodel-coding-plan/GLM-5.3
+model_effective_source: trace
+model_route: config_copy
+run_id: 20260913T033609Z
+rerun_index: 1
+snapshot_hash: sha256:f9acfb53b88e9bbe17d3151f390a7588bc75d216cdfece8f9307f5bfc3d7c34d
+blind: true
+started_at: 2026-09-13T03:36:10.742Z
+finished_at: 2026-09-13T03:44:10.356Z
+duration_s: 480
+tool_calls:
+  read: 24
+  grep: 7
+  glob: 2
+  run_command: 0
+  project_reads: 29
+evidence_ok: true
+verdict: request-changes
+findings_count:
+  blocker: 0
+  major: 3
+  minor: 4
+  nit: 2
+degraded: false
+parse_fallback: false
+peer_deny: false
+drift: false
+heterogeneous: true
+session_id: sess_b9268422-7a42-431b-bb23-f3de10079f98
+---
+
+# 计划审查：server-transfer-limits
+
+> Critic-B · 智谱 ZCode ｜ 模型 `bigmodel-coding-plan/GLM-5.3`
+> ｜ 运行 `20260913T033609Z`
+
+> ⚠️ **路径级 deny 未生效**：本机该侧 CLI 不支持路径级读取拒绝，对方历史产出的屏蔽仅依赖任务书禁读清单与事后轨迹核验。
+
+## 总判断
+
+计划整体质量高：现状核验全部属实（我逐条验证了四处既有限制、三个死字段、dispatch_offer 落库时序、双向兼容前提），方案方向正确。最危险的一条是 GLM-02：§4.4(4) 在 TRANSFER_ANSWER 处的并发拒绝未定义回送对象，按现有代码两条实现路径（转发无 token 的 answer / 丢弃 answer 只回接收方）都会让发送方卡片永久挂起——通过新路径原样复刻本轮要修的 §1.4 缺陷。其次 GLM-01：§4.2 强制照抄的 `err == nil && val > 0` 形态在语义上无法表达「显式设 0 = 不限制」，与 §4.2 第一条规则及 §7.1 自己的测试直接矛盾。GLM-03 的预检时序会把「超限拒绝」推迟到全量 SHA-256 之后。其余为次要与细节问题。建议修订 §4.2/§4.4/§4.5 后再进入实施。
+
+**结论**：`request-changes`
+
+## 审查意见（共 9 条：重要 3 ｜ 次要 4 ｜ 吹毛求疵 2）
+
+### GLM-01 · 重要（major）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `plan §4.2（对照 §4.1 表、§7.1）` |
+| 类别 | contract ｜ 层次 plan |
+| 置信度 | high |
+
+**问题**：§4.2 一边规定「env 显式设为 0 = 不限制该项，部署者有权关掉任何一项」，一边强制「新增五项必须照抄 config.go:38-41 的 `err == nil && val > 0` 形态」。二者不可同真：该形态下 `val > 0` 排除了 0，显式设置 UNIDROP_MAX_SINGLE_FILE_BYTES=0 会静默保持默认值 128 MB，而不是「不限制」。§7.1 自己的测试（「该项设 0 时任意大小都通过」）按 mandated 形态实现必然变红——计划给实现者的是自相矛盾的指令，落点要么破坏 0 语义、要么偏离被强制的形态。
+
+**依据**：server/internal/config/config.go:38-42 实测为 `if val, err := strconv.Atoi(timeoutStr); err == nil && val > 0`（0 被该条件吞掉，保持默认）；该写法对 HeartbeatTimeout 是对的恰因为它没有「0=不限制」语义，而五个新字段有。§7.1 测试条目「0 = 不限制」与 mandated 形态冲突。
+
+**建议**：把 §4.2 的解析规则改为三态：未设置→默认值；解析成功且 val>=0→原样采用（含 0=不限制）；解析失败或负数→默认值+warn。相应地「照抄现有形态」改为「照抄防误判思路但条件必须是 val>=0」，并在 §7.1 补一条「env 显式设 0 得到 0（不限制），与未设置得到默认值可区分」的测试。
+
+### GLM-02 · 重要（major）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `plan §4.4 第 4 条（TRANSFER_ANSWER 并发校验）` |
+| 类别 | correctness ｜ 层次 plan |
+| 置信度 | high |
+
+**问题**：并发数超限时「回 TRANSFER_FAILURE」未指明回给谁、原 answer 是否转发。按现有代码，两种自然实现都会复刻 §1.4 的永久挂起：(a) 若沿用现有「AuthorizeSession 失败仍 routeToPeer 转发 answer」路径，answer 不带 token，客户端 lib.rs 的 `if let Some(token) = answer.token` 静默跳过，发送方 pending_outbound 永不消费；(b) 若丢弃 answer 只向接收方回 TRANSFER_FAILURE，发送方永远等不到回应，且接收方自己在 lib.rs:185-194 已写入的 pending_inbound 与 RECEIVE 历史 TRANSFERRING 行同样无人复位。此外「在途会话数」计数口径未定义（authSessions 有 5 分钟 TTL、pipes 在双方连上 /ws/data 才创建，二者语义不同）。
+
+**依据**：server/internal/controller/control_ws.go:262-289（ANSWER 分支：authorize 失败仅 warn 后仍转发；成功时才回填 token 并 echo）；client/src-tauri/src/lib.rs:200-204（token 为 None 时整个分支静默跳过）、lib.rs:185-194（接收方在 answer 前就落了 pending_inbound 与 TRANSFERRING 历史）；server/internal/relay/relay_manager.go:77-87（authSessions 按 SessionID 存、带 AccountID 与 5min TTL）、174-181（容量上限实际在管道创建时生效）。
+
+**建议**：§4.4(4) 明确：拒绝时不转发原 answer，向双方各发一条 TRANSFER_FAILURE——接收方经 session.Send，发送方经该 answer 的 ToDevice（对 ANSWER 而言恰是发送方，此处 routeToPeer 方向是对的）；同时定义「在途」= 该账号已授权未终结的会话（即 authSessions），并说明其随 RemovePipe/SweepIdlePipes/TTL 递减。§7.1 的「失败必须到达发送方」断言扩展到 ANSWER 拒绝路径，并断言接收方卡片同样翻红而非残留 TRANSFERRING。
+
+### GLM-03 · 重要（major）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `plan §4.5（预检时序：prepare_offer 之后、dispatch_offer 之前）` |
+| 类别 | correctness ｜ 层次 plan |
+| 置信度 | high |
+
+**问题**：预检放在 prepare_offer 之后，意味着超限文件也要先被完整读取做 SHA-256，拒绝提示要等整个哈希算完才出现。文件大小只需 fs::metadata 即可知，不需要哈希；§1.5 自己把「选 100 GB 文件照常算完 SHA-256」列为现状荒谬之处，而 §4.5 的设计没有修掉它，只是把荒谬从「发出去」改成「算完再拒」。对需求 3 的「超出限制时客户端弹出提示」而言，几十 GB 文件等几分钟才弹提示接近于未实现。
+
+**依据**：client/src-tauri/src/core/transfer_engine.rs:94-131：prepare_offer 对每个文件先 fs::metadata（大小此时已知）再全量读入 SHA-256；cmd_send_files（client/src-tauri/src/commands/clipboard_cmd.rs:156-174）在 spawn_blocking 里调用它，返回后才走到计划新增的预检点。剪贴板路径现状反而是在哈希前检查（clipboard_cmd.rs:185/191），新时序对它还是倒退。
+
+**建议**：§4.5 改为两级：进入 prepare_offer 前先做 metadata 级大小预检（逐文件与总量，含剪贴板 bytes 路径保持哈希前检查），条目数与 total_size 的复核可保留在 prepare 之后作为第二道；§7.2 对应补「超限大文件在哈希开始前即返回」的断言。
+
+### GLM-04 · 次要（minor）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `plan §4.4 第 1 条（解析失败→拒绝）` |
+| 类别 | correctness ｜ 层次 plan |
+| 置信度 | high |
+
+**问题**：对解析失败的 offer 回 TRANSFER_FAILURE 时，服务端拿不到 session_id（payload 解不开），而客户端 TRANSFER_FAILURE 处理完全以 payload.session_id 为匹配键，缺失即整个分支 no-op——拒绝信发出去了却落不到任何卡片上，该路径的挂起并未真正修复。
+
+**依据**：client/src-tauri/src/lib.rs:255-269：session_id 从 env.payload 取出，`if let Some(sid)` 不成立时什么也不做，pending_outbound 不清理、历史不更新。server/internal/protocol/envelope.go:131-137：TransferFailurePayload 的 session_id 是必填字段。
+
+**建议**：§4.4(1) 补充：先做一次宽松的两段式解析（只提 session_id 的最小结构），能提到则回带该 id 的 TRANSFER_FAILURE，完全无法提取时明确只能丢弃+warn（并接受该极端路径挂起），把预期写清楚避免实现者以为回了信就完事。
+
+### GLM-05 · 次要（minor）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `plan §6.3（删除 rate_limit_mb「无迁移成本」）` |
+| 类别 | contract ｜ 层次 plan |
+| 置信度 | high |
+
+**问题**：「删字段安全、serde 忽略未知字段」只对升级方向成立。老结构体的 rate_limit_mb 是无 `#[serde(default)]` 的必填字段：新客户端保存的设置 JSON 不再含该键，一旦用户回滚到旧版本客户端，整份 AppSettings 反序列化失败并走 unwrap_or_else 静默回落全部默认值——server_url / account_id / psk_secret 一并被冲掉。settings_cmd.rs 里关于 start_minimized 的注释正是文档化的同型事故。
+
+**依据**：client/src-tauri/src/commands/settings_cmd.rs:12（rate_limit_mb 无 default），:15-18 注释明确记载「反序列化会整条失败并走 lib.rs 的 unwrap_or_else 静默回落到全部默认值，把用户已配置的 server_url / account_id / psk_secret 一起冲掉」。
+
+**建议**：§6.3 补一句回滚风险的说明（本项目发签名 dmg，版本回退是现实场景）；若要消除，可保留字段一版只读不写，或至少在发布说明里提示降级前导出设置。不必为此改变删除决策。
+
+### GLM-06 · 次要（minor）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `plan §4.5 末段（「服务端校验管正确性，服务端不能信客户端」）` |
+| 类别 | security ｜ 层次 plan |
+| 置信度 | high |
+
+**问题**：服务端校验的对象是 offer 里客户端自报的 size/total_size 字段，数据面没有任何按会话聚合的字节核算——被修改的客户端可以申报 total_size=1 然后经管道流送任意多字节（每帧上限 4 MiB、全局管道 200 是仅有的粗界）。「服务端不能信客户端」的表述会让读者以为限额对恶意客户端也可执行，实际它只约束诚实客户端，强度与 R5 对 account_id 的坦白定位相同。
+
+**依据**：server/internal/protocol/envelope.go:104-114（大小均为 payload 自报字段）；server/internal/controller/data_ws.go:65/146/156（仅帧级 ReadLimit、PayloadLen 一致性与字节指标累计，无逐会话上限）；server/internal/relay/relay_manager.go:174-181（容量只在管道数维度）。
+
+**建议**：把 §4.5 该句改为与 R5 同级的定位（限额是面向诚实客户端的容量/体验约束，不构成对篡改客户端的字节级执行），或在需求文档「已实现」说明中写明这一边界；真正的执行需要管道级字节计数，明确不在本轮。
+
+### GLM-07 · 次要（minor）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `plan §4.1（max_items_per_offer 可配）× control_ws.go:46` |
+| 类别 | contract ｜ 层次 plan |
+| 置信度 | medium |
+
+**问题**：max_items_per_offer 开放为 env 后没有与控制面 512 KiB 单消息读上限联动：部署者把它调大（粗估每条目 JSON 约 200-400 字节，长文件名更高，1000 条即可逼近甚至越过 512 KiB）后，超限 offer 不会走新的 TRANSFER_FAILURE 拒绝路径，而是被 websocket 库直接断连——静默挂起原样保留，且表现形式比条目数超限更迷惑。
+
+**依据**：server/internal/controller/control_ws.go:46（`ws.SetReadLimit(512 * 1024)`，超限由库层断连，服务端无机会回任何控制消息）；server/internal/protocol/envelope.go:95-102（每条目含 relative_path + 64 字符 sha256 等，体积随文件名长度上不封顶）。
+
+**建议**：在 §4.1 或 §6.2 的 .env.example 注释中写明条目数与 512 KiB 信封上限的近似关系（给个保守建议值），或让客户端预检同时按「估算信封体积」兜底；至少把这个交互记入 §9 的需求文档说明，避免部署者调大后误判为服务端 bug。
+
+### GLM-08 · 吹毛求疵（nit）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `plan §7.1（「现有 control_ws_test.go 已有握手脚手架可复用」）` |
+| 类别 | test-gap ｜ 层次 plan |
+| 置信度 | high |
+
+**问题**：所指文件里没有握手脚手架：control_ws_test.go 只含两个数据面测试（未授权访问、坏魔数帧），并无控制面 AUTH_CHALLENGE→AUTH_REQUEST 签名握手。可复用的握手代码实际在 e2e_test.go。照计划找文件会扑空，且超限 offer 集成测需要的 HMAC 盐化签名脚手架得先抽取。
+
+**依据**：server/internal/controller/control_ws_test.go:18/54 仅有 TestDataWSUnauthorizedAccessRejected 与 TestDataWSInvalidMagicFrameDisconnected；server/internal/e2e_test.go:312-337 含完整的 challenge 读取 + GenerateSignatureWithSalt + AUTH_REQUEST 流程。
+
+**建议**：§7.1 把引用改为 e2e_test.go 的握手段（约 312-337 行），或计划里写明先把该握手抽成 controller 包内可复用的测试 helper。
+
+### GLM-09 · 吹毛求疵（nit）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `plan §4.6（设置面板只读展示）` |
+| 类别 | correctness ｜ 层次 plan |
+| 置信度 | high |
+
+**问题**：§4.6 只定义了 limits 为 None 时的展示（「未下发」），没有定义某项限额被部署者显式设为 0（=不限制）时的展示。直接渲染数值会显示「0」或「0 MB」，用户读作「配额为零、什么都发不了」，与「不限制」语义正好相反。
+
+**依据**：plan §4.2 定义 0=不限制；§4.6 与 §7.3 均只覆盖 null/None 分支，无 0 值分支。
+
+**建议**：§4.6 补一句「值为 0 显示『不限制』」，§7.3 的 vitest 用例对应加一条 0 值渲染断言。
+
+## 认为正确的部分
+
+- §1.2/§1.3 现状核验逐条属实：四处既有限制的位置与数值（control_ws.go:46/255、binary_header.go:23、relay_manager.go:14）、MaxItemsPerOffer 与 HeartbeatInterval 确为死字段（全仓 grep 仅 config.go 定义与赋值处）、config.example.yaml 整份不被读取（config.Load 只读 env）。
+- §1.4/§1.5 客户端侧论断属实：dispatch_offer 先插 pending_outbound 再写 TRANSFERRING 历史（clipboard_cmd.rs:122-153），预检放在它之前确能避免挂起残留；cmd_send_files 现状无任何大小检查；MAX_TEXT_BYTES/MAX_IMAGE_BYTES 仅在 cmd_send_clipboard 被检查。
+- 拒绝信方向的风险识别正确且关键：routeToPeer 确实发往 env.ToDevice（control_ws.go:313-329），OFFER 拒绝必须回 session 自己；session.Send 回送通道现成（pong 与 answer echo 已在用）。
+- 双向兼容前提成立：客户端 serde 全仓无 deny_unknown_fields（envelope.rs），新服务端→旧客户端安全；旧服务端→新客户端 Option 缺失即 None。三选一退化行为的辨析（沿用兜底/归零/无限制）是本计划最有价值的一段。
+- §4.3.1「文本两个 4 MB 相等是巧合、不得合并」的论证与 §7.2 钉死测试设计正确——两常量语义来源不同（旧环境原样 vs 新策略默认），合并会让兜底值被将来的服务端调参静默拖走。
+- 协议层具备服务端校验所需数据：offer 自带 data_type/total_size/items[].size（envelope.go:95-114），「剪贴板与文件限额同时适用、取更严」可执行且必要（图片上限调高时单文件维度仍须拦截）。
+- lib.rs:255-302 确会按 session_id 翻红卡片并把 error_message 拼入 summary，服务端拒绝路径的前端呈现无需改动——该引用核实无误。
+- §6.5 重编号连带影响属实：docs/需求.md 新编号已顺延（现 6=多用户、8=缓存清理），cache_manager.rs:477 与 SettingsModal.test.tsx:126 两处注释确仍指旧「需求 9」。rate_limit_mb 死字段论断同样属实（仅 settings_cmd.rs:12 声明、App.tsx:27 默认值、types/index.ts:14 类型与测试 fixture，无读取方）。
+- §4.4 对「解析失败反而放行」缺陷的修正、§6.2 将骗人的 config.example.yaml 改为 .env.example 的取向、R4/R5 对并发计数定位的坦白，均属正确判断。
+
+## 未覆盖范围（本侧盲区）
+
+- 只读静态审查，未运行任何构建/测试/端到端场景；Go 与 Rust 测试的可行性判断基于源码阅读。
+- 未深读 client/src-tauri/src/core/connection_actor.rs 全文与 App.tsx 事件链，AUTH_RESPONSE 之外是否还有解析点未逐一排查（envelope.rs 已确认无 deny_unknown_fields，主结论不受影响）。
+- 未评估 encrypted/encrypted_metadata 加密传输路径下限额的适用性——当前客户端恒为 encrypted:false，按现状不构成本轮约束，但协议字段存在。
+- 未核对 SendModal 文件选择器的多选交互上限，及设置面板 380×560 新分区的实际布局回归（无 UI 运行环境，依赖计划 §7.4 第 6 项人工验收）。
+- 未深究 server/internal/relay/pipe.go 逐帧转发实现细节（仅核 data_ws.go 帧级检查与 relay_manager 容量逻辑，足以支撑 GLM-06 的结论强度）。
+- docker-compose 与 .env.example 变更对既有部署（systemd、Nginx 反代场景，见 docs/DEPLOY*.md）的运维影响未展开评估。
+
+## 实际查阅的项目文件
+
+- `.reviews/server-transfer-limits/plan/2026-09-13-server-transfer-limits-claude.md`
+- `CLAUDE.md`
+- `AGENTS.md`
+- `README.md`
+- `docs/需求.md`
+- `docker-compose.yml`
+- `server/cmd/unidrop-server/main.go`
+- `server/configs/config.example.yaml`
+- `server/internal/auth/verifier.go`
+- `server/internal/config/config.go`
+- `server/internal/controller/control_ws.go`
+- `server/internal/controller/control_ws_test.go`
+- `server/internal/controller/data_ws.go`
+- `server/internal/e2e_test.go`
+- `server/internal/protocol/binary_header.go`
+- `server/internal/protocol/envelope.go`
+- `server/internal/registry/registry.go`
+- `server/internal/relay/relay_manager.go`
+- `client/src/App.tsx`
+- `client/src/App.test.tsx`
+- `client/src/types/index.ts`
+- `client/src/components/SendModal.tsx`
+- `client/src/components/SettingsModal.test.tsx`
+- `client/src-tauri/src/commands/clipboard_cmd.rs`
+- `client/src-tauri/src/commands/settings_cmd.rs`
+- `client/src-tauri/src/core/cache_manager.rs`
+- `client/src-tauri/src/core/transfer_engine.rs`
+- `client/src-tauri/src/lib.rs`
+- `client/src-tauri/src/protocol/envelope.rs`
+
+> 编排器从工具轨迹中记录到的读取次数：{"read":24,"grep":7,"glob":2,"run_command":0,"project_reads":29}
+
+---
+
+*本文档由 TriviumCode 编排器从 `glm` 侧的结构化输出渲染而成。
+审查员无写仓库权限，全部落盘由编排器完成。*
