@@ -1,0 +1,2037 @@
+# trivium changes.diff
+# run_id: 20260913T163647Z
+# base: HEAD
+# head: 119ce540ffe8a9a0eed75aa25bf3ef4fce2f5b6a
+# files: 19
+#   client/src-tauri/Cargo.lock
+#   client/src-tauri/Cargo.toml
+#   client/src-tauri/src/commands/clipboard_cmd.rs
+#   client/src-tauri/src/commands/settings_cmd.rs
+#   client/src-tauri/src/core/cache_manager.rs
+#   client/src-tauri/src/core/e2ee.rs
+#   client/src-tauri/src/core/mod.rs
+#   client/src-tauri/src/core/transfer_engine.rs
+#   client/src-tauri/src/lib.rs
+#   client/src-tauri/src/protocol/envelope.rs
+#   client/src-tauri/src/storage/history_repo.rs
+#   client/src/App.test.tsx
+#   client/src/App.tsx
+#   client/src/components/SettingsModal.test.tsx
+#   client/src/components/SettingsModal.tsx
+#   client/src/types/index.ts
+#   docs/USER_GUIDE.md
+#   docs/design/DESIGN.md
+#   docs/需求.md
+diff --git a/client/src-tauri/Cargo.lock b/client/src-tauri/Cargo.lock
+index bd5a828..7b07a77 100644
+--- a/client/src-tauri/Cargo.lock
++++ b/client/src-tauri/Cargo.lock
+@@ -5033,6 +5033,7 @@ checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
+ name = "unidrop-client"
+ version = "0.2.0"
+ dependencies = [
++ "base64 0.22.1",
+  "crc32fast",
+  "env_logger",
+  "futures-util",
+@@ -5043,6 +5044,7 @@ dependencies = [
+  "objc2 0.5.2",
+  "objc2-app-kit 0.2.2",
+  "objc2-foundation 0.2.2",
++ "ring",
+  "rusqlite",
+  "rustls",
+  "serde",
+diff --git a/client/src-tauri/Cargo.toml b/client/src-tauri/Cargo.toml
+index 52c5893..93b38ad 100644
+--- a/client/src-tauri/Cargo.toml
++++ b/client/src-tauri/Cargo.toml
+@@ -30,6 +30,11 @@ tokio = { version = "1.38", features = ["full"] }
+ futures-util = "0.3"
+ tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
+ rustls = { version = "0.23", features = ["ring"] }
++# ring 本来就在依赖树里（rustls 的 ring feature），这里显式声明是为了直接用它的
++# aead/hkdf。版本必须与 rustls 解析出的一致（当前 0.17.14），否则依赖树会出现两份。
++ring = "0.17"
++# 只用于把 AEAD 密文塞进 OFFER 的 JSON 字段（encrypted_metadata）。
++base64 = "0.22"
+ uuid = { version = "1.8", features = ["v4", "fast-rng"] }
+ crc32fast = "1.4"
+ sha2 = "0.10"
+diff --git a/client/src-tauri/src/commands/clipboard_cmd.rs b/client/src-tauri/src/commands/clipboard_cmd.rs
+index daa9b80..a326e5f 100644
+--- a/client/src-tauri/src/commands/clipboard_cmd.rs
++++ b/client/src-tauri/src/commands/clipboard_cmd.rs
+@@ -1,7 +1,7 @@
+ use std::path::PathBuf;
+ 
+ use serde::Serialize;
+-use tauri::State;
++use tauri::{Emitter, State};
+ use uuid::Uuid;
+ 
+ use crate::app_state::AppState;
+@@ -268,8 +268,88 @@ async fn dispatch_offer(
+     Ok(session_id)
+ }
+ 
++/// 本次传输的加密决策。
++///
++/// `key` 为 `None` 时 `fallback_reason` 必然为 `Some`——调用方据此发出可见提示。
++/// **静默回落明文是安全功能里最糟的反模式**：用户以为加密了，实际没有。
++struct E2eeDecision {
++    key: Option<ring::aead::LessSafeKey>,
++    fallback_reason: Option<String>,
++}
++
++/// 在构造 OFFER **之前**决定加不加密。
++///
++/// 协商为什么必须前置到这里，而不是等对端在 ANSWER 里回一个能力位：
++/// 1. 元数据在构造 OFFER 的那一刻就已经抹空了，等 ANSWER 回来才决定已经太晚——
++///    老接收端收到 OFFER 会无条件 `accepted=true`（lib.rs），然后拿着空文件名失败；
++/// 2. ANSWER 根本带不回自定义字段：服务端在授权成功后会
++///    `env.Payload, _ = json.Marshal(answer)` 重建载荷，未知字段被 Go 静默丢弃
++///    （server/internal/controller/control_ws.go:388）。OFFER 路径则是原样转发——
++///    这个不对称会绊倒任何下一个想给 ANSWER 加字段的人。
++///
++/// 所以改读在线设备表里已有的 `app_version`，单次 OFFER 即定形态，服务端零改动。
++///
++/// **注意这不是抗主动攻击的保证**：协商信息全部经过服务器，恶意服务端可以改写
++/// `app_version` 把传输打回明文。本轮是机会性加密，威胁模型里已如实记录。
++async fn decide_e2ee(
++    state: &State<'_, AppState>,
++    target_device: &str,
++    session_id: &Uuid,
++) -> E2eeDecision {
++    let (enabled, psk, account_id) = {
++        let s = state.settings.lock().await;
++        (s.e2ee_enabled, s.psk_secret.clone(), s.account_id.clone())
++    };
++
++    if !enabled {
++        // 用户自己关的，不必提示——提示应当只用于「你以为开着但这次没生效」。
++        return E2eeDecision { key: None, fallback_reason: None };
++    }
++
++    let peer_version = {
++        let devs = state.online_devices.lock().await;
++        devs.iter()
++            .find(|d| d.device_id == target_device)
++            .map(|d| d.app_version.clone())
++    };
++
++    if !crate::core::e2ee::peer_supports_e2ee(peer_version.as_deref()) {
++        // 文案刻意不写死「对端版本过旧」：协商信息经过服务器，
++        // 「对端确实老」与「协商字段被剥离」在客户端是**不可区分**的。
++        // 只陈述现象与后果，不做无法证实的归因。
++        return E2eeDecision {
++            key: None,
++            fallback_reason: Some("本次传输未加密：未能确认对端支持端到端加密".to_string()),
++        };
++    }
++
++    match crate::core::e2ee::derive_session_key(&psk, session_id, &account_id) {
++        Ok(k) => E2eeDecision { key: Some(k), fallback_reason: None },
++        Err(e) => {
++            log::warn!("会话密钥派生失败，本次回落明文: {}", e);
++            E2eeDecision {
++                key: None,
++                fallback_reason: Some(format!("本次传输未加密：无法派生会话密钥（{e}）")),
++            }
++        }
++    }
++}
++
++/// 回落提示统一从这里发，保证四条发送路径的行为一致。
++fn emit_fallback(app: &tauri::AppHandle, reason: Option<String>) {
++    if let Some(r) = reason {
++        log::warn!("{}", r);
++        let _ = app.emit("e2ee-fallback", r);
++    }
++}
++
+ #[tauri::command]
+-pub async fn cmd_send_files(state: State<'_, AppState>, target_device: String, paths: Vec<String>) -> Result<String, String> {
++pub async fn cmd_send_files(
++    app: tauri::AppHandle,
++    state: State<'_, AppState>,
++    target_device: String,
++    paths: Vec<String>,
++) -> Result<String, String> {
+     if paths.is_empty() {
+         return Err("No files specified".into());
+     }
+@@ -292,25 +372,39 @@ pub async fn cmd_send_files(state: State<'_, AppState>, target_device: String, p
+     .await
+     .map_err(|e| e.to_string())??;
+ 
+-    // 1. Prepare offer in spawn_blocking (P1-10: prevent hashing from blocking Tokio worker)
++    // 1. 协商加密——必须在 prepare_offer 之前，理由见 decide_e2ee。
++    let decision = decide_e2ee(&state, &target_device, &session_id).await;
++    emit_fallback(&app, decision.fallback_reason);
++
++    // 2. Prepare offer in spawn_blocking (P1-10: prevent hashing from blocking Tokio worker)
+     let paths_for_hash = path_bufs.clone();
++    let e2ee_key = decision.key;
+     let (offer_payload, valid_paths) = tokio::task::spawn_blocking(move || {
+-        TransferEngine::prepare_offer(session_id, &paths_for_hash)
++        TransferEngine::prepare_offer(session_id, &paths_for_hash, e2ee_key.as_ref())
+     })
+     .await
+     .map_err(|e| e.to_string())??;
+ 
+-    // 2. Dispatch offer envelope (R2 / N2: 1:1 aligned pending entry)
++    // 3. Dispatch offer envelope (R2 / N2: 1:1 aligned pending entry)
+     dispatch_offer(&state, &target_device, offer_payload, TransferSource::Files(valid_paths)).await
+ }
+ 
+ /// Reads the local clipboard (text / image / file list) and sends it as one transfer.
+ #[tauri::command]
+-pub async fn cmd_send_clipboard(state: State<'_, AppState>, target_device: String) -> Result<String, String> {
++pub async fn cmd_send_clipboard(
++    app: tauri::AppHandle,
++    state: State<'_, AppState>,
++    target_device: String,
++) -> Result<String, String> {
+     let session_id = Uuid::new_v4();
+     let limits_snapshot = { state.server_limits.lock().await.clone() };
+ 
++    let decision = decide_e2ee(&state, &target_device, &session_id).await;
++    emit_fallback(&app, decision.fallback_reason);
++    let e2ee_key = decision.key;
++
+     let (offer_payload, source) = tokio::task::spawn_blocking(move || -> Result<(TransferOfferPayload, TransferSource), String> {
++        let e2ee_key = e2ee_key.as_ref();
+         let limits = limits_snapshot.as_ref();
+         let content = read_clipboard();
+         match content {
+@@ -327,7 +421,7 @@ pub async fn cmd_send_clipboard(state: State<'_, AppState>, target_device: Strin
+                         human_bytes(cap)
+                     ));
+                 }
+-                TransferEngine::prepare_offer_from_bytes(session_id, "TEXT", "clipboard.txt", t.into_bytes())
++                TransferEngine::prepare_offer_from_bytes(session_id, "TEXT", "clipboard.txt", t.into_bytes(), e2ee_key)
+             }
+             ClipboardContent::Image(png) => {
+                 let cap = limits
+@@ -340,13 +434,13 @@ pub async fn cmd_send_clipboard(state: State<'_, AppState>, target_device: Strin
+                         human_bytes(cap)
+                     ));
+                 }
+-                TransferEngine::prepare_offer_from_bytes(session_id, "IMAGE", "clipboard.png", png)
++                TransferEngine::prepare_offer_from_bytes(session_id, "IMAGE", "clipboard.png", png, e2ee_key)
+             }
+             ClipboardContent::Files(paths) => {
+                 // 剪贴板里的文件走与 cmd_send_files 相同的预检，
+                 // 否则「复制文件再发送」会绕开限额。
+                 let usable = precheck_file_paths(&paths, limits)?;
+-                let (offer, valid) = TransferEngine::prepare_offer(session_id, &usable)?;
++                let (offer, valid) = TransferEngine::prepare_offer(session_id, &usable, e2ee_key)?;
+                 Ok((offer, TransferSource::Files(valid)))
+             }
+             ClipboardContent::Empty => Err("剪贴板为空或不包含可发送内容（支持文本 / 图片 / 文件）".into()),
+diff --git a/client/src-tauri/src/commands/settings_cmd.rs b/client/src-tauri/src/commands/settings_cmd.rs
+index 8ef8d47..f84faa5 100644
+--- a/client/src-tauri/src/commands/settings_cmd.rs
++++ b/client/src-tauri/src/commands/settings_cmd.rs
+@@ -60,6 +60,19 @@ pub struct AppSettings {
+     #[serde(default)]
+     pub allow_insecure_tls: bool,
+ 
++    /// 是否对传输内容做端到端加密。
++    ///
++    /// **这里必须写自定义 default，不能用裸 `#[serde(default)]`——与紧邻的
++    /// `allow_insecure_tls` 恰好相反。** 那个字段的安全值是 `false`，正好等于
++    /// `bool::default()`；而这个字段的安全值是 `true`，裸 default 会让所有
++    /// 老库升级后静默关闭加密，且没有任何迹象。两个相邻的 bool 取了相反的默认，
++    /// 看起来像风格不一致，实际都是「默认值必须落在安全的那一侧」。
++    ///
++    /// 开启后并不保证每次传输都加密：对端版本过旧时会回落明文并给出可见提示
++    /// （见 `core::e2ee::peer_supports_e2ee`）。
++    #[serde(default = "default_e2ee_enabled")]
++    pub e2ee_enabled: bool,
++
+     /// 后台清理间隔（分钟），最小 1。
+     ///
+     /// 这个字段的裸 `#[serde(default)]` 后果最严重：`0` 会让调度循环拿到
+@@ -69,6 +82,12 @@ pub struct AppSettings {
+     pub cache_sweep_interval_minutes: u32,
+ }
+ 
++/// E2EE 默认开启。回落机制保证了对端老版本不会因此失败，
++/// 而默认关闭等于绝大多数用户永远不会用上它。
++fn default_e2ee_enabled() -> bool {
++    true
++}
++
+ /// 历史保留条数的默认值。沿用改造前 `cmd_list_history` 硬编码的 100，
+ /// 使未改过设置的老用户看到的列表长度保持不变。
+ pub const DEFAULT_HISTORY_MAX_ENTRIES: u32 = 100;
+@@ -112,6 +131,7 @@ impl AppSettings {
+             cache_max_size_mb: crate::core::retention::DEFAULT_CACHE_MAX_SIZE_MB,
+             cache_sweep_interval_minutes: crate::core::retention::DEFAULT_SWEEP_INTERVAL_MINUTES,
+             allow_insecure_tls: false,
++            e2ee_enabled: true,
+         }
+     }
+ }
+diff --git a/client/src-tauri/src/core/cache_manager.rs b/client/src-tauri/src/core/cache_manager.rs
+index fbac97d..9ccbeb2 100644
+--- a/client/src-tauri/src/core/cache_manager.rs
++++ b/client/src-tauri/src/core/cache_manager.rs
+@@ -383,6 +383,7 @@ mod tests {
+             preview_summary: "demo".to_string(),
+             encrypted: false,
+             encrypted_metadata: None,
++            e2ee_version: None,
+             items: vec![crate::protocol::TransferItemPayload {
+                 item_index: 0,
+                 relative_path: "a.bin".to_string(),
+diff --git a/client/src-tauri/src/core/mod.rs b/client/src-tauri/src/core/mod.rs
+index b14202c..8fcc0b1 100644
+--- a/client/src-tauri/src/core/mod.rs
++++ b/client/src-tauri/src/core/mod.rs
+@@ -1,4 +1,5 @@
+ pub mod cache_manager;
++pub mod e2ee;
+ pub mod connection_actor;
+ pub mod history_pruner;
+ pub mod path_guard;
+@@ -8,6 +9,7 @@ pub mod startup;
+ pub mod transfer_engine;
+ 
+ pub use cache_manager::*;
++pub use e2ee::*;
+ pub use connection_actor::*;
+ pub use history_pruner::*;
+ pub use path_guard::*;
+diff --git a/client/src-tauri/src/core/transfer_engine.rs b/client/src-tauri/src/core/transfer_engine.rs
+index 94a4eb4..9dabd4b 100644
+--- a/client/src-tauri/src/core/transfer_engine.rs
++++ b/client/src-tauri/src/core/transfer_engine.rs
+@@ -21,7 +21,7 @@ use crate::core::path_guard::PathGuard;
+ use crate::core::sliding_window::SlidingWindow;
+ use crate::platform::show_transfer_notification;
+ use crate::protocol::{
+-    ActionType, BinaryHeader, ChunkType, ControlEnvelope, HEADER_SIZE, MAX_PAYLOAD_LENGTH,
++    ActionType, BinaryHeader, ChunkType, ControlEnvelope, FLAG_ENCRYPTED, HEADER_SIZE,
+     TransferItemPayload, TransferOfferPayload,
+ };
+ use crate::storage::HistoryRepo;
+@@ -86,7 +86,19 @@ impl TransferEngine {
+     }
+ 
+     /// Prepares a TransferOfferPayload and matching valid file paths (R2 / N2: strictly 1:1 index-aligned).
+-    pub fn prepare_offer(session_id: Uuid, file_paths: &[PathBuf]) -> Result<(TransferOfferPayload, Vec<PathBuf>), String> {
++    /// 构造文件传输的 OFFER。
++    ///
++    /// `e2ee_key` 为 `Some` 时本次传输加密：分块按明文块长切（给 GCM tag 留出
++    /// 16 字节，否则满块密文会超 4MB 上限被中继断连），且敏感元数据会被摘出加密。
++    /// 传 `Option<&LessSafeKey>` 而不是 `bool`，是为了让「声称加密却没有密钥」
++    /// 这个状态在类型上就不可表示。
++    pub fn prepare_offer(
++        session_id: Uuid,
++        file_paths: &[PathBuf],
++        e2ee_key: Option<&ring::aead::LessSafeKey>,
++    ) -> Result<(TransferOfferPayload, Vec<PathBuf>), String> {
++        // 四处同源之一：块长只从 plaintext_chunk_len 取，不得就地写 MAX_PAYLOAD_LENGTH。
++        let chunk_len = crate::core::e2ee::plaintext_chunk_len(e2ee_key.is_some()) as i64;
+         let mut items = Vec::new();
+         let mut valid_paths = Vec::new();
+         let mut total_size = 0i64;
+@@ -127,7 +139,7 @@ impl TransferEngine {
+             let total_chunks = if file_size == 0 {
+                 1
+             } else {
+-                ((file_size + (MAX_PAYLOAD_LENGTH as i64) - 1) / (MAX_PAYLOAD_LENGTH as i64)) as u32
++                ((file_size + chunk_len - 1) / chunk_len) as u32
+             };
+ 
+             items.push(TransferItemPayload {
+@@ -151,19 +163,22 @@ impl TransferEngine {
+             format!("{} 等 {} 个文件", items[0].relative_path, items.len())
+         };
+ 
+-        Ok((
+-            TransferOfferPayload {
+-                session_id: session_id.to_string(),
+-                data_type: "FILES".to_string(),
+-                total_size,
+-                total_items: items.len(),
+-                preview_summary: summary,
+-                encrypted: false,
+-                encrypted_metadata: None,
+-                items,
+-            },
+-            valid_paths,
+-        ))
++        let mut offer = TransferOfferPayload {
++            session_id: session_id.to_string(),
++            data_type: "FILES".to_string(),
++            total_size,
++            total_items: items.len(),
++            preview_summary: summary,
++            encrypted: false,
++            encrypted_metadata: None,
++            e2ee_version: None,
++            items,
++        };
++        if let Some(key) = e2ee_key {
++            crate::core::e2ee::seal_offer_metadata(&mut offer, key)?;
++        }
++
++        Ok((offer, valid_paths))
+     }
+ 
+     /// Prepares an offer for in-memory content (clipboard text / image) without touching disk.
+@@ -172,6 +187,7 @@ impl TransferEngine {
+         data_type: &str,
+         name: &str,
+         bytes: Vec<u8>,
++        e2ee_key: Option<&ring::aead::LessSafeKey>,
+     ) -> Result<(TransferOfferPayload, TransferSource), String> {
+         if bytes.is_empty() {
+             return Err("Empty payload".into());
+@@ -182,7 +198,9 @@ impl TransferEngine {
+         hasher.update(&bytes);
+         let hash = hex::encode(hasher.finalize());
+ 
+-        let total_chunks = ((size + (MAX_PAYLOAD_LENGTH as i64) - 1) / (MAX_PAYLOAD_LENGTH as i64)) as u32;
++        // 四处同源之一，理由见 prepare_offer。剪贴板内容同样按明文块长切。
++        let chunk_len = crate::core::e2ee::plaintext_chunk_len(e2ee_key.is_some()) as i64;
++        let total_chunks = ((size + chunk_len - 1) / chunk_len) as u32;
+ 
+         let preview_summary = match data_type {
+             "TEXT" => {
+@@ -205,7 +223,7 @@ impl TransferEngine {
+             _ => name.to_string(),
+         };
+ 
+-        let offer = TransferOfferPayload {
++        let mut offer = TransferOfferPayload {
+             session_id: session_id.to_string(),
+             data_type: data_type.to_string(),
+             total_size: size,
+@@ -213,6 +231,7 @@ impl TransferEngine {
+             preview_summary,
+             encrypted: false,
+             encrypted_metadata: None,
++            e2ee_version: None,
+             items: vec![TransferItemPayload {
+                 item_index: 0,
+                 relative_path: name.to_string(),
+@@ -222,6 +241,9 @@ impl TransferEngine {
+                 total_chunks,
+             }],
+         };
++        if let Some(key) = e2ee_key {
++            crate::core::e2ee::seal_offer_metadata(&mut offer, key)?;
++        }
+ 
+         Ok((offer, TransferSource::Memory(bytes)))
+     }
+@@ -238,9 +260,15 @@ impl TransferEngine {
+         to_device: String,
+         source: TransferSource,
+         offer: TransferOfferPayload,
++        // 本次传输的会话密钥。None = 明文传输。
++        // 由调用方派生并传入，而不是在这里重新派生：派生需要 PSK 与 account_id，
++        // 把它们再传一遍只会多两个参数，且多一处「用错 session_id 派生」的机会。
++        e2ee_key: Option<ring::aead::LessSafeKey>,
+         outgoing_tx: mpsc::Sender<ControlEnvelope>,
+         app_handle: AppHandle,
+     ) {
++        // 四处同源之一：与 prepare_offer 算 total_chunks 时用的块长必须一致。
++        let chunk_len = crate::core::e2ee::plaintext_chunk_len(e2ee_key.is_some());
+         let base = server_url.trim().trim_end_matches('/');
+         let ws_data_url = if base.starts_with("ws://") || base.starts_with("wss://") {
+             format!(
+@@ -338,11 +366,13 @@ impl TransferEngine {
+         for (item_idx, item) in offer.items.iter().enumerate() {
+             let file_size = item.size as u64;
+             for c in 0..item.total_chunks {
+-                let offset = (c as u64) * (MAX_PAYLOAD_LENGTH as u64);
+-                let length = if offset + (MAX_PAYLOAD_LENGTH as u64) > file_size {
++                // 四处同源之一：切块必须与 total_chunks 用同一个块长，
++                // 否则最后一块的长度会算错，或多切/少切一块。
++                let offset = (c as u64) * (chunk_len as u64);
++                let length = if offset + (chunk_len as u64) > file_size {
+                     (file_size.saturating_sub(offset)) as usize
+                 } else {
+-                    MAX_PAYLOAD_LENGTH as usize
++                    chunk_len
+                 };
+                 let origin = if let Some(mem) = &mem_buf {
+                     ChunkOrigin::Memory(mem.clone())
+@@ -404,18 +434,22 @@ impl TransferEngine {
+                     }
+                 };
+ 
+-                // Build BinaryHeader
+-                let header = BinaryHeader::new_data(
++                // 成帧（加密在这里发生，三条发送路径共用同一个函数）
++                let frame = match build_data_frame(
+                     session_uuid,
+                     desc.item_index,
+                     desc.chunk_index,
+                     desc.total_chunks,
+                     &payload,
+-                );
+-
+-                let mut frame = vec![0u8; HEADER_SIZE + payload.len()];
+-                if header.encode(&mut frame[..HEADER_SIZE]).is_ok() {
+-                    frame[HEADER_SIZE..].copy_from_slice(&payload);
++                    e2ee_key.as_ref(),
++                ) {
++                    Ok(f) => f,
++                    Err(e) => {
++                        log::error!("成帧失败（session {}）: {}", session_id, e);
++                        break;
++                    }
++                };
++                {
+                     if write.send(Message::Binary(frame)).await.is_ok() {
+                         window.on_chunk_sent(next_chunk_to_send);
+                         next_chunk_to_send += 1;
+@@ -461,16 +495,14 @@ impl TransferEngine {
+                                             log::warn!("Received NACK for chunk {}, immediately fast-retransmitting", retransmit_idx);
+                                             let desc = &all_chunks[retransmit_idx as usize];
+                                             if let Ok(payload) = read_chunk_payload(desc) {
+-                                                    let header = BinaryHeader::new_data(
++                                                    if let Ok(frame) = build_data_frame(
+                                                         session_uuid,
+                                                         desc.item_index,
+                                                         desc.chunk_index,
+                                                         desc.total_chunks,
+                                                         &payload,
+-                                                    );
+-                                                    let mut frame = vec![0u8; HEADER_SIZE + payload.len()];
+-                                                    if header.encode(&mut frame[..HEADER_SIZE]).is_ok() {
+-                                                        frame[HEADER_SIZE..].copy_from_slice(&payload);
++                                                        e2ee_key.as_ref(),
++                                                    ) {
+                                                         let _ = write.send(Message::Binary(frame)).await;
+                                                     }
+                                                 }
+@@ -489,16 +521,14 @@ impl TransferEngine {
+                     for timed_out_idx in timeouts {
+                         let desc = &all_chunks[timed_out_idx as usize];
+                         if let Ok(payload) = read_chunk_payload(desc) {
+-                            let header = BinaryHeader::new_data(
++                            if let Ok(frame) = build_data_frame(
+                                 session_uuid,
+                                 desc.item_index,
+                                 desc.chunk_index,
+                                 desc.total_chunks,
+                                 &payload,
+-                            );
+-                            let mut frame = vec![0u8; HEADER_SIZE + payload.len()];
+-                            if header.encode(&mut frame[..HEADER_SIZE]).is_ok() {
+-                                frame[HEADER_SIZE..].copy_from_slice(&payload);
++                                e2ee_key.as_ref(),
++                            ) {
+                                 let _ = write.send(Message::Binary(frame)).await;
+                             }
+                         }
+@@ -574,9 +604,25 @@ impl TransferEngine {
+         offer: TransferOfferPayload,
+         cache_manager: CacheManager,
+         auto_inject: bool,
++        // 会话密钥。None = 明文传输。必须与 offer.encrypted 一致：
++        // 不一致时要么把密文当明文写盘（文件损坏），要么对明文做 AEAD 解密（全块失败）。
++        e2ee_key: Option<ring::aead::LessSafeKey>,
+         outgoing_tx: mpsc::Sender<ControlEnvelope>,
+         app_handle: AppHandle,
+     ) {
++        // 四处同源之一：写盘定位必须与发送端切块用同一个块长。
++        let chunk_len = crate::core::e2ee::plaintext_chunk_len(e2ee_key.is_some());
++
++        // §D 双层熔断的计数器。
++        //
++        // 单块阈值处理「CRC32 漏检后仍 tag 失败」这种极罕见情形；
++        // **会话级阈值才是主力**：滑动窗口有 4 个在途块，PSK 不一致时它们会
++        // 同时 tag 失败、各自只计到 1，永远够不到单块阈值——只按单块计数的话
++        // 限次在最常见的触发场景下完全失效，退化成无限重传。
++        let mut tag_fail_total: u32 = 0;
++        let mut tag_fail_per_chunk: std::collections::HashMap<(u32, u32), u32> =
++            std::collections::HashMap::new();
++
+         let base = server_url.trim().trim_end_matches('/');
+         let ws_data_url = if base.starts_with("ws://") || base.starts_with("wss://") {
+             format!(
+@@ -678,8 +724,12 @@ impl TransferEngine {
+                 }
+             };
+ 
+-            let payload = &chunk_data[HEADER_SIZE..];
+-            if header.verify_crc32(payload).is_err() {
++            // 线路上的字节：加密时这里是密文（含 tag）。
++            let wire_payload = &chunk_data[HEADER_SIZE..];
++
++            // 第一道：CRC32。它算在**密文**上（见 build_data_frame），所以这一步
++            // 不需要先解密，能在做任何 AES 运算之前就把损坏的块打回重传。
++            if header.verify_crc32(wire_payload).is_err() {
+                 log::warn!("CRC32 corruption on chunk {}, requesting retransmit", header.chunk_index);
+                 // Send NACK
+                 let nack = BinaryHeader::new_nack(header.session_id, header.item_index, header.chunk_index);
+@@ -690,6 +740,70 @@ impl TransferEngine {
+                 continue;
+             }
+ 
++            // 第二道：AEAD。CRC32 过了而 tag 不过，实践中几乎只剩篡改或 PSK 不一致
++            // （CRC32 碰撞在 2^-32 量级），所以这里不能像损坏那样无限重传。
++            let decrypted;
++            let payload: &[u8] = match e2ee_key.as_ref() {
++                Some(key) => {
++                    // nonce **自行重算**，不读 header.nonce：发送端填了它只为抓包可读。
++                    // 信任帧头里的 nonce 会让攻击者靠改它制造解密失败——后果虽与直接
++                    // 改密文相同，但自己算消除了一整类需要论证的问题，成本为零。
++                    let nonce = crate::core::e2ee::data_nonce(header.item_index, header.chunk_index);
++                    match crate::core::e2ee::open(key, nonce, wire_payload) {
++                        Ok(pt) => {
++                            decrypted = pt;
++                            &decrypted
++                        }
++                        Err(e) => {
++                            let should_abort = record_tag_failure(
++                                &mut tag_fail_per_chunk,
++                                &mut tag_fail_total,
++                                header.item_index,
++                                header.chunk_index,
++                            );
++                            log::warn!(
++                                "AEAD 校验失败（item {} chunk {}，本会话累计 {} 次）: {}",
++                                header.item_index, header.chunk_index, tag_fail_total, e
++                            );
++
++                            if should_abort {
++                                log::error!(
++                                    "session {} 触发 E2EE 熔断，中止接收", session_id
++                                );
++                                let fail_env = ControlEnvelope {
++                                    version: 1,
++                                    trace_id: Uuid::new_v4().to_string(),
++                                    action: ActionType::TRANSFER_FAILURE,
++                                    from_device: to_device.clone(),
++                                    to_device: Some(from_device.clone()),
++                                    timestamp: crate::core::connection_actor::current_time_ms(),
++                                    payload: serde_json::json!({
++                                        "session_id": session_id,
++                                        "error_code": "E2EE_AUTH_FAILED",
++                                        // 最常见的原因是两端 PSK 不一致，不是篡改——
++                                        // 文案先指向它，否则用户会去排查网络。
++                                        "error_message": "内容校验失败：两端密钥可能不一致，或数据在传输中被篡改"
++                                    }),
++                                };
++                                let _ = outgoing_tx.send(fail_env).await;
++                                break;
++                            }
++
++                            // 未触顶：当作可恢复的损坏，请求重传。
++                            let nack = BinaryHeader::new_nack(
++                                header.session_id, header.item_index, header.chunk_index,
++                            );
++                            let mut nack_frame = [0u8; HEADER_SIZE];
++                            if nack.encode(&mut nack_frame).is_ok() {
++                                let _ = write.send(Message::Binary(nack_frame.to_vec())).await;
++                            }
++                            continue;
++                        }
++                    }
++                }
++                None => wire_payload,
++            };
++
+             let item_idx = header.item_index as usize;
+             if item_idx >= offer.items.len() {
+                 continue;
+@@ -711,7 +825,7 @@ impl TransferEngine {
+ 
+             // 2. Write chunk into file (P1-6: truncate on first chunk)
+             let is_first = header.chunk_index == 0 && !safe_target.exists();
+-            let write_res = write_payload_chunk(&safe_target, header.chunk_index, payload, is_first);
++            let write_res = write_payload_chunk(&safe_target, header.chunk_index, payload, is_first, chunk_len);
+             if let Err(e) = write_res {
+                 log::error!("Failed to write chunk to {:?}: {}", safe_target, e);
+                 break;
+@@ -727,6 +841,11 @@ impl TransferEngine {
+             // 4. Track completion via bitmap set
+             let was_new = received_chunks_per_item[item_idx].insert(header.chunk_index);
+             if was_new {
++                // 这里必须累加 `payload`（解密后的明文）而不是 `wire_payload`（密文）：
++                // total_size 是明文口径，密文每块多 16 字节，累加密文会让
++                // transferred_size 虚高、进度提前触顶。上面的 clamp 会盖住百分比的
++                // 越界，但不会修正 transferred_size 本身——所以守卫测试断言的是
++                // transferred_size，不是百分比。
+                 total_received_bytes += payload.len() as i64;
+                 let pct = if total_size > 0 {
+                     ((total_received_bytes as f64) / (total_size as f64) * 100.0).clamp(0.0, 100.0)
+@@ -929,6 +1048,75 @@ impl TransferEngine {
+     }
+ }
+ 
++/// AEAD 校验失败的熔断阈值。单块与会话级共用这一个数。
++///
++/// CRC32 已算在密文上，线路偶发损坏会先被它拦下走 NACK；能同时通过 CRC32
++/// 又 tag 失败的情形实践中几乎只剩篡改或 PSK 不一致（CRC32 碰撞在 2^-32 量级），
++/// 所以快速熔断不会误伤正常传输。
++pub(crate) const TAG_FAIL_LIMIT: u32 = 3;
++
++/// 记录一次 AEAD 失败，返回是否应当熔断整个会话。
++///
++/// **双层计数缺一不可**：滑动窗口有 4 个在途块，PSK 不一致时它们会同时 tag 失败，
++/// 每块各自只计到 1——只按单块计数的话永远够不到阈值，限次在最常见的触发场景下
++/// 完全失效，退化成无限 NACK 重传（传输永不结束，用户看不到任何错误）。
++/// 会话级累计才是主力，单块阈值负责「同一块反复失败」这种更窄的情形。
++pub(crate) fn record_tag_failure(
++    per_chunk: &mut std::collections::HashMap<(u32, u32), u32>,
++    total: &mut u32,
++    item_index: u32,
++    chunk_index: u32,
++) -> bool {
++    *total += 1;
++    let per = per_chunk.entry((item_index, chunk_index)).or_insert(0);
++    *per += 1;
++    *per >= TAG_FAIL_LIMIT || *total >= TAG_FAIL_LIMIT
++}
++
++/// 把一块明文封装成完整数据帧。
++///
++/// 加密时：payload 换成 AEAD 密文，**CRC32 因此算在密文上**，nonce 写进帧头、
++/// 置 `FLAG_ENCRYPTED`。
++///
++/// CRC32 为什么算密文而不是明文：帧头对中继完全可见，而明文的 32 位指纹足以让
++/// 短内容被暴力枚举确认——剪贴板文本正是短内容。加密了正文却在帧头附赠校验和，
++/// 等于自己拆掉一半。算在密文上还保留了「解密之前就能拒绝坏块」的能力，
++/// 不必对已知损坏的数据做无用的 AES 运算。
++///
++/// **三条发送路径（首发 / NACK 快重传 / 超时重传）都必须走这个函数。**
++/// 漏掉任一条的后果是那条路径发出明文而接收端按加密解析，
++/// 表现为随机的 tag 失败——极难定位到是某条重传路径没加密。
++fn build_data_frame(
++    session_uuid: Uuid,
++    item_index: u32,
++    chunk_index: u32,
++    total_chunks: u32,
++    plaintext: &[u8],
++    e2ee_key: Option<&ring::aead::LessSafeKey>,
++) -> Result<Vec<u8>, String> {
++    let (payload, nonce) = match e2ee_key {
++        Some(k) => {
++            let n = crate::core::e2ee::data_nonce(item_index, chunk_index);
++            (crate::core::e2ee::seal(k, n, plaintext)?, Some(n))
++        }
++        None => (plaintext.to_vec(), None),
++    };
++
++    let mut header =
++        BinaryHeader::new_data(session_uuid, item_index, chunk_index, total_chunks, &payload);
++    if let Some(n) = nonce {
++        header.nonce = n;
++        header.flags |= FLAG_ENCRYPTED;
++    }
++
++    let mut frame = vec![0u8; HEADER_SIZE + payload.len()];
++    header
++        .encode(&mut frame[..HEADER_SIZE])
++        .map_err(|e| e.to_string())?;
++    frame[HEADER_SIZE..].copy_from_slice(&payload);
++    Ok(frame)
++}
++
+ fn read_file_chunk(path: &Path, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
+     let mut file = File::open(path)?;
+     file.seek(SeekFrom::Start(offset))?;
+@@ -937,14 +1125,26 @@ fn read_file_chunk(path: &Path, offset: u64, length: usize) -> std::io::Result<V
+     Ok(buf)
+ }
+ 
+-fn write_payload_chunk(path: &Path, chunk_index: u32, payload: &[u8], truncate: bool) -> std::io::Result<()> {
++/// 把一块**明文**写进目标文件的对应位置。
++///
++/// `chunk_len` 必须与发送端切块、以及 `total_chunks` 的计算用同一个值。
++/// 四处同源里这一处的失败形态最隐蔽：offset 用错不会报错、不会 CRC 失败、
++/// 也不会 tag 失败——每块都成功解密、成功写入，只是写在错误的位置，
++/// 直到最后 SHA256 才发现文件是坏的，而那时整个传输已经跑完了。
++fn write_payload_chunk(
++    path: &Path,
++    chunk_index: u32,
++    payload: &[u8],
++    truncate: bool,
++    chunk_len: usize,
++) -> std::io::Result<()> {
+     let mut file = OpenOptions::new()
+         .create(true)
+         .write(true)
+         .truncate(truncate)
+         .open(path)?;
+ 
+-    let offset = (chunk_index as u64) * (MAX_PAYLOAD_LENGTH as u64);
++    let offset = (chunk_index as u64) * (chunk_len as u64);
+     file.seek(SeekFrom::Start(offset))?;
+     file.write_all(payload)?;
+     Ok(())
+@@ -968,6 +1168,8 @@ fn verify_file_sha256(path: &Path, expected_hex: &str) -> Result<bool, String> {
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    // 生产代码已全部改走 plaintext_chunk_len，只有测试还需要这个原始上限。
++    use crate::protocol::MAX_PAYLOAD_LENGTH;
+     use std::io::Write;
+ 
+     #[test]
+@@ -991,7 +1193,7 @@ mod tests {
+         let input_paths = vec![sub_dir, file1.clone(), non_existent, file2.clone()];
+ 
+         let session_id = Uuid::new_v4();
+-        let (offer, valid_paths) = TransferEngine::prepare_offer(session_id, &input_paths).unwrap();
++        let (offer, valid_paths) = TransferEngine::prepare_offer(session_id, &input_paths, None).unwrap();
+ 
+         assert_eq!(offer.items.len(), 2);
+         assert_eq!(valid_paths.len(), 2);
+@@ -1012,7 +1214,7 @@ mod tests {
+ 
+         // Small text: single chunk, TEXT summary present
+         let (offer, source) =
+-            TransferEngine::prepare_offer_from_bytes(session_id, "TEXT", "clipboard.txt", b"hello clipboard".to_vec())
++            TransferEngine::prepare_offer_from_bytes(session_id, "TEXT", "clipboard.txt", b"hello clipboard".to_vec(), None)
+                 .unwrap();
+         assert_eq!(offer.data_type, "TEXT");
+         assert_eq!(offer.total_items, 1);
+@@ -1029,11 +1231,214 @@ mod tests {
+         // Payload larger than one chunk (>4MB) splits into the right number of chunks
+         let big = vec![7u8; (MAX_PAYLOAD_LENGTH as usize) * 2 + 1024];
+         let (offer_big, _) =
+-            TransferEngine::prepare_offer_from_bytes(session_id, "IMAGE", "clipboard.png", big).unwrap();
++            TransferEngine::prepare_offer_from_bytes(session_id, "IMAGE", "clipboard.png", big, None).unwrap();
+         assert_eq!(offer_big.items[0].total_chunks, 3);
+         assert!(offer_big.preview_summary.contains("图片"));
+ 
+         // Empty payload is rejected
+-        assert!(TransferEngine::prepare_offer_from_bytes(session_id, "TEXT", "clipboard.txt", Vec::new()).is_err());
++        assert!(TransferEngine::prepare_offer_from_bytes(session_id, "TEXT", "clipboard.txt", Vec::new(), None).is_err());
++    }
++
++    // ---------- E2EE ----------
++
++    fn test_key(sid: &Uuid) -> ring::aead::LessSafeKey {
++        crate::core::e2ee::derive_session_key("psk-for-test", sid, "acct").unwrap()
++    }
++
++    /// 帧头的 CRC32 必须算在**密文**上。
++    ///
++    /// 算在明文上会把明文的 32 位指纹写进对中继完全可见的帧头，
++    /// 短内容（剪贴板文本正是短内容）可被暴力枚举确认——加密了正文却附赠校验和。
++    /// 后半条断言（≠ 明文 CRC32）才是真正的守卫：它防的是有人"顺手"改回明文。
++    #[test]
++    fn crc32_is_computed_over_ciphertext_not_plaintext() {
++        let sid = Uuid::new_v4();
++        let key = test_key(&sid);
++        let plaintext = b"secret clipboard payload";
++
++        let frame = build_data_frame(sid, 0, 0, 1, plaintext, Some(&key)).unwrap();
++        let header = BinaryHeader::decode(&frame[..HEADER_SIZE]).unwrap();
++        let wire = &frame[HEADER_SIZE..];
++
++        assert_eq!(
++            header.checksum,
++            crate::protocol::binary_header::compute_crc32(wire),
++            "帧头 CRC32 应等于密文的 CRC32"
++        );
++        assert_ne!(
++            header.checksum,
++            crate::protocol::binary_header::compute_crc32(plaintext),
++            "帧头 CRC32 等于明文的 CRC32——明文指纹泄露给了中继"
++        );
++        assert_ne!(wire, plaintext, "线路上出现了明文");
++        assert_eq!(header.flags & FLAG_ENCRYPTED, FLAG_ENCRYPTED, "未置加密标志位");
++    }
++
++    /// 不加密时行为必须与改造前完全一致：CRC32 算在明文上、不置标志位。
++    #[test]
++    fn plaintext_frame_is_unchanged() {
++        let sid = Uuid::new_v4();
++        let plaintext = b"plain payload";
++        let frame = build_data_frame(sid, 0, 0, 1, plaintext, None).unwrap();
++        let header = BinaryHeader::decode(&frame[..HEADER_SIZE]).unwrap();
++        assert_eq!(&frame[HEADER_SIZE..], plaintext);
++        assert_eq!(
++            header.checksum,
++            crate::protocol::binary_header::compute_crc32(plaintext)
++        );
++        assert_eq!(header.flags & FLAG_ENCRYPTED, 0);
++    }
++
++    /// 满的加密块整帧不得超过中继的 4MB 上限。
++    /// 超了的话中继会 ErrPayloadTooLarge 断连，而客户端只看到"连接被关"。
++    #[test]
++    fn full_encrypted_frame_fits_the_relay_limit() {
++        let sid = Uuid::new_v4();
++        let key = test_key(&sid);
++        let pt = vec![3u8; crate::core::e2ee::plaintext_chunk_len(true)];
++        let frame = build_data_frame(sid, 0, 0, 1, &pt, Some(&key)).unwrap();
++        let payload_len = frame.len() - HEADER_SIZE;
++        assert_eq!(
++            payload_len, MAX_PAYLOAD_LENGTH as usize,
++            "满块密文应恰好等于上限（多一字节就会被中继拒收）"
++        );
++    }
++
++    /// **端到端错位守卫**：跨 3 块的加密传输，按发送端切块 → 成帧 → 接收端解密 →
++    /// 按同一块长写盘，重组后必须与原文逐字节相同。
++    ///
++    /// 这条防的是"四处同源"漏改任意一处：offset 用错时每块都能解密、能写入，
++    /// 只有重组后的字节会不同——单看每一块都是成功的。
++    #[test]
++    fn encrypted_multichunk_roundtrip_is_byte_identical() {
++        let sid = Uuid::new_v4();
++        let key = test_key(&sid);
++        let chunk_len = crate::core::e2ee::plaintext_chunk_len(true);
++
++        // 3 块：两满块 + 一个零头，确保覆盖"最后一块长度不同"的分支
++        let original: Vec<u8> = (0..(chunk_len * 2 + 777)).map(|i| (i % 251) as u8).collect();
++        let total_chunks = ((original.len() + chunk_len - 1) / chunk_len) as u32;
++        assert_eq!(total_chunks, 3);
++
++        let mut rebuilt = vec![0u8; original.len()];
++        for c in 0..total_chunks {
++            let offset = c as usize * chunk_len;
++            let end = (offset + chunk_len).min(original.len());
++            let frame =
++                build_data_frame(sid, 0, c, total_chunks, &original[offset..end], Some(&key)).unwrap();
++
++            let header = BinaryHeader::decode(&frame[..HEADER_SIZE]).unwrap();
++            let wire = &frame[HEADER_SIZE..];
++            assert!(header.verify_crc32(wire).is_ok(), "第 {c} 块 CRC32 未通过");
++
++            // 接收端自行重算 nonce，不读 header.nonce
++            let nonce = crate::core::e2ee::data_nonce(header.item_index, header.chunk_index);
++            let plain = crate::core::e2ee::open(&key, nonce, wire).unwrap();
++
++            // 与 write_payload_chunk 相同的定位方式
++            let write_at = header.chunk_index as usize * chunk_len;
++            rebuilt[write_at..write_at + plain.len()].copy_from_slice(&plain);
++        }
++
++        assert_eq!(rebuilt, original, "重组结果与原文不一致——块长或写盘 offset 不同源");
++    }
++
++    /// 加密与不加密的分块数可能不同（块长差 16 字节），而两端必须各自
++    /// 按同一个 encrypted 取块长。这条钉死 total_chunks 确实跟着 encrypted 走。
++    #[test]
++    fn total_chunks_follows_the_encrypted_flag() {
++        let sid = Uuid::new_v4();
++        let key = test_key(&sid);
++        // 恰好等于一个明文满块：不加密时 1 块，加密时因为块长少 16 字节而变成 2 块
++        let size = MAX_PAYLOAD_LENGTH as usize;
++        let bytes = vec![9u8; size];
++
++        let (plain_offer, _) =
++            TransferEngine::prepare_offer_from_bytes(sid, "IMAGE", "a.png", bytes.clone(), None).unwrap();
++        let (enc_offer, _) =
++            TransferEngine::prepare_offer_from_bytes(sid, "IMAGE", "a.png", bytes, Some(&key)).unwrap();
++
++        assert_eq!(plain_offer.items[0].total_chunks, 1);
++        assert_eq!(
++            enc_offer.items[0].total_chunks, 2,
++            "加密块长少 16 字节，这个尺寸必须多切一块"
++        );
++    }
++
++    /// 加密 OFFER 序列化后**不得**出现明文文件名与 sha256。
++    ///
++    /// 直接对序列化后的字符串做子串断言，而不是检查结构体字段——
++    /// 后者在新增字段时不会跟着变红，而真正上线的是这串 JSON。
++    #[test]
++    fn encrypted_offer_leaks_no_filename_or_hash() {
++        let sid = Uuid::new_v4();
++        let key = test_key(&sid);
++        let (offer, _) = TransferEngine::prepare_offer_from_bytes(
++            sid, "TEXT", "my-secret-notes.txt", b"hello".to_vec(), Some(&key),
++        ).unwrap();
++
++        let mut hasher = Sha256::new();
++        hasher.update(b"hello");
++        let real_hash = hex::encode(hasher.finalize());
++
++        let json = serde_json::to_string(&offer).unwrap();
++        assert!(!json.contains("my-secret-notes.txt"), "文件名明文出现在 OFFER 里");
++        assert!(!json.contains(&real_hash), "内容 sha256 明文出现在 OFFER 里——查表即可确认传了哪个文件");
++        assert!(!json.contains("文本: hello"), "预览摘要明文出现在 OFFER 里");
++        assert!(offer.encrypted);
++        assert_eq!(offer.e2ee_version, Some(crate::core::e2ee::E2EE_VERSION));
++
++        // 服务端限额要读的字段必须仍是明文，否则限额会静默失效或误拒
++        assert_eq!(offer.total_size, 5);
++        assert_eq!(offer.total_items, 1);
++        assert_eq!(offer.data_type, "TEXT");
++        assert_eq!(offer.items[0].size, 5);
++
++        // 接收端解密后必须原样还原
++        let mut received = offer.clone();
++        crate::core::e2ee::open_offer_metadata(&mut received, &key).unwrap();
++        assert_eq!(received.items[0].relative_path, "my-secret-notes.txt");
++        assert_eq!(received.items[0].sha256, real_hash);
++        assert!(received.preview_summary.contains("hello"));
++    }
++
++    /// 用错的密钥解 OFFER 元数据必须失败——这条是"PSK 不一致在信令阶段就被发现"的依据。
++    #[test]
++    fn offer_metadata_rejects_wrong_key() {
++        let sid = Uuid::new_v4();
++        let (offer, _) = TransferEngine::prepare_offer_from_bytes(
++            sid, "TEXT", "a.txt", b"x".to_vec(), Some(&test_key(&sid)),
++        ).unwrap();
++
++        let wrong = crate::core::e2ee::derive_session_key("another-psk", &sid, "acct").unwrap();
++        let mut received = offer.clone();
++        assert!(crate::core::e2ee::open_offer_metadata(&mut received, &wrong).is_err());
++    }
++
++    /// **AGY-04**：滑动窗口有 4 个在途块，PSK 不一致时它们同时 tag 失败、
++    /// 每块各自只计到 1。只按单块计数的话永远够不到阈值 3，会无限重传。
++    /// 这条钉死会话级累计存在。
++    #[test]
++    fn concurrent_window_failures_trip_the_session_breaker() {
++        let mut per = std::collections::HashMap::new();
++        let mut total = 0u32;
++
++        // 四个**不同**的块各失败一次，模拟窗口内并发失败
++        assert!(!record_tag_failure(&mut per, &mut total, 0, 0));
++        assert!(!record_tag_failure(&mut per, &mut total, 0, 1));
++        assert!(
++            record_tag_failure(&mut per, &mut total, 0, 2),
++            "三个不同块各失败一次后必须熔断——只按单块计数会在这里放行并无限重传"
++        );
++    }
++
++    /// 同一块连续失败同样要熔断（更窄的情形，由单块阈值负责）。
++    #[test]
++    fn repeated_failure_on_one_chunk_trips_the_breaker() {
++        let mut per = std::collections::HashMap::new();
++        let mut total = 0u32;
++        assert!(!record_tag_failure(&mut per, &mut total, 5, 5));
++        assert!(!record_tag_failure(&mut per, &mut total, 5, 5));
++        assert!(record_tag_failure(&mut per, &mut total, 5, 5));
+     }
+ }
+diff --git a/client/src-tauri/src/lib.rs b/client/src-tauri/src/lib.rs
+index 0189f0d..6ab23ce 100644
+--- a/client/src-tauri/src/lib.rs
++++ b/client/src-tauri/src/lib.rs
+@@ -42,6 +42,22 @@ fn reveal_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+     }
+ }
+ 
++/// 按会话 ID 字符串派生密钥。
++///
++/// session_id 在信令里是字符串，而密钥派生要的是 16 字节原始 UUID
++/// （字符串形式有大小写与连字符的歧义，见 `e2ee::derive_session_key`）。
++/// 解析失败必须报错而不是回落到一个随便造的 UUID——那会让两端派生出不同的 key，
++/// 表现为整批 tag 失败，而真正的原因（ID 格式不对）完全看不出来。
++fn derive_key_for(
++    session_id: &str,
++    psk: &str,
++    account_id: &str,
++) -> Result<ring::aead::LessSafeKey, String> {
++    let uuid = uuid::Uuid::parse_str(session_id)
++        .map_err(|e| format!("session_id 不是合法 UUID（{session_id}）: {e}"))?;
++    core::e2ee::derive_session_key(psk, &uuid, account_id)
++}
++
+ pub fn run() {
+     env_logger::init();
+     let _ = rustls::crypto::ring::default_provider().install_default();
+@@ -188,8 +204,63 @@ pub fn run() {
+                         }
+                         ActionType::TRANSFER_OFFER => {
+                             // Receiver received offer: send TRANSFER_ANSWER(accepted=true) back
+-                            if let Ok(offer) = serde_json::from_value::<TransferOfferPayload>(env.payload.clone()) {
++                            if let Ok(mut offer) = serde_json::from_value::<TransferOfferPayload>(env.payload.clone()) {
+                                 log::info!("Received TRANSFER_OFFER from {} for session {}", env.from_device, offer.session_id);
++
++                                // 加密 OFFER：必须**先解密元数据再做任何别的事**。
++                                //
++                                // 下面几步会 emit 给界面并把历史行落库，而加密 OFFER 里的
++                                // relative_path / sha256 / preview_summary 都是空的——
++                                // 不先还原就会展示并持久化空文件名，后续展示与修剪都带着它。
++                                //
++                                // 解密失败就地拒收，不建数据面：最常见的原因是两端 PSK 不一致，
++                                // 让它在信令阶段以明确理由失败，比拖到数据面靠 tag 失败发现要好得多
++                                // （那条路径给出的现象与真正的原因隔了好几层）。
++                                let mut reject_reason: Option<String> = None;
++                                if offer.encrypted {
++                                    let (psk, acct) = {
++                                        let s = settings_ref.lock().await;
++                                        (s.psk_secret.clone(), s.account_id.clone())
++                                    };
++                                    match derive_key_for(&offer.session_id, &psk, &acct) {
++                                        Ok(key) => {
++                                            if let Err(e) = core::e2ee::open_offer_metadata(&mut offer, &key) {
++                                                log::warn!("加密 OFFER 的元数据解密失败，拒收 session {}: {}", offer.session_id, e);
++                                                reject_reason = Some("E2EE_KEY_MISMATCH".to_string());
++                                            }
++                                        }
++                                        Err(e) => {
++                                            log::warn!("接收端密钥派生失败，拒收 session {}: {}", offer.session_id, e);
++                                            reject_reason = Some("E2EE_KEY_MISMATCH".to_string());
++                                        }
++                                    }
++                                }
++
++                                if let Some(reason) = reject_reason {
++                                    let answer = TransferAnswerPayload {
++                                        session_id: offer.session_id.clone(),
++                                        accepted: false,
++                                        reject_reason: Some(reason),
++                                        resumed_items: Vec::new(),
++                                        token: None,
++                                    };
++                                    let answer_env = protocol::ControlEnvelope {
++                                        version: 1,
++                                        trace_id: uuid::Uuid::new_v4().to_string(),
++                                        action: ActionType::TRANSFER_ANSWER,
++                                        from_device: self_device_id.clone(),
++                                        to_device: Some(env.from_device.clone()),
++                                        timestamp: core::connection_actor::current_time_ms(),
++                                        payload: serde_json::to_value(&answer).unwrap(),
++                                    };
++                                    let _ = outgoing_tx_actor.send(answer_env).await;
++                                    let _ = app_handle.emit(
++                                        "e2ee-offer-rejected",
++                                        "收到一份无法解密的传输请求，已拒收：两端密钥可能不一致",
++                                    );
++                                    continue;
++                                }
++
+                                 let answer = TransferAnswerPayload {
+                                     session_id: offer.session_id.clone(),
+                                     accepted: true,
+@@ -236,9 +307,24 @@ pub fn run() {
+ 
+                                         if let Some((offer, source)) = outbound_entry {
+                                             log::info!("Starting Sender task for session {}", answer.session_id);
+-                                            let (active_server_url, allow_insecure_tls) = {
++                                            let (active_server_url, allow_insecure_tls, psk, acct) = {
+                                                 let s = settings_ref.lock().await;
+-                                                (s.server_url.clone(), s.allow_insecure_tls)
++                                                (s.server_url.clone(), s.allow_insecure_tls,
++                                                 s.psk_secret.clone(), s.account_id.clone())
++                                            };
++                                            // offer.encrypted 是发 OFFER 时就定下的，这里按它派生。
++                                            // 派生失败不能静默降级成明文：接收端已经按加密形态
++                                            // 准备好了，发明文过去只会让它整批 tag 失败。
++                                            let sender_key = if offer.encrypted {
++                                                match derive_key_for(&answer.session_id, &psk, &acct) {
++                                                    Ok(k) => Some(k),
++                                                    Err(e) => {
++                                                        log::error!("发送端会话密钥派生失败，放弃本次传输: {}", e);
++                                                        continue;
++                                                    }
++                                                }
++                                            } else {
++                                                None
+                                             };
+                                             tokio::spawn(TransferEngine::start_sender_task(
+                                                 active_server_url,
+@@ -249,6 +335,7 @@ pub fn run() {
+                                                 env.from_device.clone(),
+                                                 source,
+                                                 offer,
++                                                sender_key,
+                                                 outgoing_tx_actor.clone(),
+                                                 app_handle.clone(),
+                                             ));
+@@ -260,9 +347,21 @@ pub fn run() {
+                                             };
+ 
+                                             if let Some((offer, sender_device)) = inbound_entry {
+-                                                let (auto_inject, active_server_url, allow_insecure_tls) = {
++                                                let (auto_inject, active_server_url, allow_insecure_tls, psk, acct) = {
+                                                     let s = settings_ref.lock().await;
+-                                                    (s.auto_inject, s.server_url.clone(), s.allow_insecure_tls)
++                                                    (s.auto_inject, s.server_url.clone(), s.allow_insecure_tls,
++                                                     s.psk_secret.clone(), s.account_id.clone())
++                                                };
++                                                let receiver_key = if offer.encrypted {
++                                                    match derive_key_for(&answer.session_id, &psk, &acct) {
++                                                        Ok(k) => Some(k),
++                                                        Err(e) => {
++                                                            log::error!("接收端会话密钥派生失败，放弃本次接收: {}", e);
++                                                            continue;
++                                                        }
++                                                    }
++                                                } else {
++                                                    None
+                                                 };
+                                                 log::info!("Starting Receiver task for session {}, auto_inject={}", answer.session_id, auto_inject);
+                                                 tokio::spawn(TransferEngine::start_receiver_task(
+@@ -275,6 +374,7 @@ pub fn run() {
+                                                     offer,
+                                                     cache_manager_ref.clone(),
+                                                     auto_inject,
++                                                    receiver_key,
+                                                     outgoing_tx_actor.clone(),
+                                                     app_handle.clone(),
+                                                 ));
+diff --git a/client/src-tauri/src/protocol/envelope.rs b/client/src-tauri/src/protocol/envelope.rs
+index 031da71..48fc266 100644
+--- a/client/src-tauri/src/protocol/envelope.rs
++++ b/client/src-tauri/src/protocol/envelope.rs
+@@ -139,14 +139,49 @@ pub struct TransferOfferPayload {
+     pub data_type: String, // "TEXT" | "IMAGE" | "FILES"
+     pub total_size: i64,
+     pub total_items: usize,
++    /// 预览摘要。`encrypted = true` 时这里是空串，真值在 `encrypted_metadata` 里。
+     pub preview_summary: String,
++    /// 本次传输是否加密。此前是一直硬编码 `false` 的协议占位，现已启用。
+     pub encrypted: bool,
++    /// `encrypted = true` 时装 base64(AEAD(条目元数据 JSON))，见 `EncryptedMetadata`。
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub encrypted_metadata: Option<String>,
++    /// E2EE 协议版本。`None` = 明文传输（老客户端或协商回落）。
++    ///
++    /// 它**不承担能力协商职责**——协商在发 OFFER 之前就由对端 `app_version` 定了
++    /// （见 `core::e2ee::peer_supports_e2ee`）。这里只是接收端的自描述。
++    /// `skip_serializing_if` 让明文 OFFER 与老版本保持字节级一致。
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub e2ee_version: Option<u8>,
+     #[serde(default)]
+     pub items: Vec<TransferItemPayload>,
+ }
+ 
++/// 加密元数据的明文形态：`encrypted = true` 时从 `items[]` 里摘出来的敏感字段。
++///
++/// 为什么这几个字段必须加密，而 `size` / `total_chunks` 不能加密：
++/// 服务端限额只读 `total_size` / `data_type` / `items[].size` 与条目数
++/// （server/internal/limits/limits.go），**从不读文件名与哈希**。
++/// 所以能藏的就藏，藏不了的如实留明文——这条切分线是限额机制的必然代价，
++/// 不是可以再优化的空间。
++///
++/// `sha256` 尤其要藏：它是内容的密码学指纹，服务端拿它**查表**就能精确确认
++/// 你传了哪个已知文件，不需要暴力枚举。加密了正文却附赠内容指纹，
++/// 与把 CRC32 算在明文上是同一类错误。
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct EncryptedMetadata {
++    pub preview_summary: String,
++    pub items: Vec<EncryptedItemMeta>,
++}
++
++#[derive(Debug, Clone, Serialize, Deserialize)]
++pub struct EncryptedItemMeta {
++    pub item_index: u32,
++    pub relative_path: String,
++    pub sha256: String,
++    pub is_dir: bool,
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct ResumedItemPayload {
+     pub item_index: u32,
+diff --git a/client/src-tauri/src/storage/history_repo.rs b/client/src-tauri/src/storage/history_repo.rs
+index 31773e7..d64f1f5 100644
+--- a/client/src-tauri/src/storage/history_repo.rs
++++ b/client/src-tauri/src/storage/history_repo.rs
+@@ -382,6 +382,7 @@ mod tests {
+             preview_summary: "demo".to_string(),
+             encrypted: false,
+             encrypted_metadata: None,
++            e2ee_version: None,
+             items: vec![TransferItemPayload {
+                 item_index: 0,
+                 relative_path: "a.txt".to_string(),
+diff --git a/client/src/App.test.tsx b/client/src/App.test.tsx
+index 21aa156..1636991 100644
+--- a/client/src/App.test.tsx
++++ b/client/src/App.test.tsx
+@@ -31,6 +31,7 @@ const baseSettings: AppSettings = {
+   cache_max_size_mb: 10240,
+   cache_sweep_interval_minutes: 60,
+   allow_insecure_tls: false,
++  e2ee_enabled: true,
+ };
+ 
+ function transfer(overrides: Partial<ActiveTransfer> = {}): ActiveTransfer {
+@@ -217,6 +218,36 @@ describe("TLS 证书失败提示", () => {
+     expect(screen.getAllByText(/无法验证服务器证书/)).toHaveLength(1);
+   });
+ 
++  it("E2EE 回落时以 toast 提示，而不是常驻横幅", async () => {
++    await renderApp();
++
++    await act(async () => {
++      emitEvent("e2ee-fallback", "本次传输未加密：未能确认对端支持端到端加密");
++    });
++
++    expect(screen.getByText(/本次传输未加密/)).toBeInTheDocument();
++    // 回落是「一次传输一条」的事件，不能走常驻横幅那条路——
++    // 横幅会一直挂着，让人以为当前连接状态有问题。
++    expect(screen.queryByRole("button", { name: "检查连接设置" })).not.toBeInTheDocument();
++    expect(screen.queryByText(/鉴权失败/)).not.toBeInTheDocument();
++  });
++
++  it("收到解不开的加密 OFFER 时提示密钥可能不一致", async () => {
++    await renderApp();
++
++    await act(async () => {
++      emitEvent("e2ee-offer-rejected", "收到一份无法解密的传输请求，已拒收：两端密钥可能不一致");
++    });
++
++    expect(screen.getByText(/两端密钥可能不一致/)).toBeInTheDocument();
++  });
++
++  it("注册了两个 E2EE 事件监听", async () => {
++    await renderApp();
++    expect(listenerCount("e2ee-fallback")).toBe(1);
++    expect(listenerCount("e2ee-offer-rejected")).toBe(1);
++  });
++
+   it("连接恢复后横幅消失", async () => {
+     await renderApp();
+ 
+diff --git a/client/src/App.tsx b/client/src/App.tsx
+index 2fbcb03..11ef7ce 100644
+--- a/client/src/App.tsx
++++ b/client/src/App.tsx
+@@ -32,6 +32,7 @@ const defaultSettings: AppSettings = {
+   cache_max_size_mb: 10240,
+   cache_sweep_interval_minutes: 60,
+   allow_insecure_tls: false,
++  e2ee_enabled: true,
+ };
+ 
+ export const App: React.FC = () => {
+@@ -177,6 +178,23 @@ export const App: React.FC = () => {
+       setConnError({ kind: "tls", message: event.payload });
+     });
+ 
++    // E2EE 回落：本次传输没能加密。
++    //
++    // 用 toast 而不是常驻横幅，与 tls-cert-failed 相反：那个是持续性的连接故障、
++    // 每次重试都会重发，横幅才幂等；这个是**一次传输一条**的事件，
++    // 用横幅反而会一直挂着，让人以为当前状态仍然不安全。
++    // 这里可以直接调 showNotification（不必像 settingsRef 那样过 ref）：
++    // 它只依赖 setNotification，而 React 保证 setState 的引用稳定，
++    // 不读任何会过期的 state。
++    const unlistenE2eeFallbackPromise = listen<string>("e2ee-fallback", (event) => {
++      showNotification(event.payload, "error");
++    });
++
++    // 收到一份解不开的加密 OFFER，已拒收。最常见的原因是两端 PSK 不一致。
++    const unlistenE2eeRejectPromise = listen<string>("e2ee-offer-rejected", (event) => {
++      showNotification(event.payload, "error");
++    });
++
+     // 3. Listen for transfer progress updates (both outbound and inbound)
+     const unlistenProgressPromise = listen<ActiveTransfer>("transfer-progress", (event) => {
+       const update = event.payload;
+@@ -228,6 +246,8 @@ export const App: React.FC = () => {
+       unlistenAuthPromise.then((unlisten) => unlisten());
+       unlistenAuthSuccessPromise.then((unlisten) => unlisten());
+       unlistenTlsPromise.then((unlisten) => unlisten());
++      unlistenE2eeFallbackPromise.then((unlisten) => unlisten());
++      unlistenE2eeRejectPromise.then((unlisten) => unlisten());
+       unlistenAccountPromise.then((unlisten) => unlisten());
+       unlistenProgressPromise.then((unlisten) => unlisten());
+       unlistenOfferPromise.then((unlisten) => unlisten());
+diff --git a/client/src/components/SettingsModal.test.tsx b/client/src/components/SettingsModal.test.tsx
+index e9911f1..4152eae 100644
+--- a/client/src/components/SettingsModal.test.tsx
++++ b/client/src/components/SettingsModal.test.tsx
+@@ -21,6 +21,7 @@ const baseSettings: AppSettings = {
+   cache_max_size_mb: 10240,
+   cache_sweep_interval_minutes: 60,
+   allow_insecure_tls: false,
++  e2ee_enabled: true,
+ };
+ 
+ function setup(
+@@ -327,4 +328,16 @@ describe("账号标识校验", () => {
+     await waitFor(() => expect(onSave).toHaveBeenCalled());
+     expect(onSave.mock.calls[0][0]).toMatchObject({ account_id: "my_team_sync" });
+   });
++
++  it("端到端加密开关默认开启，关闭时给出明文警告", async () => {
++    const { user } = setup();
++
++    const toggle = screen.getByRole("checkbox", { name: /端到端加密/ });
++    expect(toggle).toBeChecked();
++    // 开启时不该出现警告——警告只用于「你以为安全但其实不是」的状态
++    expect(screen.queryByText(/将以明文经过中继服务器/)).not.toBeInTheDocument();
++
++    await user.click(toggle);
++    expect(screen.getByText(/将以明文经过中继服务器/)).toBeInTheDocument();
++  });
+ });
+diff --git a/client/src/components/SettingsModal.tsx b/client/src/components/SettingsModal.tsx
+index d4360ce..73cd9e0 100644
+--- a/client/src/components/SettingsModal.tsx
++++ b/client/src/components/SettingsModal.tsx
+@@ -353,6 +353,33 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
+             />
+           </div>
+ 
++          {/* 与上面的 TLS 开关相对：那个默认关闭（安全值是 false），
++              这个默认开启（安全值是 true）。文案同样要说清它保证什么、
++              不保证什么——「端到端加密」四个字很容易被读成比实际更强的承诺。 */}
++          <div className="flex items-center justify-between pt-2">
++            <div className="pr-3">
++              <span className="font-medium text-slate-200">端到端加密</span>
++              <p className="text-[11px] text-slate-500">
++                内容在本机加密后才经中继转发，服务器看不到明文；对端版本过旧时会回落为不加密并提示
++              </p>
++              {!form.e2ee_enabled && (
++                <p className="mt-1 text-[11px] text-amber-400">
++                  已关闭：传输内容将以明文经过中继服务器
++                </p>
++              )}
++            </div>
++            <input
++              type="checkbox"
++              // 旁边的说明文字在独立的 div 里，与 input 没有 label 关联，
++              // 屏幕阅读器与测试都定位不到。新加的开关补上 aria-label；
++              // 上面几个既有开关同样缺，但那属于另一件事，不在本轮一并动。
++              aria-label="端到端加密"
++              checked={form.e2ee_enabled}
++              onChange={(e) => setForm({ ...form, e2ee_enabled: e.target.checked })}
++              className="w-4 h-4 rounded text-teal-500 focus:ring-teal-400 bg-slate-800 border-slate-700"
++            />
++          </div>
++
+           <div className="flex items-center justify-between pt-2">
+             <div>
+               <span className="font-medium text-slate-200">静默自动装载剪贴板</span>
+diff --git a/client/src/types/index.ts b/client/src/types/index.ts
+index 1747a44..f9d869c 100644
+--- a/client/src/types/index.ts
++++ b/client/src/types/index.ts
+@@ -25,6 +25,14 @@ export interface AppSettings {
+   cache_sweep_interval_minutes: number;
+   /** 跳过 TLS 服务器证书校验；默认 false（= 校验）。 */
+   allow_insecure_tls: boolean;
++  /**
++   * 对传输内容做端到端加密；默认 **true**。
++   *
++   * 与紧邻的 allow_insecure_tls 默认值相反，两者都遵循同一条规则：
++   * 默认值必须落在安全的那一侧。开启后不保证每次都加密——对端版本过旧时
++   * 会回落明文并推送 e2ee-fallback 事件。
++   */
++  e2ee_enabled: boolean;
+ }
+ 
+ /**
+diff --git a/docs/USER_GUIDE.md b/docs/USER_GUIDE.md
+index f1eca4a..a321d1a 100644
+--- a/docs/USER_GUIDE.md
++++ b/docs/USER_GUIDE.md
+@@ -10,7 +10,7 @@
+ 
+ UniDrop 与传统文件传输工具（如网盘、微信文件传输助手、隔空投送）相比，最大的革新在于：
+ * **原生剪贴板无感装载**：接收端下载校验完毕后，直接将文件句柄注入操作系统剪贴板（Windows `CF_HDROP` / macOS `fileURL` / Linux `text/uri-list`）。您无需在繁琐的“下载文件夹”里翻找，直接在目标目录按 **`Ctrl + V`** (Windows/Linux) 或 **`Cmd + V`** (macOS) 即可瞬间落地粘贴！
+-* **企业级零泄露安全**：传输走加密中继通道，支持 HMAC 盐化接入、PathGuard 防目录穿越沙盒防护、整文件 SHA-256 完整性核验。
++* **端到端加密**：内容在本机以 AES-256-GCM 加密后才经中继转发，服务器看不到明文（默认开启，密钥由 PSK 派生）。另有 HMAC 盐化接入、TLS 证书校验、PathGuard 防目录穿越沙盒、整文件 SHA-256 核验。
+ * **超轻量常驻**：后台常驻仅需 20~30MB 物理内存，低功耗静默运行。
+ 
+ ---
+@@ -94,9 +94,27 @@ UniDrop 与传统文件传输工具（如网盘、微信文件传输助手、隔
+ 
+      用 `openssl x509 -in cert.pem -noout -text | grep Version` 确认输出是
+      `Version: 3 (0x2)`。
+-6. **静默自动装载剪贴板**（强烈推荐勾选）：
++6. **端到端加密**（默认**开启**，建议保持开启）：
++   * 开启后，内容在本机加密后才交给中继服务器转发，**服务器、云厂商或拿到服务器
++     权限的人都看不到明文**。传输的文件名、内容哈希与预览摘要同样被加密。
++   * 密钥不需要另外配置：由你填的 **PSK** 按每次传输派生，所以**两端 PSK 必须一致**。
++     不一致时对方会直接拒收并提示「两端密钥可能不一致」，而不是传到一半失败。
++   * **PSK 的强度决定加密的强度**。它现在不只是接入凭据，还是解开内容的钥匙，
++     请使用足够长的随机字符串。
++   * 对端客户端版本过旧时，本次传输会**回落为不加密**并在界面上明确提示。
++     不会静默发生——但也意味着那次传输的内容服务器是能看到的。
++   * 它**不保证**以下几件事，请勿据此做更强的假设：
++     * **前向保密**：PSK 长期不变，一旦泄露，此前被录下的流量都能解开；
++     * **设备丢失**：PSK 以明文保存在本机配置里，拿到设备就能解开历史内容；
++     * **设备之间互相隔离**：同一 PSK 下所有设备共用同一套密钥，彼此可解；
++     * **防止被强制降级**：协商信息经过服务器，恶意服务器可以把传输打回不加密
++       （界面会提示，但无法区分是对端老还是被做了手脚）；
++     * **本地存储加密**：本机的历史数据库与缓存文件仍是明文。
++   * 服务器始终能看到的元数据：谁传给谁、时间、总大小、条目数与每个条目的大小、
++     类型是文本还是文件。这是服务端限额检查的必要输入，与加密不可兼得。
++7. **静默自动装载剪贴板**（强烈推荐勾选）：
+    * 开启后，远端传来的文件一经下载核验完成，无需手动点击，直接写入本地系统剪贴板。
+-7. 点击 **“保存配置”**，客户端将即时热更新配置并自动重新建立安全连接，无需重启客户端。
++8. 点击 **“保存配置”**，客户端将即时热更新配置并自动重新建立安全连接，无需重启客户端。
+ 
+ > [!TIP]
+ > 如果顶部出现红色横幅提示 **“鉴权失败: signature mismatch / timestamp expired”**，说明密钥填写有误或本机系统时间与服务器误差超过 60 秒，请点击“检查密钥”重新校对。
+diff --git a/docs/design/DESIGN.md b/docs/design/DESIGN.md
+index a90e2b6..c7862f7 100644
+--- a/docs/design/DESIGN.md
++++ b/docs/design/DESIGN.md
+@@ -322,7 +322,7 @@ enum ActionType {
+ | `28..31` | `TotalChunks`| `uint32` | 当前文件的总切片数（单切片或短文本固定为 1）。 |
+ | `32..35` | `PayloadLen` | `uint32` | 载荷字节长度。ACK/NACK 帧为 0；DATA 帧必须 $\le 4,194,304$ (4MB)。超过 4MB 即视为滥用攻击，服务端立刻掐线。 |
+ | `36..39` | `Checksum` | `uint32` | Payload 原始字节流的 CRC32-IEEE 校验和（**注：用于快速信道检错，非密码学防篡改**）。ACK/NACK 填 0。 |
+-| `40..51` | `Nonce` | `[12]byte` | 充足容纳 AES-256-GCM 标准 96 位 Nonce；未启用 E2EE 时全填 `0x00`。 |
++| `40..51` | `Nonce` | `[12]byte` | AES-256-GCM 的 96 位 Nonce；未启用 E2EE 时全填 `0x00`。v1 填 `ItemIndex‖ChunkIndex‖域分隔`，但**接收端自行重算而不读此字段**（见 6.0），填写仅为抓包可读。 |
+ | `52..55` | `Flags` | `uint32` | 位标记掩码：<br>• Bit 0: `IS_ENCRYPTED` (是否启用 E2EE)<br>• Bit 1: `IS_COMPRESSED` (预留压缩标记)<br>• Bit 2: `IS_LAST_CHUNK` (当前文件最后一个分片) |
+ | `56..63` | `Reserved` | `[8]byte` | 保留填充对齐字节，必须全置为 `0x00`。 |
+ | `64..` | `Payload` | `[]byte` | 实际数据或密文载荷。 |
+@@ -618,7 +618,7 @@ func (p *RelayPipe) Push(data *[]byte, timeout time.Duration) error {
+   * `unidrop_relay_bytes_total{direction}`：流式中转吞吐累计字节数。
+   * `unidrop_active_relay_pipes`：当前活跃数据管道数。
+   * `unidrop_chunk_retransmit_total{reason}`：分片重传累计次数（区分 timeout 或 nack）。
+-  * `unidrop_e2ee_sessions_total`：端到端加密传输会话数。
++  * `unidrop_e2ee_sessions_total`：端到端加密传输会话数。**尚未实现**——v1 的加密完全在客户端，服务端不解密也不感知 `encrypted` 标志，要出这个指标得让中继去读 OFFER 载荷。
+ * 全量信令日志均携带 `trace_id` 字段，采用 Go 官方 `log/slog` 输出结构化 JSON 日志。
+ 
+ ---
+@@ -1071,6 +1071,31 @@ CREATE TABLE IF NOT EXISTS cache_entries (
+ 
+ 针对评审 P0-2、P1-10 指出的“纯临时 DH 易受中间人攻击”、“未绑定 AAD 导致重排重放”以及“明文元数据泄露”三大硬伤，本节给出具有密码学强度的完备设计。
+ 
++### 6.0 当前实现状态（v1，2026-09-14）
++
++**本节 6.1 / 6.2 描述的是目标设计，与已落地的 v1 实现有实质差异，请勿照本节阅读代码。**
++v1 走的是「复用既有 PSK」的简化路线：密钥分发这一 E2EE 最昂贵的环节，
++在本项目里已由用户手动在每台设备填写同一把 PSK 解决，因此 v1 不引入配对流程。
++
++| 维度 | 本节设计 | v1 实现 | 差异理由 |
++| :--- | :--- | :--- | :--- |
++| 密钥来源 | Ed25519/X25519 设备长期密钥 + 配对 | `HKDF-SHA256(psk, salt=session_id, info="UNIDROP-E2EE-v1"‖account_id)` | 无需配对 UX；代价是**没有前向保密、设备间不隔离**（同 PSK 即组密钥） |
++| 防 MITM | 长期身份签名，中继无法伪造 | 依赖 PSK 保密性；协商信息经服务器，**恶意服务端可强制降级为明文**（界面会提示） | v1 是机会性加密，不是抗主动攻击的保证 |
++| AAD | `SessionID‖ItemIndex‖ChunkIndex‖TotalChunks‖Flags` | **`Aad::empty()`** | `ItemIndex`/`ChunkIndex` 已通过 nonce 参与认证（改动即 nonce 不匹配、tag 失败）；`TotalChunks`/`Flags` 的篡改由上层兜住。非空 AAD 会新增一处两端必须逐字节一致的约定，而失败形态是「本该能解密的数据解不开」 |
++| Nonce | 前 4B 随机盐 + 后 8B 计数器 | `ItemIndex(4B)‖ChunkIndex(4B)‖域分隔(4B)` | 随机盐要靠握手协商传递，而 v1 没有握手；改用确定性构造让**接收端可自行重算**，不必信任帧头里的 nonce。唯一性由「每次传输现铸 session_id ⇒ 每次一把新 key」保证 |
++| 元数据 | 见 6.3 | 已实现：文件名 / sha256 / 预览摘要加密进 `encrypted_metadata` | 与 6.3 一致；但 `total_size` / `data_type` / 每项 `size` 必须留明文供服务端限额检查 |
++
++v1 另有两处实现约束值得记在设计层面：
++
++* **明文块长必须是 `MAX_PAYLOAD_LENGTH - 16`**。GCM 密文比明文长 16 字节，
++  按 4MB 满块加密会得到 4MB+16，中继 `DecodeBinaryHeader` 当场 `ErrPayloadTooLarge`
++  断连，而客户端只能看到「连接被关」。
++* **CRC32 改算在密文上**。算在明文上等于把明文的 32 位指纹写进对中继完全可见的
++  帧头，短内容（剪贴板文本）可被枚举确认。算密文还保留了「解密前就能拒绝坏块」。
++
++升级到本节完整设计时，`paired_devices` 表按 schema 注记重建，
++HKDF 的 `info` 前缀改版本号即可与 v1 的密钥域分隔。
++
+ ### 6.1 基于设备长期身份密钥的认证密钥协商 (Noise-based AKE)
+ 彻底消除中间人（MITM）攻击风险：
+ 1. **设备初始配对（Pairing Phase）**：
+diff --git a/docs/需求.md b/docs/需求.md
+index cdf014f..2dc47fa 100644
+--- a/docs/需求.md
++++ b/docs/需求.md
+@@ -111,7 +111,7 @@
+    接收完成后的自动装载也会在写剪贴板前复核归属（防传输途中切账号）；切账号时
+    广播 `account-changed` 让界面重拉，避免残留卡片被点开。
+ 7. 全程加密。
+-   — **部分实现**（2026-09-13）。本轮只做了传输层：客户端此前**无条件**跳过
++   — **已实现**（传输层 2026-09-13，内容层 2026-09-14）。传输层：客户端此前**无条件**跳过
+    TLS 服务器证书校验（`verify_server_cert` 直接返回成功，控制面与数据面
+    都走这条路），意味着即便连 `wss://` 也挡不住中间人。现默认走 webpki 根
+    证书校验，跳过校验改为设置项 `allow_insecure_tls`（默认关闭），
+@@ -126,9 +126,26 @@
+    **SAN 是另一个条件，只在不勾选本项时才需要**：它服务于主机名校验，
+    勾选后客户端根本不查名称。此前这里把两者并列成同一个必要条件，机制上不对。
+    已写进 USER_GUIDE。
+-   **E2EE 仍未实现**，属 Phase 3：协议位（`FLAG_ENCRYPTED`、`encrypted`
+-   字段）是占位，客户端所有构造点硬编码 `false`，仓库无任何密码学依赖。
+-   本地 SQLite 与缓存文件也仍是明文。
++   **E2EE 已实现**（2026-09-14，e2ee-payload-encryption）。此前占位的协议位
++   （`FLAG_ENCRYPTED`、`encrypted`、帧头预留的 12 字节 `Nonce`）全部启用：
++   数据块走 AES-256-GCM，会话密钥由 `HKDF-SHA256(psk, salt=session_id,
++   info="UNIDROP-E2EE-v1|"+account_id)` 每次传输现派生。
++   文件名、内容 sha256 与预览摘要一并加密进 `encrypted_metadata`——
++   sha256 尤其要藏，服务端拿它查表就能确认传了哪个已知文件。
++   **服务端零改动**：中继不解密、不验 CRC32、限额只读未加密字段。
++   实现上有四处承重决定，都写进了代码注释：明文块长取 `4MB - 16`
++   （满块密文恰好填满上限，否则会被中继以 `ErrPayloadTooLarge` 断连）；
++   CRC32 改算在**密文**上（算明文等于把明文指纹送给中继，短文本可被枚举确认）；
++   nonce 由 `(item_index, chunk_index)` 构造并留 4 字节做域分隔，接收端自行重算
++   而不信帧头；AEAD 失败按单块 3 次 **与会话累计 3 次**双层熔断（只按单块计数时，
++   滑动窗口里 4 个在途块各失败一次永远够不到阈值，会退化成无限重传）。
++   能力协商读在线设备表的 `app_version`，在发 OFFER **之前**定形态——
++   不能走 ANSWER 回传，服务端会在授权后重建该载荷并丢弃未知字段。
++   对端过旧时回落明文并给出可见提示。
++   **仍未做**：前向保密（PSK 长期不变）、设备间隔离（单 PSK 即组密钥）、
++   防主动降级（协商信息经过服务器，属机会性加密）。
++   本地 SQLite 与缓存文件**仍是明文**——主要威胁（设备失窃）已被操作系统全盘
++   加密覆盖，独立评估后判定不值得引入 SQLCipher，不是排期不下。
+ 8. 磁盘缓存文件要定时删除。
+    — **已实现**（2026-09-13）。核验发现定时清理早已存在（每小时一次，24h TTL +
+    10GB LRU），本轮是把写死的策略参数开放为配置项，而非新建第二套清理：
+diff --git a/client/src-tauri/src/core/e2ee.rs b/client/src-tauri/src/core/e2ee.rs
+new file mode 100644
+index 0000000..885294e
+--- /dev/null
++++ b/client/src-tauri/src/core/e2ee.rs
+@@ -0,0 +1,469 @@
++//! E2EE 载荷加密：密钥派生、nonce 构造、块与元数据的 AEAD 封装。
++//!
++//! 本模块是整个加密方案的**唯一事实源**。分块长度、nonce 构造、AAD 约定
++//! 全部只在这里定义一次——它们都是「两端必须逐字节一致」的约定，
++//! 散落到调用点就会出现一端改了另一端没改，而失败形态是「解不开」而不是编译错误。
++//!
++//! 威胁模型边界（文档同步写明，不要在这里假装做到了更多）：
++//! - 达成：服务器、云厂商、拿到 root 的人看不到内容；
++//! - 达不成：前向保密（PSK 长期不变）、防设备失窃（PSK 明文存盘）、
++//!   设备间隔离（单 PSK 派生的是组密钥）、防主动降级（协商信息经过服务器）。
++
++use crate::protocol::envelope::{EncryptedItemMeta, EncryptedMetadata, TransferOfferPayload};
++use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
++use ring::{aead, hkdf};
++use uuid::Uuid;
++
++/// AES-256-GCM 认证标签长度。密文 = 明文 + 这么多字节。
++pub const GCM_TAG_LEN: usize = 16;
++
++/// 本方案的 E2EE 协议版本，写进 OFFER 的 `e2ee_version`。
++///
++/// 它**不承担能力协商职责**（协商在发 OFFER 之前就由对端 app_version 定了），
++/// 只是接收端的自描述：告诉它这份 OFFER 里的元数据是不是加密的。
++pub const E2EE_VERSION: u8 = 1;
++
++/// nonce 的域分隔标记，占 `nonce[8..12]`。
++///
++/// 数据块与条目元数据用同一把会话密钥，靠这 4 字节让两者的 nonce 空间
++/// 完全不相交——于是不必论证「item_index 不会恰好取到某个魔数」。
++/// 这 4 字节此前是帧头 `Nonce` 字段里空着的部分。
++const NONCE_DOMAIN_DATA: u32 = 0x0000_0000;
++const NONCE_DOMAIN_METADATA: u32 = 0x0000_0001;
++
++/// HKDF 的 info 前缀。带版本号是域分隔：将来换算法或换构造时，
++/// 同一把 PSK 派生出的旧 key 不会被新用途复用。成本为零，不加才需要理由。
++const HKDF_INFO_PREFIX: &[u8] = b"UNIDROP-E2EE-v1|";
++
++/// 一次传输的**明文**块大小。
++///
++/// 加密时取 `MAX_PAYLOAD_LENGTH - GCM_TAG_LEN`，密文恰好填满 4MB 不触上限。
++/// 这不是调优参数：满块加密后是 4MB+16，而中继的 `DecodeBinaryHeader` 会以
++/// `ErrPayloadTooLarge` 当场断连（server/internal/protocol/binary_header.go:172），
++/// 客户端只看到连接被关、看不到原因。
++///
++/// **调用点必须全部走这个函数，不得就地写 `MAX_PAYLOAD_LENGTH`。** 目前四处：
++/// 1. `prepare_offer` 算 `total_chunks`
++/// 2. `prepare_offer_from_bytes` 算 `total_chunks`
++/// 3. 发送端切块的 offset / length
++/// 4. 接收端 `write_payload_chunk` 的写入 offset
++///
++/// 外加接收端进度累加按**明文**长度计（见 `transfer_engine` 中的注释）。
++/// 漏改其中任何一处的失败形态都是**静默的**：每块都能解密、能写入，
++/// 只是写在错误的位置，直到最后 SHA256 才发现文件是坏的，而那时传输已经跑完。
++pub fn plaintext_chunk_len(encrypted: bool) -> usize {
++    if encrypted {
++        crate::protocol::binary_header::MAX_PAYLOAD_LENGTH as usize - GCM_TAG_LEN
++    } else {
++        crate::protocol::binary_header::MAX_PAYLOAD_LENGTH as usize
++    }
++}
++
++/// 从 PSK 派生本次会话的密钥。
++///
++/// ```text
++/// key = HKDF-SHA256(
++///     ikm  = psk 的 UTF-8 字节,
++///     salt = session_id 的 16 字节原始 UUID,
++///     info = "UNIDROP-E2EE-v1|" || account_id
++/// ) → 32 字节
++/// ```
++///
++/// - **不拿 PSK 直接当 key**：PSK 是用户手输的任意长度字符串，而 AES-256 要的是
++///   恰好 32 字节的均匀随机量。HKDF 做长度归一化与熵提取，这是它的本职；
++///   截断或补零是典型误用。
++/// - **salt 用 session_id**：每次传输现铸 UUIDv4 ⇒ 每次传输一把新 key。
++///   这是 nonce 唯一性论证的根基——key 换了，nonce 空间就是全新的。
++/// - **salt 用 16 字节原始 UUID 而非字符串**：两端必须逐字节一致，而字符串形式
++///   有大小写与连字符的歧义（`Uuid::to_string()` 今天是小写带连字符，
++///   但没有任何机制强制它不变）。原始字节没有这个问题。
++/// - **info 带 account_id**：把 key 绑定到账号上下文，与 registry 复合键、
++///   本地历史按账号分区是同一条思路的延续。
++///   注意 `account_id` 是用户自填标识（`[A-Za-z0-9._@-]`，1–64 字节，**不是 UUID**）；
++///   两端由服务端按账号隔离路由，能建立传输即保证两侧是同一个字符串，
++///   故这条绑定无需依赖它的随机性。
++///
++/// **HKDF 不能凭空创造熵**：用户把 PSK 填成 `123456`，E2EE 的强度就是 `123456`。
++/// 这不比现状更弱（同一把 PSK 今天已在保护 HMAC 鉴权），但文档必须说明。
++pub fn derive_session_key(
++    psk: &str,
++    session_id: &Uuid,
++    account_id: &str,
++) -> Result<aead::LessSafeKey, String> {
++    if psk.is_empty() {
++        return Err("PSK 为空，无法派生会话密钥".into());
++    }
++
++    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, session_id.as_bytes());
++    let prk = salt.extract(psk.as_bytes());
++
++    // info 由前缀与 account_id 拼接而成；ring 会把切片数组按顺序连接。
++    let info: [&[u8]; 2] = [HKDF_INFO_PREFIX, account_id.as_bytes()];
++    let okm = prk
++        .expand(&info, &aead::AES_256_GCM)
++        .map_err(|_| "HKDF expand 失败".to_string())?;
++
++    let unbound = aead::UnboundKey::from(okm);
++    Ok(aead::LessSafeKey::new(unbound))
++}
++
++/// 数据块的 nonce：`item_index ‖ chunk_index ‖ 0x00000000`（全大端）。
++///
++/// 唯一性论证（四种情况，缺一不可）：
++/// 1. **同 session 内不同块**：`(item_index, chunk_index)` 唯一标识一个块。✓
++/// 2. **不同 session**：key 由 session_id 派生，key 不同则 nonce 复用无害。✓
++/// 3. **重传**（滑动窗口 / NACK）：重传的是**同一块的同一份明文**，
++///    相同 (key, nonce, plaintext) 产出相同密文。GCM 的灾难性失败要求的是
++///    「相同 (key,nonce) 加密**不同**明文」，相同明文重传是安全的。
++///    **不要把这里"修"成随机 nonce**——那才会引入真正的问题（帧头放不下
++///    随机 nonce 的同时还要保证接收端能重算）。
++/// 4. **断点续传**：本仓库尚未实现（`BitmapRepo` 无生产调用、`resumed_items` 恒空），
++///    当前每次重连都是新 session 新 key，天然安全。
++///    **若将来实现续传，不得复用 session_id 传不同内容**——这条必须写进续传自己的验收。
++pub fn data_nonce(item_index: u32, chunk_index: u32) -> [u8; 12] {
++    let mut n = [0u8; 12];
++    n[0..4].copy_from_slice(&item_index.to_be_bytes());
++    n[4..8].copy_from_slice(&chunk_index.to_be_bytes());
++    n[8..12].copy_from_slice(&NONCE_DOMAIN_DATA.to_be_bytes());
++    n
++}
++
++/// 条目元数据的 nonce：`0 ‖ 0 ‖ 0x00000001`。
++///
++/// 元数据每个 session 只加密一次，所以前 8 字节恒零不产生复用；
++/// 域分隔标记让它与任何数据块的 nonce 都不相同。
++pub fn metadata_nonce() -> [u8; 12] {
++    let mut n = [0u8; 12];
++    n[8..12].copy_from_slice(&NONCE_DOMAIN_METADATA.to_be_bytes());
++    n
++}
++
++/// 加密，产出 `ciphertext ‖ tag`。
++///
++/// **AAD 统一为空**，数据块与元数据都是。这是个需要解释的选择：
++/// 把帧头字段纳入 AAD 看似更严格，但 `item_index` / `chunk_index` 已经通过 nonce
++/// 参与了认证——改动它们会直接导致 nonce 不匹配、tag 校验失败。而 `total_chunks`
++/// / `flags` 被篡改的后果由上层兜住（块数不符会让传输无法完成）。
++/// 引入非空 AAD 只会新增一处两端必须逐字节一致的约定，
++/// 而它的失败形态是「本该能解密的数据解不开」。选简单且可论证的一侧。
++pub fn seal(key: &aead::LessSafeKey, nonce: [u8; 12], plaintext: &[u8]) -> Result<Vec<u8>, String> {
++    let mut buf = plaintext.to_vec();
++    key.seal_in_place_append_tag(
++        aead::Nonce::assume_unique_for_key(nonce),
++        aead::Aad::empty(),
++        &mut buf,
++    )
++    .map_err(|_| "AEAD 加密失败".to_string())?;
++    Ok(buf)
++}
++
++/// 解密 `ciphertext ‖ tag`，返回明文。
++///
++/// tag 校验失败时返回 `Err`。调用方**不得**把它当作普通的传输损坏无限重传：
++/// 见 `transfer_engine` 里的双层熔断（单块 3 次 + 会话级累计 3 次）。
++pub fn open(
++    key: &aead::LessSafeKey,
++    nonce: [u8; 12],
++    ciphertext_and_tag: &[u8],
++) -> Result<Vec<u8>, String> {
++    if ciphertext_and_tag.len() < GCM_TAG_LEN {
++        return Err(format!(
++            "密文长度 {} 小于 tag 长度 {}",
++            ciphertext_and_tag.len(),
++            GCM_TAG_LEN
++        ));
++    }
++    let mut buf = ciphertext_and_tag.to_vec();
++    let plaintext = key
++        .open_in_place(
++            aead::Nonce::assume_unique_for_key(nonce),
++            aead::Aad::empty(),
++            &mut buf,
++        )
++        .map_err(|_| "AEAD 解密失败（tag 校验未通过）".to_string())?;
++    Ok(plaintext.to_vec())
++}
++
++/// 把 OFFER 里的敏感元数据摘出来加密，并抹空对应的明文字段。
++///
++/// 调用时机：`offer` 已完整构造好（含真实文件名与哈希）之后、**发出之前**。
++///
++/// 与 `open_offer_metadata` 是严格对称的一对，**必须放在一起改**：
++/// 摘出的字段清单在两边各写一次，漏一个的后果是接收端拿到空值继续跑，
++/// 然后在 PathGuard 或 SHA256 校验处以一个和真实原因无关的错误失败。
++pub fn seal_offer_metadata(
++    offer: &mut TransferOfferPayload,
++    key: &aead::LessSafeKey,
++) -> Result<(), String> {
++    let meta = EncryptedMetadata {
++        preview_summary: std::mem::take(&mut offer.preview_summary),
++        items: offer
++            .items
++            .iter_mut()
++            .map(|it| EncryptedItemMeta {
++                item_index: it.item_index,
++                relative_path: std::mem::take(&mut it.relative_path),
++                sha256: std::mem::take(&mut it.sha256),
++                is_dir: it.is_dir,
++            })
++            .collect(),
++    };
++
++    let json = serde_json::to_vec(&meta).map_err(|e| format!("元数据序列化失败: {e}"))?;
++    let sealed = seal(key, metadata_nonce(), &json)?;
++
++    offer.encrypted = true;
++    offer.e2ee_version = Some(E2EE_VERSION);
++    offer.encrypted_metadata = Some(B64.encode(sealed));
++    Ok(())
++}
++
++/// 接收端：解密并把字段还原回 `offer`。
++///
++/// 失败即整份 OFFER 不可用——调用方**必须**就地拒绝（回 `accepted=false`），
++/// 不能带着空文件名继续走：`lib.rs` 收到 OFFER 后会立刻 emit 给界面并写历史行，
++/// 空文件名一旦落库，后续展示与修剪都会带着它。
++///
++/// 最常见的失败原因是**两端 PSK 不一致**，不是篡改。提示文案要先指向这个。
++pub fn open_offer_metadata(
++    offer: &mut TransferOfferPayload,
++    key: &aead::LessSafeKey,
++) -> Result<(), String> {
++    let b64 = offer
++        .encrypted_metadata
++        .as_ref()
++        .ok_or_else(|| "OFFER 标记为加密但没有 encrypted_metadata".to_string())?;
++    let sealed = B64
++        .decode(b64)
++        .map_err(|e| format!("encrypted_metadata 不是合法 base64: {e}"))?;
++    let json = open(key, metadata_nonce(), &sealed)?;
++    let meta: EncryptedMetadata =
++        serde_json::from_slice(&json).map_err(|e| format!("元数据反序列化失败: {e}"))?;
++
++    offer.preview_summary = meta.preview_summary;
++    for m in meta.items {
++        // 按 item_index 对位回填，不靠数组下标——两边的顺序没有任何机制保证一致。
++        if let Some(it) = offer.items.iter_mut().find(|i| i.item_index == m.item_index) {
++            it.relative_path = m.relative_path;
++            it.sha256 = m.sha256;
++            it.is_dir = m.is_dir;
++        }
++    }
++    Ok(())
++}
++
++/// 判断对端 `app_version` 是否支持 E2EE。
++///
++/// **协商必须发生在构造 OFFER 之前**。原设计是「发 OFFER → 等 ANSWER 带回能力位」，
++/// 有两处致命伤：
++/// 1. 元数据在发 OFFER 的那一刻就已经抹空了，等 ANSWER 回来才决定已经太晚——
++///    老接收端会照常 `accepted=true`（lib.rs 收到 OFFER 即无条件应答），
++///    然后拿着空文件名与空哈希必然失败；
++/// 2. ANSWER 根本带不回自定义字段：`control_ws.go:388` 在授权成功后
++///    `env.Payload, _ = json.Marshal(answer)` 重建载荷，Go 会静默丢弃未知字段。
++///    （OFFER 路径不同，它确实原样转发原始 payload——这个不对称会绊倒
++///    任何下一个想给 ANSWER 加字段的人。）
++///
++/// 所以改读在线设备表里已有的 `app_version`，单次 OFFER 即定形态，
++/// 且仍然**服务端零改动**（只读已有字段，不加新字段）。
++///
++/// 取不到版本时**按不支持处理**（保守回落明文）。乐观假设支持会让接收端
++/// 收到一份它解不开的 OFFER，正是上面第 1 条要避免的形态。
++pub fn peer_supports_e2ee(app_version: Option<&str>) -> bool {
++    let Some(v) = app_version else {
++        return false;
++    };
++    parse_semver(v)
++        .map(|got| got >= E2EE_MIN_VERSION_TUPLE)
++        .unwrap_or(false)
++}
++
++/// 支持 E2EE 的最低客户端版本，即发布本功能的版本号。
++///
++/// 刻意**不**同时留一份字符串形式：两份会漂移，而它只有比较这一个用途。
++/// 将来 UI 要展示时从这里格式化，不要再加一个并列的字面量。
++const E2EE_MIN_VERSION_TUPLE: (u32, u32, u32) = (0, 3, 0);
++
++/// 解析 `x.y.z`。解析不出来就是 `None`——调用方按不支持处理，
++/// 不要在这里"尽量猜"：猜错的代价是对端收到解不开的 OFFER。
++fn parse_semver(v: &str) -> Option<(u32, u32, u32)> {
++    let mut it = v.trim().split('.');
++    let major = it.next()?.parse().ok()?;
++    let minor = it.next()?.parse().ok()?;
++    // patch 段可能带预发布后缀（如 "0.3.0-beta"），只取前面的数字部分。
++    let patch_raw = it.next().unwrap_or("0");
++    let patch = patch_raw
++        .split(|c: char| !c.is_ascii_digit())
++        .next()
++        .unwrap_or("0")
++        .parse()
++        .unwrap_or(0);
++    if it.next().is_some() {
++        return None; // 四段及以上不是我们发布的版本号形态
++    }
++    Some((major, minor, patch))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn key_for(session: &Uuid) -> aead::LessSafeKey {
++        derive_session_key("test-psk", session, "acct").unwrap()
++    }
++
++    /// 派生必须是确定性的：两端各算一次要得到同一把 key，
++    /// 否则一切都解不开。这条红了说明 HKDF 参数被改动过。
++    #[test]
++    fn derive_is_deterministic() {
++        let s = Uuid::new_v4();
++        let a = derive_session_key("psk", &s, "acct").unwrap();
++        let b = derive_session_key("psk", &s, "acct").unwrap();
++        let n = data_nonce(0, 0);
++        let ca = seal(&a, n, b"hello").unwrap();
++        // 用 b 解 a 的密文——能解开就证明两把 key 相同。
++        let pt = open(&b, n, &ca).unwrap();
++        assert_eq!(pt, b"hello");
++    }
++
++    /// 三个输入各自都必须影响 key。删掉其中任一个参与派生的输入，
++    /// 这条就会退回成「不同会话/不同账号共用一把 key」。
++    #[test]
++    fn every_input_changes_the_key() {
++        let s1 = Uuid::new_v4();
++        let s2 = Uuid::new_v4();
++        let n = data_nonce(0, 0);
++        let base = seal(&derive_session_key("psk", &s1, "acct").unwrap(), n, b"x").unwrap();
++
++        for (psk, sess, acct, what) in [
++            ("psk2", &s1, "acct", "psk"),
++            ("psk", &s2, "acct", "session_id"),
++            ("psk", &s1, "acct2", "account_id"),
++        ] {
++            let other = derive_session_key(psk, sess, acct).unwrap();
++            assert!(
++                open(&other, n, &base).is_err(),
++                "改变 {what} 之后仍能解开对方的密文——该输入没有真正参与派生"
++            );
++        }
++    }
++
++    /// 空 PSK 必须拒绝而不是派生出一把「空密钥」。
++    #[test]
++    fn empty_psk_is_rejected() {
++        assert!(derive_session_key("", &Uuid::new_v4(), "acct").is_err());
++    }
++
++    /// 密文恰好比明文长 GCM_TAG_LEN。这个等号是 §B 块大小的全部依据：
++    /// 它变了，`plaintext_chunk_len` 留的余量就不对，满块会超 4MB 上限被中继断连。
++    #[test]
++    fn ciphertext_is_exactly_tag_len_longer() {
++        let k = key_for(&Uuid::new_v4());
++        for len in [0usize, 1, 1000, 65536] {
++            let pt = vec![7u8; len];
++            let ct = seal(&k, data_nonce(0, 0), &pt).unwrap();
++            assert_eq!(
++                ct.len(),
++                len + GCM_TAG_LEN,
++                "明文 {len} 字节加密后应为 {} 字节",
++                len + GCM_TAG_LEN
++            );
++        }
++    }
++
++    /// 满的加密块密文必须**恰好**等于 MAX_PAYLOAD_LENGTH，不是「小于等于」。
++    /// 等号才能钉死那 16 字节的预留：写成 <= 的话，把 plaintext_chunk_len
++    /// 改小一截也不会让测试变红，而那会白白浪费带宽。
++    #[test]
++    fn full_encrypted_chunk_exactly_fills_the_frame() {
++        let k = key_for(&Uuid::new_v4());
++        let pt = vec![0u8; plaintext_chunk_len(true)];
++        let ct = seal(&k, data_nonce(0, 0), &pt).unwrap();
++        assert_eq!(
++            ct.len(),
++            crate::protocol::binary_header::MAX_PAYLOAD_LENGTH as usize,
++            "满块密文应恰好填满 4MB 上限"
++        );
++    }
++
++    /// 不加密时块大小不变——加密路径的余量不能溢出到明文路径，
++    /// 否则老服务端/老对端的明文传输会平白变慢且块边界错位。
++    #[test]
++    fn plaintext_path_keeps_the_original_chunk_size() {
++        assert_eq!(
++            plaintext_chunk_len(false),
++            crate::protocol::binary_header::MAX_PAYLOAD_LENGTH as usize
++        );
++    }
++
++    /// 遍历一次多条目多块传输的全部 (item, chunk)，nonce 必须两两不同。
++    /// 这条是 GCM 安全性的地基：同 key 下 nonce 复用会直接摧毁认证性。
++    #[test]
++    fn data_nonces_never_collide_within_a_session() {
++        let mut seen = std::collections::HashSet::new();
++        for item in 0u32..8 {
++            for chunk in 0u32..256 {
++                assert!(
++                    seen.insert(data_nonce(item, chunk)),
++                    "nonce 在 item={item} chunk={chunk} 处重复"
++                );
++            }
++        }
++    }
++
++    /// 元数据 nonce 与任何数据块 nonce 都不同——这是域分隔标记的全部职责。
++    /// 去掉 nonce[8..12] 的域分隔后，metadata_nonce 会等于 data_nonce(0,0)，此条即红。
++    #[test]
++    fn metadata_nonce_is_disjoint_from_every_data_nonce() {
++        let meta = metadata_nonce();
++        for item in 0u32..4 {
++            for chunk in 0u32..64 {
++                assert_ne!(meta, data_nonce(item, chunk), "元数据 nonce 撞上了数据块 nonce");
++            }
++        }
++    }
++
++    /// 篡改密文任意一个字节都必须被 tag 抓住。这是 E2EE 相对 CRC32 的全部增量。
++    #[test]
++    fn tampering_is_detected() {
++        let k = key_for(&Uuid::new_v4());
++        let n = data_nonce(1, 2);
++        let mut ct = seal(&k, n, b"sensitive clipboard content").unwrap();
++        assert!(open(&k, n, &ct).is_ok());
++        ct[3] ^= 0x01;
++        assert!(open(&k, n, &ct).is_err(), "密文被改了一位却仍然解开了");
++    }
++
++    /// 用错 nonce 解不开——间接证明 nonce 真的参与了认证，
++    /// 也是"接收端自行重算 nonce"这个决定的安全依据。
++    #[test]
++    fn wrong_nonce_fails_to_open() {
++        let k = key_for(&Uuid::new_v4());
++        let ct = seal(&k, data_nonce(0, 0), b"payload").unwrap();
++        assert!(open(&k, data_nonce(0, 1), &ct).is_err());
++    }
++
++    /// 截断到比 tag 还短时给出明确错误，而不是 panic 或 underflow。
++    #[test]
++    fn truncated_ciphertext_is_rejected_cleanly() {
++        let k = key_for(&Uuid::new_v4());
++        assert!(open(&k, data_nonce(0, 0), &[0u8; GCM_TAG_LEN - 1]).is_err());
++        assert!(open(&k, data_nonce(0, 0), &[]).is_err());
++    }
++
++    /// 版本门槛：低于 0.3.0 与取不到版本都必须判为不支持。
++    /// 「取不到就按不支持」这条被改成乐观假设的话，对端会收到解不开的 OFFER。
++    #[test]
++    fn peer_capability_gate() {
++        assert!(!peer_supports_e2ee(None), "版本未知必须保守判为不支持");
++        assert!(!peer_supports_e2ee(Some("0.2.0")));
++        assert!(!peer_supports_e2ee(Some("0.1.1")));
++        assert!(!peer_supports_e2ee(Some("乱七八糟")));
++        assert!(!peer_supports_e2ee(Some("")));
++        assert!(peer_supports_e2ee(Some("0.3.0")));
++        assert!(peer_supports_e2ee(Some("0.3.1")));
++        assert!(peer_supports_e2ee(Some("1.0.0")));
++        // 预发布后缀取前面的数字部分
++        assert!(peer_supports_e2ee(Some("0.3.0-beta")));
++    }
++}

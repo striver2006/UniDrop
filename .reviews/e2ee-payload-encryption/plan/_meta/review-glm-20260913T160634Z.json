@@ -1,0 +1,123 @@
+{
+  "schema": "trivium.review.v1",
+  "verdict": "request-changes",
+  "summary": "最危险的一条：§F 声称 ANSWER 加 e2ee_ok 字段服务端零改动，但 control_ws.go:305-388 在接受路径上会把 ANSWER 载荷解析进 Go 结构体、注入 token 后重新序列化——未知字段被静默丢弃，e2ee_ok 永远到不了发送端，新→新传输将永远回落明文并误报「对端版本过旧」。其次：§E 元数据加密决策发生在 OFFER、能力确认却来自 ANSWER，先后顺序矛盾未解决，新→旧的「干净回落」表不成立。第三：断点续传在代码里根本未接线（BitmapRepo 无生产调用、resumed_items 恒空、失败即删沙盒），§C 情况 4、§F 位图版本节与手工验证第 5 步都建立在不存在的能力上。其余（§A 派生、§B 块大小、§D CRC32 算密文、焦点 4 限额不受影响）均独立核实成立。",
+  "findings": [
+    {
+      "id": "GLM-01",
+      "severity": "blocker",
+      "layer": "plan",
+      "kind": "contract",
+      "location": "plan §F（做法：ANSWER 增加 e2ee_ok）及「已核验事实」表「Payload json.RawMessage 原样透传」行",
+      "problem": "「服务端零改动 + ANSWER 自行加 e2ee_ok 字段」不成立。服务端处理 TRANSFER_ANSWER 时把 env.Payload 解析进 protocol.TransferAnswerPayload（control_ws.go:305-306），授权成功后注入 token 并 json.Marshal 重建 payload 再转发（387-388 行，回声给接收方的 echoEnv 同样基于重建后的 env）。Go 反序列化进结构体会静默丢弃未知字段，因此接收端填的 e2ee_ok 到达发送端时已被剥掉。后果：所有新→新传输的发送端都判定「对端无 e2ee_ok」→ 永远回落明文，并显示错误的「对端版本过旧」提示——本轮目标静默落空且看起来像做完了。计划的证据行只核实了 envelope.go:40 的字段类型是 RawMessage，没有核实处理器会原样转发它；OFFER 路径确实是原样透传（control_ws.go:279 仅反序列化做限额检查，298 行 routeToPeer 用原始 payload），这种不对称正是被漏掉的原因。",
+      "evidence": "实读 server/internal/controller/control_ws.go:240-429（305 行解析、387-388 行 answer.Token = token 后 env.Payload 重建、395 行 routeToPeer）、server/internal/protocol/envelope.go:154-161（TransferAnswerPayload 无任何 e2ee 字段）；对照 OFFER 路径 control_ws.go:274-298 确认 payload 未被重建。",
+      "suggestion": "二选一并写进计划：(a) 接受一行服务端改动——给 TransferAnswerPayload 加 e2ee_ok 字段使其在重建中存活，并同步验收口径（不再是零改动，需服务端发版）；(b) 把能力协商挪到确实原样透传的通道——OFFER 载荷本身（如 e2ee_version 从 OFFER 原文到达接收端），或设备在线表里的 app_version（envelope.go:107 OnlineDevice 已携带）。同时修正「已核验事实」表那一行，注明两条转发路径的差异。",
+      "confidence": "high"
+    },
+    {
+      "id": "GLM-02",
+      "severity": "major",
+      "layer": "plan",
+      "kind": "correctness",
+      "location": "plan §E（做法：明文 items[] 置空/置零）与 §F（新|老 ⇒ 回落明文）的交叉",
+      "problem": "元数据加密的决策点在 OFFER，而能力确认（e2ee_ok）在 ANSWER——先有鸡还是先有蛋，计划没有解决。按 §E 字面执行（encrypted=true 时明文字段置空），新发送端→老接收端：OFFER 里文件名与 sha256 全空，老接收端会照常自动接受（lib.rs:189-213 收到 OFFER 即回 accepted=true）并接收明文数据块，最终 verify_file_sha256 对空哈希必然失败（transfer_engine.rs:759-775），整场传输在老端硬失败——§F 表格承诺的「回落明文+可见提示」只在数据块层面成立，元数据层面是坏的。反过来若保留明文元数据直到收到 e2ee_ok，则 §E 想保护的字段在每次新→新传输中都先明文过了一次服务端（OFFER 只发一次，没有二次协商消息），§E 目标落空。两个方向都牺牲了计划声称的某个性质，必须在实施前定夺。",
+      "evidence": "实读 client/src-tauri/src/lib.rs:189-213（接收端收到 OFFER 即自动应答 accepted=true，先于任何解密）、client/src-tauri/src/core/transfer_engine.rs:759-775（按 offer.items[].sha256 校验整文件）、plan §E 的置空表与 §F 的三行组合表。",
+      "suggestion": "在计划里明确决策。可选方向：利用协商前置信息（设备表 app_version）在发 OFFER 前就知道对端能力，从而单次 OFFER 即定加密形态；或接受「新→老先失败并提示升级」为显式行为（改 §F 表格如实写）；或 OFFER 同时携带明文+密文双份元数据、由 e2ee_ok 决定数据块加密与接收端取用哪份（此时须如实写明：文件名在协商完成前仍明文可见，§E 降级为部分达成）。任选其一，但不能维持现状的两节各说一半。",
+      "confidence": "high"
+    },
+    {
+      "id": "GLM-03",
+      "severity": "major",
+      "layer": "plan",
+      "kind": "correctness",
+      "location": "plan §C 情况 4（断点续传）、§F「断点续传的跨版本兼容」、验证第 5 步",
+      "problem": "计划把断点续传当作已存在的机制来设计，但代码里它没有接线：BitmapRepo 的方法只在自身测试中被调用（bitmap_repo.rs:57-64）；chunk_bitmaps 表在生产代码中无写入（history_repo.rs:194 的注释自己写着「本仓库没有续传路径」）；ANSWER 的 resumed_items 恒为空（lib.rs:197）；接收端位图是内存 HashSet，失败路径直接 remove_dir_all 整个沙盒（transfer_engine.rs:898-900）。后果三连：(a) §C 情况 4 的 nonce 论证对象不存在（无害但误导）；(b) §F 的「bitmap 按 4MB 边界记录、版本不一致丢弃重传」是在给死基础设施写规格；(c) 手工验证第 5 步「断网重连 ⇒ 续传正确」按现状不可能通过——验收会被一条不存在的功能卡住，或被迫现场改口径。",
+      "evidence": "实读 client/src-tauri/src/storage/bitmap_repo.rs（全文件，生产调用为零）、client/src-tauri/src/lib.rs:197、client/src-tauri/src/core/transfer_engine.rs:645/728/898-900、client/src-tauri/src/storage/history_repo.rs:194 注释；grep 全 src 无其它 BitmapRepo:: 调用。",
+      "suggestion": "把与续传相关的三处改写为与现状一致：§C 情况 4 改为「续传尚未实现，当前每次重连都是新 session 新 key，天然安全；若未来实现续传，不得复用 session_id 传不同内容，须在本方案落地时把这条写进续传的验收」；§F 位图版本节可保留为防御性设计但注明「当前无生产写入路径」；验证第 5 步改为「断网重连后从头重传成功且 SHA256 通过」（顺带覆盖 §B 的 offset 正确性）。",
+      "confidence": "high"
+    },
+    {
+      "id": "GLM-04",
+      "severity": "major",
+      "layer": "plan",
+      "kind": "security",
+      "location": "plan §F（回落必须可见）与「威胁模型」节",
+      "problem": "本方案的对手按威胁模型就是服务器本身，而能力协商完全经过服务器：恶意的服务端只要从 OFFER 里剥掉 e2ee_version、或从 ANSWER 里剥掉 e2ee_ok（它在 GLM-01 的重建路径上本来就能任意改写），就能把任意传输打回明文。计划对此的唯一防线是「回落时界面可见提示」——一条用户看几次就会习惯性忽略的提示，且文案指向「对端版本过旧」这一错误归因。威胁模型节把「服务器看不到内容」列为本轮能达成的目标，但按当前机制这只在服务器配合时成立，属于机会性加密而非保证，文档如果照现文写会高估安全性。",
+      "evidence": "实读 server/internal/controller/control_ws.go:274-298（OFFER 限额检查后原样转发，服务端可改写任何字节）、300-395（ANSWER 重建路径）；plan 威胁模型节「本轮能达成：服务器、云厂商、拿到 root 的人看不到内容」与 §F 回落表。",
+      "suggestion": "在威胁模型表里加一行「防主动降级：达不成——服务端可剥离协商字段强制明文」；回落提示的归因与措辞按 GLM-01 一并修正（区分「对端老」「协商被服务端剥离」两种可能至少要在文档里承认无法区分）；考虑给 e2ee_enabled=true 增加严格模式（协商失败即拒绝发送）作为后续项，哪怕本轮只做提示。",
+      "confidence": "medium"
+    },
+    {
+      "id": "GLM-05",
+      "severity": "minor",
+      "layer": "plan",
+      "kind": "correctness",
+      "location": "plan §B（三处同源清单）",
+      "problem": "「块大小三处同源」清单漏了第四个密文/明文长度敏感点：接收端进度统计。transfer_engine.rs:728-730 对新收到的块累加 payload.len()（加密后即密文长度=明文+16）并与明文 total_size 比较，加密传输下 transferred_size 会虚高、进度提前触顶 100%（clamp 掩盖但不消除）。不影响正确性，但正是 §B 想防的「16 字节差异藏在角落」这一类问题，应纳入同一个明文长度函数的管辖。",
+      "evidence": "实读 client/src-tauri/src/core/transfer_engine.rs:728-744（was_new 分支累加 payload.len()）与 731-735（对 total_size 求百分比）；发送端对应位置 440 行累加的是明文 length，不受影响。",
+      "suggestion": "把该累加点列入 §B 的同源清单：加密传输时在解密后按明文长度计（或统一减 GCM_TAG_LEN），并注明「进度统计也必须按明文口径」。顺带确认测试清单里补一条 transferred_size 不超过 total_size 的断言。",
+      "confidence": "high"
+    },
+    {
+      "id": "GLM-06",
+      "severity": "minor",
+      "layer": "plan",
+      "kind": "maintainability",
+      "location": "plan §G（PSK 进系统 keychain）",
+      "problem": "keyring 条目的命名与多账号语义未决策，而这是 §G 落地时第一个要写的代码。现状设置是单条 JSON（settings_cmd.rs:180-192），切换账号=原地改写 account_id 与 psk_secret，旧账号的 PSK 随即丢失；项目刚完成历史/缓存按账号分区（git 6650930）。若 keyring 用单一固定条目名，行为与现状持平但「切回老账号需重输 PSK」——在 PSK 升格为「解密全部内容的钥匙」后，这个体验回退比现在更痛；若按账号建多条目，迁移逻辑「首次启动读到明文 PSK ⇒ 写入 keychain」就必须写明以哪个 account_id 建条目、切换账号时读哪条。计划对两者都未表态，属于按现状写完会返工的未决策点。",
+      "evidence": "实读 client/src-tauri/src/commands/settings_cmd.rs:148-201（单条 JSON 落库、account_changed 检测、config_actor 原地覆盖）、7-70（AppSettings 仅一份 account_id/psk_secret）；plan §G 三条失败路径未含账号切换场景。",
+      "suggestion": "在 §G 明确：keyring 条目按 account_id 命名（多账号各存各的），迁移时以当前 account_id 落条目；并把「切换账号时 keychain 读取失败」并入既有的失败路径清单（提示重输，而不是回落成上一个账号的 PSK——后者会造成用 A 的 PSK 解 B 的会话这种最难排查的故障）。",
+      "confidence": "medium"
+    },
+    {
+      "id": "GLM-07",
+      "severity": "nit",
+      "layer": "plan",
+      "kind": "maintainability",
+      "location": "plan §A（info 带 account_id 的理由）",
+      "problem": "§A 写「UUIDv4 碰撞概率可忽略，所以这条不是为了防碰撞」，但 account_id 不是 UUID——它是用户自填字符串（默认 \"default_user\"，合法字符集 [A-Za-z0-9._@-]，1..=64 字节，settings_cmd.rs:105/129-138）。设计本身仍成立：两端同账号字符串字节一致（跨账号传输被服务端路由层挡掉，到达传输层的两端必然同串），info 绑定依然有效。但计划要求把逐项理由「全部写进代码注释」，照抄这句会把错误事实钉进注释里误导后来人。",
+      "evidence": "实读 client/src-tauri/src/commands/settings_cmd.rs:100-138（default_config 的 account_id 字面量、validate_account_id 的字符集规则）。",
+      "suggestion": "注释里改为如实表述：「account_id 是用户自填标识（非 UUID）；两端由服务端按账号隔离路由，能建立传输即保证同串，故 info 绑定无需依赖其随机性」。设计不变，只改论证文字。",
+      "confidence": "high"
+    }
+  ],
+  "agreed": [
+    "§B 的 4MB 硬冲突识别与解法完全正确：binary_header.go:172-174 的 PayloadLen>MaxPayloadLength 拒绝 + data_ws.go:145-148 的长度一致性校验均实锤，密文=明文+16 会让满块加密 100% 断连；4MB-16 的明文块大小、以及「三处必须从一个函数取」的单源要求是对的（三行清单实际覆盖了全部 5 处 MAX_PAYLOAD_LENGTH 使用点：130/185/341-345/947）。",
+    "§D 的决策方向正确：CRC32 必须算在密文上——明文 CRC32 指纹对剪贴板短文本可被字典式枚举确认，这个论证成立；「保留 CRC32 做损坏分流、tag 失败走限次中止」的职责划分合理。对 Driver 求判的阈值 3：结合 CRC-算密文，CRC 通过而 tag 失败在实践中几乎只剩篡改或 PSK 不匹配（CRC32 碰撞概率 2^-32 量级），偶发线路损坏会先被 CRC32 拦下走 NACK，不会误伤；PSK 不匹配场景下首个块 3 次重传即中止，也满足验证第 3 步的「有限次失败」。",
+    "§C 的 nonce 构造（item_index‖chunk_index‖域分隔，计数器式）与「接收端自行重算、不信任帧头 nonce」是标准且正确的做法；重传复用 (key,nonce,plaintext) 不是 GCM 失败形态、须写注释防后人误修——这条判断对。",
+    "session_id 复用风险（Driver 提示第 1 条）我独立核过：现铸点其实在调用方 cmd_send_files / cmd_send_clipboard（clipboard_cmd.rs:278/310），每次调用新铸 UUIDv4，prepare_offer 只是形参传入——计划表述不准但结论成立：当前所有发送路径均不复用 session_id（结合 GLM-03，续传这条唯一潜在复用源也不存在）。two_transfers_never_share_session_id 守卫测试值得保留。",
+    "焦点 4 的结论成立：limits.go 的 CheckOffer/checkContent/clipboardViolation 只读 TotalSize、DataType、items[].Size 与条目数（171-277 行），PreviewSummary 在服务端仅出现于结构定义、diag 工具与测试，relative_path 只进入拒绝文案不参与判定——preview_summary 及 §E 的字段加密不会使限额静默失效。relative_path/sha256 比 preview_summary 更严重这个补充判断也对。",
+    "威胁模型节的诚实清单（前向保密、防失窃、设备隔离、元数据、低熵 PSK 均达不成并须写文档）方向正确，是这份计划质量最高的部分之一；明确不做 ECDH 前向保密的取舍我认可。",
+    "ring 已在依赖树的判断正确（Cargo.toml:32 rustls features=[\"ring\"]），显式声明并核对版本的注意事项恰当；keyring 缺失的判断也对。",
+    "§F 默认 e2ee_enabled=true 的倾向我同意——但前提是 GLM-01/GLM-02 先解决，否则默认开启的是一个必然回落明文的开关。"
+  ],
+  "not_covered": [
+    "未审前端 React 层与通知/toast 链路——回落提示、E2EE_AUTH_FAILED 提示的 UI 落点与文案只能到实施阶段核对。",
+    "未运行任何编译/测试/依赖解析（只读审查）：ring 显式版本与 rustls 解析是否一致（cargo tree）、keyring crate 在三平台的实际可用性矩阵与 Linux Secret Service 缺失时的具体错误形态，均未验证。",
+    "未独立评估「本地 SQLite/缓存不做静态加密」的威胁取舍（只审了计划论证的内在一致性，未重做独立威胁评估）。",
+    "§H 测试清单的「实测撤掉被测逻辑会红」无法在计划阶段验证，只能在代码审查轮核对。",
+    "HKDF/nonce 之外的非对称密码学面（如未来 ECDH 升级路径）不在本轮范围，未评估。"
+  ],
+  "consulted": [
+    ".reviews/e2ee-payload-encryption/plan/2026-09-14-e2ee-payload-encryption-claude.md",
+    "CLAUDE.md",
+    "README.md",
+    "client/src-tauri/src/core/transfer_engine.rs",
+    "client/src-tauri/src/lib.rs",
+    "client/src-tauri/src/commands/clipboard_cmd.rs",
+    "client/src-tauri/src/commands/settings_cmd.rs",
+    "client/src-tauri/src/core/connection_actor.rs",
+    "client/src-tauri/src/core/path_guard.rs",
+    "client/src-tauri/src/protocol/envelope.rs",
+    "client/src-tauri/src/protocol/binary_header.rs",
+    "client/src-tauri/src/storage/bitmap_repo.rs",
+    "client/src-tauri/src/storage/history_repo.rs",
+    "client/src-tauri/Cargo.toml",
+    "server/internal/protocol/binary_header.go",
+    "server/internal/protocol/envelope.go",
+    "server/internal/controller/data_ws.go",
+    "server/internal/controller/control_ws.go",
+    "server/internal/limits/limits.go",
+    "server/internal/relay/pipe.go"
+  ]
+}

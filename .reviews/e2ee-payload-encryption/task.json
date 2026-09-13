@@ -1,0 +1,52 @@
+{
+  "schema": "trivium.task.v1",
+  "topic": "e2ee-payload-encryption",
+  "goal": "实现E2EE",
+  "created_at": "2026-09-13T16:06:35.892Z",
+  "updated_at": "2026-09-13T16:48:02.362Z",
+  "runs": [
+    {
+      "run_id": "20260913T160634Z",
+      "stage": "plan",
+      "rerun_index": 1,
+      "status": "success",
+      "review_mode": "dual",
+      "started_at": "2026-09-13T16:06:35.882Z"
+    },
+    {
+      "run_id": "20260913T163647Z",
+      "stage": "code",
+      "rerun_index": 1,
+      "status": "success",
+      "review_mode": "dual",
+      "started_at": "2026-09-13T16:36:49.282Z"
+    }
+  ],
+  "gate": {
+    "stage": "code",
+    "state": "approved",
+    "since": "2026-09-13T16:48:02.354Z",
+    "run_id": "20260913T163647Z"
+  },
+  "approvals": [
+    {
+      "at": "2026-09-13T16:19:11.042Z",
+      "stage": "plan",
+      "run_id": "20260913T160634Z",
+      "decision": "approved",
+      "reason": null,
+      "session_id": null
+    },
+    {
+      "at": "2026-09-13T16:48:02.354Z",
+      "stage": "code",
+      "run_id": "20260913T163647Z",
+      "decision": "approved",
+      "reason": null,
+      "session_id": null
+    }
+  ],
+  "degradations": [],
+  "disputed": false,
+  "disputes": []
+}

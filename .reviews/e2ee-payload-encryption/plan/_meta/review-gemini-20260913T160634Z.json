@@ -1,0 +1,107 @@
+{
+  "agreed": [
+    "会话密钥派生方案（§A）采用 HKDF-SHA256，以 16 字节原始 UUID session_id 为 salt、account_id 为 info 域分隔，密码学参数职责划分准确，且与服务端的账号隔离架构完美契合。",
+    "CRC32 算在密文上而非明文上（§D）的决策完全正确，有效消除了短剪贴板文本通过明文 CRC32 指纹被暴力破解的风险，同时保留了低成本的线路纠错能力。",
+    "识别并解决 4MB 密文与服务端 MaxPayloadLength 上限冲突（§B），将明文块大小缩减至 4,194,288 字节（PLAINTEXT_CHUNK_LEN），并统一 total_chunks、发送 offset 与写盘 offset 三处事实源。",
+    "关于服务端限额受 preview_summary 搬迁影响的评估准确无误：服务端限额仅依赖 TotalSize、DataType 与 items[].Size，从不读取 preview_summary。",
+    "Nonce 结构（§C）设计清晰，通过 item_index、chunk_index 与 4 字节域分隔标记彻底隔离了数据块与元数据的 Nonce 空间。"
+  ],
+  "consulted": [
+    "CLAUDE.md",
+    "AGENTS.md",
+    "README.md",
+    "client/src-tauri/src/core/transfer_engine.rs",
+    ".reviews/e2ee-payload-encryption/plan/2026-09-14-e2ee-payload-encryption-claude.md",
+    "server/internal/limits/limits.go",
+    "server/internal/protocol/binary_header.go",
+    "server/internal/protocol/envelope.go",
+    "server/internal/controller/data_ws.go",
+    "server/internal/registry/registry.go",
+    "server/internal/controller/control_ws.go",
+    "server/internal/auth/identity.go",
+    "server/internal/auth/verifier.go",
+    "client/src-tauri/src/commands/clipboard_cmd.rs",
+    "client/src-tauri/src/commands/settings_cmd.rs",
+    "client/src-tauri/src/protocol/binary_header.rs",
+    "client/src-tauri/src/protocol/envelope.rs",
+    "client/src-tauri/src/storage/history_repo.rs",
+    "client/src-tauri/src/lib.rs",
+    ".github/workflows/client-ci.yml"
+  ],
+  "findings": [
+    {
+      "confidence": "high",
+      "evidence": "查阅 .reviews/e2ee-payload-encryption/plan/2026-09-14-e2ee-payload-encryption-claude.md §E（320-333 行）与 §F（357-368 行）。§E 规定 encrypted=true 时明文 items[] 中的 relative_path 与 sha256 均置空并加密存入 encrypted_metadata；§F 规定发送端发出带 e2ee_version 的 OFFER 后，等待 ANSWER 中的 e2ee_ok，若无则回落明文。查阅 client/src-tauri/src/lib.rs:189-214，老版本接收端收到 OFFER 后无条件回复 accepted=true 且不带 e2ee_ok；查阅 client/src-tauri/src/core/transfer_engine.rs:700,763，接收端依赖 item.relative_path 进行 PathGuard 解析，并校验 item.sha256。此时接收端拿到的路径与哈希为空，后续即使收到明文数据块也必将发生写入失败或 SHA256 不匹配，导致整个传输中断，回落机制彻底失效。",
+      "id": "AGY-01",
+      "kind": "contract",
+      "layer": "plan",
+      "location": "plan §E, §F",
+      "problem": "OFFER 阶段剥离并加密条目元数据（§E）与 ANSWER 阶段的降级回落机制（§F）存在死锁矛盾，导致对端为老版本时无法成功回落明文。",
+      "severity": "blocker",
+      "suggestion": "能力协商必须发生在发出抹空元数据的 OFFER 之前。发送端应在发送 OFFER 前读取对端设备能力（例如通过在线设备列表中的 app_version），仅在确认对端支持 E2EE 时才发送加密元数据 OFFER；或者当收到不支持 E2EE 的旧版 ANSWER 时，明确取消当前 session 并提示用户重新发起明文传输，而非中途将数据面单向退回明文。"
+    },
+    {
+      "confidence": "high",
+      "evidence": "查阅 .reviews/e2ee-payload-encryption/plan/2026-09-14-e2ee-payload-encryption-claude.md §E（332 行），计划仅说明“接收端在收到 OFFER 时即可解密”，未定义解密失败的拦截路径与错误码；查阅 client/src-tauri/src/lib.rs:189-224，接收端收到 TRANSFER_OFFER 后立即触发 emit('transfer-offer-received', &offer) 并写入 HistoryRepo::record_task。若此时未先成功解密并还原 offer，UI 与数据库将展示并持久化空文件名；若解密失败（如 PSK 不匹配或数据损坏），计划未在此处阻断，导致流程仍会建立数据面，与 §D 中靠数据块 tag 失败发现 PSK 不一致产生逻辑冲突。",
+      "id": "AGY-02",
+      "kind": "correctness",
+      "layer": "plan",
+      "location": "plan §E",
+      "problem": "未定义接收端在收到 OFFER 时解密 encrypted_metadata 失败的处理流程，导致 UI 展示空卡片且可能产生无效数据面连接。",
+      "severity": "major",
+      "suggestion": "在 lib.rs 收到 TRANSFER_OFFER 的最前置节点强制解密 encrypted_metadata：若解密成功，将明文还原进 offer 结构体后再进行 UI 事件广播与历史记录；若解密失败，立即向发送端回复 TRANSFER_ANSWER(accepted=false, reject_reason='E2EE_KEY_MISMATCH')，就地中止流程，避免创建数据面连接。"
+    },
+    {
+      "confidence": "high",
+      "evidence": "查阅 .reviews/e2ee-payload-encryption/plan/2026-09-14-e2ee-payload-encryption-claude.md §A, §C, §E 全文，未对 AES-256-GCM 的 AAD（附加验证数据）作出任何规范；同时 §C 仅规定了 nonce[8..12] 为域分隔标记，未说明 encrypted_metadata 的 nonce[0..8] 的具体取值。底层依赖的 ring::aead 在 seal/open 时要求显式传入 Aad。此外 server/internal/protocol/binary_header.go:53-67 包含 Flags、TotalChunks 等字段，若未纳入 AAD 保护，可能遭受未认证篡改。",
+      "id": "AGY-03",
+      "kind": "security",
+      "layer": "plan",
+      "location": "plan §A, §C, §E",
+      "problem": "缺失 AES-GCM 附加验证数据（AAD）规范与 encrypted_metadata Nonce 构造规范，两端实现易产生歧义导致解密失败。",
+      "severity": "major",
+      "suggestion": "补充明确 AAD 的具体定义（例如数据块是否绑定 64 字节定长帧头中的固定字段，或者统一明确约定使用 Aad::empty()）；明确规范 encrypted_metadata 加密时的 12 字节 Nonce（例如固定 nonce[0..8] 为 0，nonce[8..12] 为 0x00000001），以及密文 tag 打包格式（ciphertext || tag 后再做 base64）。"
+    },
+    {
+      "confidence": "high",
+      "evidence": "查阅 .reviews/e2ee-payload-encryption/plan/2026-09-14-e2ee-payload-encryption-claude.md §D（276-284 行），计划按 (item_index, chunk_index) 独立累计 tag 失败次数（阈值 3 次）；查阅 client/src-tauri/src/core/transfer_engine.rs:369，发送端使用窗口大小为 4 的流水线滑动窗口并发推流。当密文遭受中间人系统性篡改或密钥错误时，在途的 4 个块在接收端会同时发生 tag 校验失败，各自计数为 1 并各自触发 NACK，导致重传放大风暴。",
+      "id": "AGY-04",
+      "kind": "performance",
+      "layer": "plan",
+      "location": "plan §D",
+      "problem": "GCM tag 校验失败仅按单块计数重传，在滑动窗口流水线下可能引发 NACK 重传放大风暴。",
+      "severity": "minor",
+      "suggestion": "除单块重传限次外，增加会话级累计 AEAD tag 失败上限（例如一个 session 内累计出现 3 次 tag 校验失败直接判定为恶意篡改或密钥失效并熔断整次会话）。鉴于 CRC32 已过滤网络线路偶然误码，tag 失败几乎必然代表篡改或密钥异常，会话级快速熔断更为安全。"
+    },
+    {
+      "confidence": "high",
+      "evidence": "查阅 client/src-tauri/src/core/transfer_engine.rs:730-735，接收端在每收到有效块时执行 total_received_bytes += payload.len() as i64；根据 .reviews/e2ee-payload-encryption/plan/2026-09-14-e2ee-payload-encryption-claude.md §B，加密后的 payload 包含 16 字节 tag。若直接累加密文长度，多块传输累计的 total_received_bytes 将超过 offer.total_size（原始明文大小），导致进度计算失真。",
+      "id": "AGY-05",
+      "kind": "correctness",
+      "layer": "plan",
+      "location": "plan §B",
+      "problem": "接收端进度计算未扣除 GCM tag 长度，多块传输时进度百分比将提前溢出。",
+      "severity": "minor",
+      "suggestion": "计划中应提醒在接收端累加 total_received_bytes 时使用解密后的明文长度（或解密前减去 GCM_TAG_LEN），以与 offer.total_size 口径一致。"
+    },
+    {
+      "confidence": "high",
+      "evidence": "查阅 .reviews/e2ee-payload-encryption/plan/2026-09-14-e2ee-payload-encryption-claude.md §G（424-426 行），计划自身提到 §G 可以拆出；查阅 .github/workflows/client-ci.yml:45-59，Linux CI 环境为无桌面、无 D-Bus Secret Service 的 ubuntu-latest 容器，引入 keyring crate 极易导致 headless CI 测试挂死或报错；且 PSK 目前已用于服务端 HMAC 认证，本轮引入 E2EE 并未在存储层恶化安全边界。",
+      "id": "AGY-06",
+      "kind": "scope-drift",
+      "layer": "plan",
+      "location": "plan §G",
+      "problem": "将系统 keychain（§G）与 E2EE 传输协议强绑定导致范围蔓延，且引入 Linux CI 环境及平台兼容性风险。",
+      "severity": "minor",
+      "suggestion": "采纳作者在计划中的解耦建议，将 §G 剥离为独立的后续需求，本轮聚焦完成数据面与信令面的 E2EE 载荷加密。"
+    }
+  ],
+  "not_covered": [
+    "前端 React 界面针对 E2EE 协商失败降级回落与认证失败弹窗的具体交互及国际化文案。",
+    "macOS Keychain、Windows Credential Manager 与 Linux Secret Service 的物理环境实际读写权限与错误回落。",
+    "在极端高丢包与持续断线重连网络恶劣场景下滑动窗口与 E2EE 组合的吞吐性能测试。"
+  ],
+  "schema": "trivium.review.v1",
+  "summary": "1. 核心阻塞点：§E 在 OFFER 剥除元数据与 §F 收到 ANSWER 后回落明文存在契约矛盾，导致老版本接收端在回落路径下必然因空文件名与空哈希失败（AGY-01）。\n2. OFFER 元数据解密失败处理缺失：计划未定义接收端解密 encrypted_metadata 失败的即时拒收逻辑，易造成 UI 空白与脏历史（AGY-02）。\n3. 审查焦点评估结论：HKDF 派生结构（session_id 为 salt，account_id 为 info）设计合理，但缺失 AAD 规范；CRC32 算在密文上并保留纠错职责完全正确；断点续传下当前架构每次现铸 session_id 能杜绝 nonce 复用；preview_summary 搬迁对服务端限额毫无影响。\n4. 建议与决策：建议解耦系统 keychain 改造（§G）以避免 CI 平台风险；设置项 e2ee_enabled 赞成默认 true，但前提是修复对端老版本协商机制。",
+  "verdict": "request-changes"
+}
