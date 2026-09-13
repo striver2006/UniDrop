@@ -58,12 +58,35 @@ type AuthRequestPayload struct {
 	Timestamp  int64  `json:"timestamp"`
 }
 
+// ServerLimits is the transfer limit set the server advertises to a client
+// right after authentication. It is configured by the operator through
+// environment variables and is read-only from the client's point of view.
+//
+// A zero on any field means that limit is switched off. Defaults and parsing
+// live in internal/limits, which is the sole source of truth for the values;
+// only the wire shape belongs here.
+type ServerLimits struct {
+	MaxSingleFileBytes     int64 `json:"max_single_file_bytes"`
+	MaxTotalTransferBytes  int64 `json:"max_total_transfer_bytes"`
+	MaxClipboardImageBytes int64 `json:"max_clipboard_image_bytes"`
+	MaxClipboardTextBytes  int64 `json:"max_clipboard_text_bytes"`
+	MaxItemsPerOffer       int   `json:"max_items_per_offer"`
+	MaxConcurrentTransfers int   `json:"max_concurrent_transfers"`
+}
+
 // AuthResponsePayload is returned to client with auth outcome.
+//
+// Limits is a pointer with omitempty so that an older server — which simply
+// does not send the field — is distinguishable on the client from a server
+// that sent an all-zero set. The two must not be conflated: absent means
+// "unknown, fall back to the client's own constants", whereas all-zero would
+// mean "every limit switched off".
 type AuthResponsePayload struct {
-	Success      bool   `json:"success"`
-	ErrorCode    string `json:"error_code,omitempty"`
-	ErrorMessage string `json:"error_message,omitempty"`
-	AssignedID   string `json:"assigned_id,omitempty"`
+	Success      bool          `json:"success"`
+	ErrorCode    string        `json:"error_code,omitempty"`
+	ErrorMessage string        `json:"error_message,omitempty"`
+	AssignedID   string        `json:"assigned_id,omitempty"`
+	Limits       *ServerLimits `json:"limits,omitempty"`
 }
 
 // OnlineDevice represents an active peer device.

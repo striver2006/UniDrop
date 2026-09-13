@@ -53,6 +53,29 @@ pub struct AuthRequestPayload {
     pub timestamp: i64,
 }
 
+/// 服务端在鉴权成功后下发的传输限额。只读——由部署者在服务端 env 配置，
+/// 客户端改不了（这条边界是刻意的，理由见 `.reviews` 下 server-transfer-limits
+/// 主题计划的 §3）。
+///
+/// 任一项为 `0` 表示该项不限制。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerLimits {
+    pub max_single_file_bytes: i64,
+    pub max_total_transfer_bytes: i64,
+    pub max_clipboard_image_bytes: i64,
+    pub max_clipboard_text_bytes: i64,
+    pub max_items_per_offer: i32,
+    pub max_concurrent_transfers: i32,
+}
+
+impl ServerLimits {
+    /// `limit <= 0` 视为不限制。三处校验共用这一个判定，避免各写各的
+    /// `if x > 0 &&`，漏掉一处就是一项限额在某条路径上静默失效。
+    pub fn exceeds(limit: i64, actual: i64) -> bool {
+        limit > 0 && actual > limit
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthResponsePayload {
     pub success: bool,
@@ -62,6 +85,15 @@ pub struct AuthResponsePayload {
     pub error_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assigned_id: Option<String>,
+
+    /// 老服务端不发这个字段，于是这里是 `None`。
+    ///
+    /// **`None` 必须退回客户端自己的兜底常量，不得 `unwrap_or_default()`。**
+    /// 三种处理在代码上只差一个调用，后果却完全不同：
+    /// 沿用兜底 = 老服务器上一切照旧；全零 = 老服务器上限额全部失效；
+    /// 若把全零当"都为 0 即不限制"以外的含义用，还可能变成什么都发不出去。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ServerLimits>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -24,7 +24,6 @@ const baseSettings: AppSettings = {
   account_id: "alice",
   psk_secret: "s",
   auto_inject: false,
-  rate_limit_mb: 10,
   start_minimized: false,
   history_max_entries: 100,
   transfer_card_retain_secs: 30,
@@ -58,10 +57,13 @@ async function renderApp(settings: Partial<AppSettings> = {}) {
   invokeResults["cmd_get_online_devices"] = [];
   invokeResults["cmd_get_settings"] = { ...baseSettings, ...settings };
   invokeResults["cmd_list_history"] = [];
+  // 默认按「老服务端」处理：不下发限额。需要限额的用例自行覆盖。
+  invokeResults["cmd_get_server_limits"] = null;
 
   const utils = render(<App />);
-  // fetchInitialData 的三个 await 需要让出 microtask 队列
+  // fetchInitialData 的四个 await 需要让出 microtask 队列
   await act(async () => {
+    await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();

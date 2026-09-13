@@ -1,7 +1,31 @@
 import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { X, Save, Shield, AlertCircle } from "lucide-react";
-import { AppSettings } from "../types";
+import { X, Save, Shield, AlertCircle, Server as ServerIcon } from "lucide-react";
+import { AppSettings, ServerLimits } from "../types";
+
+/**
+ * 把一项限额格式化成可读文案。
+ *
+ * `0` 必须显示成「不限制」而不是「0 B」。两者语义正好相反——用户看到 0
+ * 会读成「配额为零、什么都发不了」，而它实际表示该项限制已被关闭。
+ */
+const formatLimitBytes = (n: number): string => {
+  if (!n || n <= 0) return "不限制";
+  const KB = 1024;
+  if (n < KB) return `${n} B`;
+  if (n < KB * KB) return `${(n / KB).toFixed(1)} KB`;
+  if (n < KB * KB * KB) return `${(n / (KB * KB)).toFixed(1)} MB`;
+  return `${(n / (KB * KB * KB)).toFixed(2)} GB`;
+};
+
+const formatLimitCount = (n: number): string => (!n || n <= 0 ? "不限制" : `${n}`);
+
+const LimitRow: React.FC<{ label: string; value: string }> = ({ label, value }) => (
+  <div className="flex justify-between">
+    <dt className="text-slate-500">{label}</dt>
+    <dd className="text-slate-300 tabular-nums">{value}</dd>
+  </div>
+);
 
 /** Rust 侧两个字段都是 u32，超出这个范围反序列化会整单失败 */
 const U32_MAX = 4294967295;
@@ -60,9 +84,23 @@ interface SettingsModalProps {
   isOpen: boolean;
   onClose: () => void;
   onSave: (newSettings: AppSettings) => void | Promise<void>;
+  /**
+   * 服务端下发的限额，只读展示。
+   *
+   * `null` = 尚未拿到（未连接，或对端是不下发这个字段的老服务端）。
+   * 此时显示「未下发」，**不要显示 0，也不要拿默认值顶上**——显示 0 会被读成
+   * 配额为零，显示默认值会让用户以为那就是实际生效的值。
+   */
+  serverLimits?: ServerLimits | null;
 }
 
-export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, onClose, onSave }) => {
+export const SettingsModal: React.FC<SettingsModalProps> = ({
+  settings,
+  isOpen,
+  onClose,
+  onSave,
+  serverLimits = null,
+}) => {
   const [form, setForm] = useState<AppSettings>(settings);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -419,6 +457,33 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
                 <AlertCircle className="w-3.5 h-3.5 mt-px shrink-0" />
                 <span>{fieldErrors.interval}</span>
               </div>
+            )}
+          </div>
+
+          {/* 服务端限额：纯展示，本轮没有任何输入框。
+              限额的事实源在服务端环境变量里，客户端只能看。不写明这一点的话，
+              用户会对着一组灰数字猜为什么改不了。 */}
+          <div className="pt-1">
+            <div className="flex items-center space-x-1.5 text-slate-300 mb-1">
+              <ServerIcon className="w-3.5 h-3.5 text-slate-500" />
+              <span className="font-medium">服务端限额</span>
+            </div>
+            <p className="text-[11px] text-slate-500 mb-2">
+              由服务端配置，客户端只读。如需调整请联系部署者
+            </p>
+            {serverLimits === null ? (
+              <div className="text-[11px] text-slate-500 bg-slate-800/50 border border-slate-800 rounded-lg px-3 py-2">
+                未下发（尚未连接，或服务端版本较旧）
+              </div>
+            ) : (
+              <dl className="text-[11px] bg-slate-800/50 border border-slate-800 rounded-lg px-3 py-2 space-y-1">
+                <LimitRow label="单个文件" value={formatLimitBytes(serverLimits.max_single_file_bytes)} />
+                <LimitRow label="单次总量" value={formatLimitBytes(serverLimits.max_total_transfer_bytes)} />
+                <LimitRow label="剪贴板图片" value={formatLimitBytes(serverLimits.max_clipboard_image_bytes)} />
+                <LimitRow label="剪贴板文本" value={formatLimitBytes(serverLimits.max_clipboard_text_bytes)} />
+                <LimitRow label="单次文件数" value={formatLimitCount(serverLimits.max_items_per_offer)} />
+                <LimitRow label="同时传输数" value={formatLimitCount(serverLimits.max_concurrent_transfers)} />
+              </dl>
             )}
           </div>
           </div>

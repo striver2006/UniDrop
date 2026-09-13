@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 	"github.com/unidrop/unidrop-server/internal/auth"
+	"github.com/unidrop/unidrop-server/internal/limits"
 	"github.com/unidrop/unidrop-server/internal/protocol"
 	"github.com/unidrop/unidrop-server/internal/registry"
 	"github.com/unidrop/unidrop-server/internal/relay"
@@ -20,14 +22,16 @@ type ControlWSHandler struct {
 	verifier     *auth.Verifier
 	registry     *registry.DeviceRegistry
 	relayManager *relay.RelayManager
+	limits       limits.Limits
 }
 
 // NewControlWSHandler creates a new ControlWSHandler.
-func NewControlWSHandler(v *auth.Verifier, reg *registry.DeviceRegistry, rm *relay.RelayManager) *ControlWSHandler {
+func NewControlWSHandler(v *auth.Verifier, reg *registry.DeviceRegistry, rm *relay.RelayManager, lim limits.Limits) *ControlWSHandler {
 	return &ControlWSHandler{
 		verifier:     v,
 		registry:     reg,
 		relayManager: rm,
+		limits:       lim,
 	}
 }
 
@@ -143,10 +147,14 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("device authenticated", "device", session.DeviceID, "account", session.AccountID, "os", session.OSType)
 
-	// Send AUTH_RESPONSE success
+	// Send AUTH_RESPONSE success, carrying the transfer limits so the client can
+	// refuse an oversized selection locally instead of learning about it a
+	// round trip later.
+	effectiveLimits := h.limits
 	authSuccessPayload, _ := json.Marshal(protocol.AuthResponsePayload{
 		Success:    true,
 		AssignedID: session.DeviceID,
+		Limits:     &effectiveLimits,
 	})
 	authSuccessEnv, _ := json.Marshal(protocol.ControlEnvelope{
 		Version:   1,
@@ -249,13 +257,25 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if env.ToDevice == "" {
 				continue
 			}
-			// P1-8: Enforce max items per offer limit (<= 1000)
 			var offer protocol.TransferOfferPayload
-			if err := json.Unmarshal(env.Payload, &offer); err == nil {
-				if len(offer.Items) > 1000 {
-					slog.Warn("transfer offer exceeded items limit", "items", len(offer.Items), "device", session.DeviceID)
-					continue
-				}
+			if err := json.Unmarshal(env.Payload, &offer); err != nil {
+				// A malformed payload is refused rather than forwarded. The
+				// previous `if err == nil` guard only ran the limit check when
+				// the payload parsed, so anything unparsable sailed straight
+				// past it to the peer.
+				slog.Warn("malformed transfer offer refused", "device", session.DeviceID, "error", err)
+				h.rejectToSelf(session, salvageSessionID(env.Payload), &limits.Violation{
+					Code:    limits.CodeMalformedOffer,
+					Message: "传输请求格式无法解析，已拒绝",
+				})
+				continue
+			}
+			if v := limits.CheckOffer(h.limits, &offer); v != nil {
+				slog.Info("transfer offer refused by limits",
+					"device", session.DeviceID, "session", offer.SessionID,
+					"code", v.Code, "items", len(offer.Items), "total_size", offer.TotalSize)
+				h.rejectToSelf(session, offer.SessionID, v)
+				continue
 			}
 			h.routeToPeer(session, env)
 
@@ -266,13 +286,41 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// P0-1, P2-7: Authorize session in RelayManager when receiver accepts offer
 			var answer protocol.TransferAnswerPayload
 			if err := json.Unmarshal(env.Payload, &answer); err == nil && answer.Accepted && h.relayManager != nil {
-				token, authErr := h.relayManager.AuthorizeSession(
+				// Per-account concurrency is enforced while the token is minted,
+				// not before it: counting first and authorizing afterwards would
+				// let two connections of the same account both see a free slot
+				// and both be granted one.
+				//
+				// On refusal the original answer is NOT forwarded. Forwarding a
+				// token-less answer is what the old code did on authorization
+				// failure, and the client skips such an answer silently
+				// (`if let Some(token)`), leaving the sender waiting forever —
+				// the same silent hang this round exists to remove, re-entered
+				// through a different door. Both peers are told instead.
+				//
+				// Note the direction is the opposite of the OFFER rejection
+				// above. For an OFFER the sender is the current session; for an
+				// ANSWER the current session is the *receiver* and ToDevice is
+				// the sender. Reusing one helper for both would send "too many
+				// transfers" to the wrong peer. TestConcurrencyRejection... in
+				// limits_ws_test.go pins both directions.
+				token, inFlight, authErr := h.relayManager.AuthorizeSessionIfUnderLimit(
 					answer.SessionID,
 					env.ToDevice,     // Sender is ToDevice
 					session.DeviceID, // Receiver is current session
 					session.AccountID,
 					5*time.Minute,
+					h.limits.MaxConcurrentTransfers,
 				)
+				if errors.Is(authErr, relay.ErrConcurrencyLimit) {
+					v := limits.ConcurrencyViolation(h.limits, inFlight)
+					slog.Info("transfer answer refused by concurrency limit",
+						"account", session.AccountID, "session", answer.SessionID,
+						"in_flight", inFlight, "code", v.Code)
+					h.rejectToSelf(session, answer.SessionID, v)               // 接收方 = 当前连接
+					h.rejectToPeer(session, env.ToDevice, answer.SessionID, v) // 发送方 = ToDevice
+					continue
+				}
 				if authErr == nil {
 					slog.Info("transfer session authorized", "session", answer.SessionID, "sender", env.ToDevice, "receiver", session.DeviceID)
 					answer.Token = token
@@ -307,6 +355,117 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			h.routeToPeer(session, env)
 		}
 	}
+}
+
+// buildFailure wraps a limit violation as a TRANSFER_FAILURE envelope.
+func buildFailure(fromDevice, toDevice, sessionID string, v *limits.Violation) ([]byte, bool) {
+	// The client matches a failure to a card by session_id and does nothing at
+	// all when it is absent, so sending one without an id would be a rejection
+	// that reaches the wire and lands nowhere.
+	if sessionID == "" {
+		return nil, false
+	}
+	payload, err := json.Marshal(protocol.TransferFailurePayload{
+		SessionID:    sessionID,
+		ErrorCode:    v.Code,
+		ErrorMessage: v.Message,
+	})
+	if err != nil {
+		return nil, false
+	}
+	envBytes, err := json.Marshal(protocol.ControlEnvelope{
+		Version:    1,
+		TraceID:    uuid.NewString(),
+		Action:     protocol.ActionTransferFailure,
+		FromDevice: fromDevice,
+		ToDevice:   toDevice,
+		Timestamp:  time.Now().UnixMilli(),
+		Payload:    payload,
+	})
+	if err != nil {
+		return nil, false
+	}
+	return envBytes, true
+}
+
+// rejectToSelf sends a TRANSFER_FAILURE back over the connection the refused
+// message arrived on.
+//
+// This deliberately does not go through routeToPeer: that helper delivers to
+// env.ToDevice, which for an OFFER is the *receiver*. Routing a rejection
+// there would tell the wrong device that its file is too large while the
+// sender kept waiting — leaving the very hang being fixed in place, now with a
+// misleading message attached.
+//
+// Delivery is best-effort: session.Send enqueues onto the connection's
+// 256-slot SendChan and drops the message if that queue is full, which is why
+// the failure to enqueue is logged below. Writing to the socket directly would
+// not be an improvement — the write pump goroutine owns this connection and
+// coder/websocket forbids concurrent writes, so bypassing the queue would
+// trade a dropped message for a data race. If a rejection ever must not be
+// dropped, the answer is a policy for a full queue (closing the connection,
+// say), not a second writer.
+func (h *ControlWSHandler) rejectToSelf(session *registry.DeviceSession, sessionID string, v *limits.Violation) {
+	envBytes, ok := buildFailure("server", session.DeviceID, sessionID, v)
+	if !ok {
+		// Reachable when the payload was too broken to yield a session_id. The
+		// sender's card stays pending in that case; it is a known, accepted
+		// edge (only an out-of-spec client can produce it) and is logged so it
+		// is not mistaken for a missing feature.
+		slog.Warn("cannot deliver limit rejection: no session_id in payload",
+			"device", session.DeviceID, "code", v.Code)
+		return
+	}
+	if !session.Send(envBytes) {
+		slog.Warn("failed to deliver limit rejection to sender (queue full)",
+			"device", session.DeviceID, "code", v.Code)
+	}
+}
+
+// rejectToPeer sends a TRANSFER_FAILURE to the other party of a session.
+//
+// Used for the ANSWER path, where refusing the transfer must also unstick the
+// peer: by the time an answer is sent the receiver has already recorded its own
+// in-progress row, and the sender is still waiting on a reply that will now
+// never carry a token.
+func (h *ControlWSHandler) rejectToPeer(session *registry.DeviceSession, peerDevice, sessionID string, v *limits.Violation) {
+	if peerDevice == "" {
+		return
+	}
+	target, ok := h.registry.Get(peerDevice)
+	if !ok {
+		slog.Debug("peer offline for limit rejection", "to_device", peerDevice)
+		return
+	}
+	if target.AccountID != session.AccountID {
+		slog.Warn("cross-account limit rejection blocked", "from", session.AccountID, "to_device", peerDevice)
+		return
+	}
+	envBytes, ok := buildFailure("server", peerDevice, sessionID, v)
+	if !ok {
+		return
+	}
+	if !target.Send(envBytes) {
+		slog.Warn("failed to deliver limit rejection to peer (queue full)",
+			"to_device", peerDevice, "code", v.Code)
+	}
+}
+
+// salvageSessionID makes one lenient attempt to read session_id out of a
+// payload that failed strict decoding.
+//
+// The common malformed case is structurally valid JSON whose fields have the
+// wrong shape; session_id usually survives that, and recovering it is the
+// difference between a rejection the user sees and one that vanishes. When
+// even this fails the caller logs and gives up.
+func salvageSessionID(payload []byte) string {
+	var minimal struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.Unmarshal(payload, &minimal); err != nil {
+		return ""
+	}
+	return minimal.SessionID
 }
 
 // routeToPeer routes a control message to target peer and logs drops (P1-1).

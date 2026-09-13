@@ -7,7 +7,7 @@ use crate::commands::settings_cmd::AppSettings;
 use crate::core::cache_manager::CacheManager;
 use crate::core::connection_actor::ConnectionConfig;
 use crate::core::transfer_engine::{TransferEngine, TransferSource};
-use crate::protocol::{ControlEnvelope, OnlineDevice, TransferOfferPayload};
+use crate::protocol::{ControlEnvelope, OnlineDevice, ServerLimits, TransferOfferPayload};
 
 /// 应用版本的唯一事实源，编译期取自 Cargo.toml 的 `version`。
 ///
@@ -30,6 +30,13 @@ pub struct AppState {
     pub pending_outbound: Arc<Mutex<HashMap<String, (TransferOfferPayload, TransferSource)>>>,
     pub config_actor: Arc<RwLock<ConnectionConfig>>,
     pub reconnect_notify: Arc<Notify>,
+
+    /// 服务端在 AUTH_RESPONSE 里下发的传输限额。
+    ///
+    /// `None` 有两种来源，行为相同：尚未连上，或对端是不发这个字段的老服务端。
+    /// 两种情况都**不做本地预检**，沿用 `clipboard_cmd` 里的兜底常量——
+    /// 绝不能当成「无限制」或「全部为 0」来用。
+    pub server_limits: Arc<Mutex<Option<ServerLimits>>>,
 }
 
 impl AppState {
@@ -62,6 +69,7 @@ impl AppState {
             pending_outbound: Arc::new(Mutex::new(HashMap::new())),
             config_actor,
             reconnect_notify,
+            server_limits: Arc::new(Mutex::new(None)),
         }
     }
 }

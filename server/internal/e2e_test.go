@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/unidrop/unidrop-server/internal/auth"
 	"github.com/unidrop/unidrop-server/internal/controller"
+	"github.com/unidrop/unidrop-server/internal/limits"
 	"github.com/unidrop/unidrop-server/internal/protocol"
 	"github.com/unidrop/unidrop-server/internal/registry"
 	"github.com/unidrop/unidrop-server/internal/relay"
@@ -37,7 +38,7 @@ func TestEndToEndTransfer(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", controller.HealthHandler(reg, relayMgr))
-	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, reg, relayMgr))
+	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, reg, relayMgr, limits.FromEnv()))
 	mux.Handle("GET /ws/data", controller.NewDataWSHandler(relayMgr))
 
 	server := httptest.NewServer(mux)

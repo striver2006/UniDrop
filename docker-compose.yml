@@ -16,6 +16,16 @@ services:
       - UNIDROP_PSK_SECRET=change-this-to-a-very-strong-secret-key-12345
       - UNIDROP_STUN_ADDR=:3478
       - UNIDROP_HEARTBEAT_TIMEOUT=45
+      # 传输限额。全部注释掉 = 全部取默认值，与不配置时行为一致。
+      # 单位为字节，1 MB = 1024×1024；设为 0 表示关闭该项限制。
+      # 填错（非数字、负数）会退回默认值并打 warn，不会静默变成 0。
+      # 完整说明见 server/configs/.env.example。
+      #- UNIDROP_MAX_SINGLE_FILE_BYTES=134217728      # 128 MB，仅对文件生效
+      #- UNIDROP_MAX_TOTAL_TRANSFER_BYTES=268435456   # 256 MB，对所有类型生效
+      #- UNIDROP_MAX_CLIPBOARD_IMAGE_BYTES=67108864   # 64 MB
+      #- UNIDROP_MAX_CLIPBOARD_TEXT_BYTES=4194304     # 4 MB
+      #- UNIDROP_MAX_ITEMS_PER_OFFER=64               # 一次最多选几个文件，调大前见 .env.example
+      #- UNIDROP_MAX_CONCURRENT_TRANSFERS=8           # 单账号并发，按自报 account_id 计数
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/healthz"]
       interval: 30s

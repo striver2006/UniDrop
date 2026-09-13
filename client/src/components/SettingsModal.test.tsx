@@ -7,14 +7,13 @@ import { invoke, invokeResults, resetTauriMock } from "../test/tauri-mock";
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 
 import { SettingsModal } from "./SettingsModal";
-import { AppSettings } from "../types";
+import { AppSettings, ServerLimits } from "../types";
 
 const baseSettings: AppSettings = {
   server_url: "wss://example.com:58921",
   account_id: "alice",
   psk_secret: "secret",
   auto_inject: false,
-  rate_limit_mb: 10,
   start_minimized: false,
   history_max_entries: 100,
   transfer_card_retain_secs: 30,
@@ -23,7 +22,10 @@ const baseSettings: AppSettings = {
   cache_sweep_interval_minutes: 60,
 };
 
-function setup(settings: Partial<AppSettings> = {}) {
+function setup(
+  settings: Partial<AppSettings> = {},
+  serverLimits: ServerLimits | null = null
+) {
   invokeResults["cmd_get_autostart"] = false;
   const onSave = vi.fn().mockResolvedValue(undefined);
   render(
@@ -32,10 +34,20 @@ function setup(settings: Partial<AppSettings> = {}) {
       isOpen
       onClose={vi.fn()}
       onSave={onSave}
+      serverLimits={serverLimits}
     />
   );
   return { onSave, user: userEvent.setup() };
 }
+
+const limitsFixture: ServerLimits = {
+  max_single_file_bytes: 128 * 1024 * 1024,
+  max_total_transfer_bytes: 256 * 1024 * 1024,
+  max_clipboard_image_bytes: 64 * 1024 * 1024,
+  max_clipboard_text_bytes: 4 * 1024 * 1024,
+  max_items_per_offer: 64,
+  max_concurrent_transfers: 8,
+};
 
 const retainInput = () => screen.getByLabelText("完成任务在界面保持秒数");
 const ttlInput = () => screen.getByLabelText("缓存保留小时数");
@@ -123,7 +135,7 @@ describe("设置面板的数值校验", () => {
     expect(screen.getByText(/超出上限 4294967295/)).toBeInTheDocument();
   });
 
-  // ---------- 磁盘缓存清理（需求 9） ----------
+  // ---------- 磁盘缓存清理（需求 8） ----------
 
   it("三个缓存字段正常提交", async () => {
     const { onSave, user } = setup();
@@ -214,5 +226,47 @@ describe("设置面板的数值校验", () => {
     await user.click(submit());
 
     expect(onSave).not.toHaveBeenCalled();
+  });
+});
+
+// ---------- 服务端限额只读展示（需求 3） ----------
+
+describe("服务端限额只读展示（需求 3）", () => {
+  beforeEach(() => resetTauriMock());
+
+  it("未下发时显示「未下发」，而不是 0，也不是默认值", () => {
+    setup({}, null);
+
+    expect(screen.getByText(/未下发/)).toBeInTheDocument();
+    // 不得拿默认值顶上——那会让用户以为这就是实际生效的值
+    expect(screen.queryByText("128.0 MB")).not.toBeInTheDocument();
+  });
+
+  it("下发后按可读单位展示各项", () => {
+    setup({}, limitsFixture);
+
+    expect(screen.getByText("128.0 MB")).toBeInTheDocument();
+    expect(screen.getByText("256.0 MB")).toBeInTheDocument();
+    expect(screen.getByText("64.0 MB")).toBeInTheDocument();
+    expect(screen.getByText("4.0 MB")).toBeInTheDocument();
+    expect(screen.getByText("64")).toBeInTheDocument();
+  });
+
+  it("某项为 0 时显示「不限制」——显示 0 会被读成配额为零，语义正好相反", () => {
+    setup({}, { ...limitsFixture, max_single_file_bytes: 0, max_items_per_offer: 0 });
+
+    expect(screen.getAllByText("不限制")).toHaveLength(2);
+    expect(screen.queryByText("0 B")).not.toBeInTheDocument();
+  });
+
+  it("只读分区不产生可提交字段，保存时不污染 payload", async () => {
+    const { onSave, user } = setup({}, limitsFixture);
+
+    await user.click(submit());
+
+    expect(onSave).toHaveBeenCalledTimes(1);
+    const submitted = onSave.mock.calls[0][0];
+    expect(submitted).not.toHaveProperty("max_single_file_bytes");
+    expect(submitted).not.toHaveProperty("rate_limit_mb");
   });
 });

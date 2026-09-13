@@ -22,6 +22,10 @@ var (
 	ErrPipeNotFound   = errors.New("relay pipe expired or not found")
 	ErrUnauthorized   = errors.New("unauthorized data session")
 	ErrDeviceMismatch = errors.New("device does not match authorized session participant")
+
+	// ErrConcurrencyLimit is returned when an account already has the maximum
+	// number of authorized-but-unfinished transfers.
+	ErrConcurrencyLimit = errors.New("account transfer concurrency limit reached")
 )
 
 // SessionAuth represents authorization for an upcoming data plane session.
@@ -63,14 +67,46 @@ func (m *RelayManager) AckBufferPool() *AckBufferPool {
 	return m.ackBufferPool
 }
 
-// AuthorizeSession generates a secure token for an agreed transfer session (P0-1, P2-7).
+// AuthorizeSession generates a secure token for an agreed transfer session (P0-1, P2-7),
+// without applying any per-account concurrency limit.
 func (m *RelayManager) AuthorizeSession(sessionID, senderDevice, receiverDevice, accountID string, ttl time.Duration) (string, error) {
+	token, _, err := m.AuthorizeSessionIfUnderLimit(sessionID, senderDevice, receiverDevice, accountID, ttl, 0)
+	return token, err
+}
+
+// AuthorizeSessionIfUnderLimit counts the account's in-flight transfers,
+// refuses when that count has reached maxConcurrent, and otherwise mints a
+// token — all three inside a single write lock.
+//
+// The atomicity is the point. Counting under RLock and then authorizing under
+// a separate Lock leaves a window where two connections of the same account
+// both observe "one slot left", both pass, and both get authorized. Each
+// control connection runs its own read loop goroutine, so a single client
+// driving several devices — precisely what this limit exists to contain —
+// hits that window rather than merely being able to. The global pipe cap is a
+// distant second line, not a substitute.
+//
+// maxConcurrent <= 0 disables the check.
+//
+// Returns the minted token and the in-flight count observed. On refusal it
+// returns ErrConcurrencyLimit along with that count, so the caller can tell
+// the user how many transfers are already running.
+func (m *RelayManager) AuthorizeSessionIfUnderLimit(
+	sessionID, senderDevice, receiverDevice, accountID string,
+	ttl time.Duration,
+	maxConcurrent int,
+) (string, int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	inFlight := m.countAuthorizedForAccountLocked(accountID, sessionID, time.Now())
+	if maxConcurrent > 0 && inFlight >= maxConcurrent {
+		return "", inFlight, ErrConcurrencyLimit
+	}
+
 	tokenBytes := make([]byte, 24)
 	if _, err := rand.Read(tokenBytes); err != nil {
-		return "", err
+		return "", inFlight, err
 	}
 	token := hex.EncodeToString(tokenBytes)
 
@@ -83,7 +119,38 @@ func (m *RelayManager) AuthorizeSession(sessionID, senderDevice, receiverDevice,
 		ExpiresAt:      time.Now().Add(ttl),
 	}
 
-	return token, nil
+	return token, inFlight, nil
+}
+
+// countAuthorizedForAccountLocked counts an account's transfers that are
+// authorized and not yet finished. The caller must hold m.mu.
+//
+// authSessions is the right set to count, not pipes: a pipe is only created
+// once both peers have connected to /ws/data, so counting pipes would miss
+// every transfer that has been granted a token but has not started moving
+// bytes — exactly the window a client would sit in while opening many
+// transfers at once. Entries leave this map through RemovePipe (on
+// COMPLETE/FAILURE/CANCEL), through SweepIdlePipes, or by expiry.
+//
+// excludeSessionID keeps a re-authorization of an already-tracked session from
+// counting itself and being refused its own retry.
+//
+// The linear scan is deliberate: the map is bounded by the 5 minute TTL and
+// swept every 10 seconds, so it holds tens of entries and a scan costs
+// microseconds. A per-account counter would be O(1) but adds an invariant that
+// has to be decremented correctly on all three removal paths — more ways to be
+// silently wrong than this is worth.
+func (m *RelayManager) countAuthorizedForAccountLocked(accountID, excludeSessionID string, now time.Time) int {
+	count := 0
+	for id, auth := range m.authSessions {
+		if id == excludeSessionID || auth.AccountID != accountID {
+			continue
+		}
+		if now.Before(auth.ExpiresAt) {
+			count++
+		}
+	}
+	return count
 }
 
 // HasAuthSessions returns whether any authorization sessions are tracked.

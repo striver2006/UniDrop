@@ -9,7 +9,6 @@ pub struct AppSettings {
     pub account_id: String,
     pub psk_secret: String,
     pub auto_inject: bool,
-    pub rate_limit_mb: u32,
     /// 启动时不弹出主窗口，仅在托盘常驻。对手动启动与开机自启同样生效。
     ///
     /// `#[serde(default)]` 不可删除：整份设置以一条 JSON 存在 SQLite 的
@@ -93,7 +92,6 @@ impl AppSettings {
             account_id: "default_user".to_string(),
             psk_secret: "dev-insecure-psk-secret".to_string(),
             auto_inject: false,
-            rate_limit_mb: 10,
             start_minimized: false,
             history_max_entries: DEFAULT_HISTORY_MAX_ENTRIES,
             transfer_card_retain_secs: DEFAULT_TRANSFER_CARD_RETAIN_SECS,
@@ -246,8 +244,20 @@ pub async fn cmd_set_autostart(app: AppHandle, enabled: bool) -> Result<(), Stri
 mod tests {
     use super::*;
 
-    /// 老库里的 JSON 没有 start_minimized 字段。本测试守护的是
-    /// `#[serde(default)]`：删掉它，这里会红，而不是等到用户配置被静默冲掉。
+    /// 老库里的 JSON 没有 start_minimized 字段，却**有**已被删除的
+    /// rate_limit_mb 字段。本测试同时守护两个方向：
+    ///
+    /// - 缺字段：`#[serde(default)]` 删掉的话这里会红，而不是等到用户配置被静默冲掉；
+    /// - 多字段：serde 默认忽略未知键，所以删掉 rate_limit_mb 之后老 JSON 仍能读。
+    ///
+    /// **fixture 里的 rate_limit_mb 是故意留着的，不要"顺手清理"**——
+    /// 删掉它这条测试就不再覆盖「多出一个已删字段」这一半了。
+    ///
+    /// 注意「删字段安全」只对**升级**方向成立。反过来，用户若回滚到旧版客户端，
+    /// 新客户端写出的 JSON 里没有 rate_limit_mb，而旧结构体那个字段没有
+    /// `#[serde(default)]`，整条反序列化会失败并走 lib.rs 的 unwrap_or_else
+    /// 静默回落全部默认值，把 server_url / account_id / psk_secret 一起冲掉。
+    /// 本项目发签名 dmg，版本回退是现实场景——降级前应导出设置。
     #[test]
     fn legacy_settings_json_deserializes_without_data_loss() {
         let legacy = r#"{
@@ -265,7 +275,6 @@ mod tests {
         assert_eq!(parsed.account_id, "alice");
         assert_eq!(parsed.psk_secret, "user-configured-secret");
         assert!(parsed.auto_inject);
-        assert_eq!(parsed.rate_limit_mb, 42);
         assert!(!parsed.start_minimized, "缺失的新字段应取默认值 false");
 
         // 这两条守护的是 #[serde(default = "...")] 而不是裸 #[serde(default)]：
@@ -357,7 +366,6 @@ mod tests {
         assert_eq!(parsed.account_id, settings.account_id);
         assert_eq!(parsed.psk_secret, settings.psk_secret);
         assert_eq!(parsed.auto_inject, settings.auto_inject);
-        assert_eq!(parsed.rate_limit_mb, settings.rate_limit_mb);
         assert!(parsed.start_minimized);
         assert_eq!(parsed.history_max_entries, settings.history_max_entries);
         assert_eq!(parsed.transfer_card_retain_secs, settings.transfer_card_retain_secs);

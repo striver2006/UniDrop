@@ -11,7 +11,6 @@ export interface AppSettings {
   account_id: string;
   psk_secret: string;
   auto_inject: boolean;
-  rate_limit_mb: number;
   /** 启动时不弹出主窗口，仅托盘常驻。对手动启动与开机自启同样生效。 */
   start_minimized: boolean;
   /** 传输历史最多保留的条数，超出的最旧记录连同缓存文件一起删除；0 = 不限制。 */
@@ -24,6 +23,19 @@ export interface AppSettings {
   cache_max_size_mb: number;
   /** 后台清理间隔（分钟），最小 1。 */
   cache_sweep_interval_minutes: number;
+}
+
+/**
+ * 服务端下发的传输限额（只读）。由部署者在服务端环境变量配置，客户端改不了。
+ * 任一项为 0 表示该项不限制。
+ */
+export interface ServerLimits {
+  max_single_file_bytes: number;
+  max_total_transfer_bytes: number;
+  max_clipboard_image_bytes: number;
+  max_clipboard_text_bytes: number;
+  max_items_per_offer: number;
+  max_concurrent_transfers: number;
 }
 
 export interface ActiveTransfer {

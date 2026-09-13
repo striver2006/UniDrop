@@ -14,6 +14,7 @@ import (
 	"github.com/unidrop/unidrop-server/internal/auth"
 	"github.com/unidrop/unidrop-server/internal/config"
 	"github.com/unidrop/unidrop-server/internal/controller"
+	"github.com/unidrop/unidrop-server/internal/limits"
 	"github.com/unidrop/unidrop-server/internal/registry"
 	"github.com/unidrop/unidrop-server/internal/relay"
 	"github.com/unidrop/unidrop-server/internal/stun"
@@ -37,6 +38,9 @@ func main() {
 		slog.Error("failed to initialize auth verifier", "error", err)
 		os.Exit(1)
 	}
+
+	transferLimits := limits.FromEnv()
+	limits.LogSummary(transferLimits)
 
 	devRegistry := registry.NewDeviceRegistry()
 	relayManager := relay.NewRelayManager()
@@ -74,7 +78,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", controller.HealthHandler(devRegistry, relayManager))
 	mux.HandleFunc("GET /metrics", controller.MetricsHandler(devRegistry, relayManager))
-	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, devRegistry, relayManager))
+	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, devRegistry, relayManager, transferLimits))
 	mux.Handle("GET /ws/data", controller.NewDataWSHandler(relayManager))
 
 	server := &http.Server{

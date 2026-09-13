@@ -267,6 +267,26 @@ pub fn run() {
                                 .map(|s| s.to_string());
 
                             if let Some(sid) = session_id {
+                                // 失败是这个会话的终点，两侧待处理队列都必须释放。
+                                //
+                                // 改造前两个 map 都只在 TRANSFER_ANSWER 带 token 的那条
+                                // 路径上被删除，失败路径完全不碰。本轮让服务端主动拒绝成为
+                                // 常规路径（超限即拒），这条泄漏随之从罕见变高频。
+                                //
+                                // **两个都要删，不是只删 pending_outbound。** 并发超限的
+                                // 拒绝是**双向**的：服务端拒掉 ANSWER 后既不授权也不转发，
+                                // 于是 token 回显——pending_inbound 唯一的删除点——永远不会
+                                // 发生，接收端那份含完整 items 的 offer 会永久留在 map 里。
+                                //
+                                // 无条件双删而不判断本机是发送方还是接收方：
+                                // HashMap::remove 对不存在的 key 是 no-op，而那个判断本身
+                                // 才是出错的来源。
+                                {
+                                    let state = app_handle.state::<AppState>();
+                                    state.pending_outbound.lock().await.remove(&sid);
+                                }
+                                pending_inbound_ref.lock().await.remove(&sid);
+
                                 let brief = {
                                     let state = app_handle.state::<AppState>();
                                     let conn = state.db_conn.lock().await;
@@ -313,6 +333,18 @@ pub fn run() {
                                 if !resp.success {
                                     let _ = app_handle.emit("auth-failed", resp.error_message);
                                 } else {
+                                    // 存下服务端下发的限额，供发送前本地预检与设置面板展示。
+                                    //
+                                    // resp.limits 为 None（老服务端不发这个字段）时**原样存 None**，
+                                    // 不要 unwrap_or_default() —— 那会变成一组全 0，而 0 在这里
+                                    // 表示「不限制」，等于在老服务端上把限额整组关掉。
+                                    // None 的含义是「未知」，由发送端退回兜底常量处理。
+                                    {
+                                        let state = app_handle.state::<AppState>();
+                                        let mut slot = state.server_limits.lock().await;
+                                        *slot = resp.limits.clone();
+                                    }
+                                    let _ = app_handle.emit("server-limits-updated", &resp.limits);
                                     let _ = app_handle.emit("auth-success", ());
                                 }
                             }
@@ -480,6 +512,7 @@ pub fn run() {
             commands::cmd_list_history,
             commands::cmd_save_transfer_as,
             commands::cmd_reveal_session,
+            commands::cmd_get_server_limits,
         ])
         .build(tauri::generate_context!())
         .expect("error while building UniDrop application")

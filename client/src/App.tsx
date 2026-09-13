@@ -12,7 +12,7 @@ import {
   AlertCircle,
   X,
 } from "lucide-react";
-import { OnlineDevice, AppSettings, ActiveTransfer } from "./types";
+import { OnlineDevice, AppSettings, ActiveTransfer , ServerLimits } from "./types";
 import { DeviceList } from "./components/DeviceList";
 import { TransferProgress } from "./components/TransferProgress";
 import { SettingsModal } from "./components/SettingsModal";
@@ -24,7 +24,6 @@ const defaultSettings: AppSettings = {
   account_id: "default_user",
   psk_secret: "dev-insecure-psk-secret",
   auto_inject: false,
-  rate_limit_mb: 10,
   start_minimized: false,
   // 与 Rust 侧 AppSettings::default_config() 必须保持一致（两份独立字面量）
   history_max_entries: 100,
@@ -43,6 +42,9 @@ export const App: React.FC = () => {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [selectedDeviceForSend, setSelectedDeviceForSend] = useState<OnlineDevice | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
+  // 服务端下发的限额。null = 尚未拿到（未连接，或老服务端不发这个字段）。
+  // 不要用默认值顶上——那会让用户以为看到的就是实际生效的值。
+  const [serverLimits, setServerLimits] = useState<ServerLimits | null>(null);
   const [notification, setNotification] = useState<{
     type: "info" | "success" | "error";
     text: string;
@@ -105,6 +107,10 @@ export const App: React.FC = () => {
         s.server_url = "wss://drop.yourdomain.com:58921";
       }
       setSettings(s);
+
+      // 事件是推送来的，打开设置面板时可能早已错过，所以这里主动补拉一次。
+      const limits = await invoke<ServerLimits | null>("cmd_get_server_limits");
+      setServerLimits(limits);
     } catch (err: any) {
       console.error("fetch initial data error:", err);
       showNotification(typeof err === "string" ? err : "拉取初始状态失败", "error");
@@ -183,7 +189,12 @@ export const App: React.FC = () => {
       setIsSettingsOpen(true);
     });
 
+    const unlistenLimitsPromise = listen<ServerLimits | null>("server-limits-updated", (event) => {
+      setServerLimits(event.payload ?? null);
+    });
+
     return () => {
+      unlistenLimitsPromise.then((unlisten) => unlisten());
       unlistenDevicesPromise.then((unlisten) => unlisten());
       unlistenAuthPromise.then((unlisten) => unlisten());
       unlistenAuthSuccessPromise.then((unlisten) => unlisten());
@@ -391,6 +402,7 @@ export const App: React.FC = () => {
           isOpen={isSettingsOpen}
           onClose={() => setIsSettingsOpen(false)}
           onSave={handleSaveSettings}
+          serverLimits={serverLimits}
         />
       )}
 
