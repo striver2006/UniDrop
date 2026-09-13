@@ -67,6 +67,19 @@ UniDrop 与传统文件传输工具（如网盘、微信文件传输助手、隔
      但**加密的对端是谁不再有保证**。
    * 若升级后突然连不上，且界面提示「无法验证服务器证书」，说明你的部署属于
      上述三类之一。首选做法是给服务器换一张受信任的证书，其次才是勾选此项。
+   * **自签证书必须是 X.509 v3 且带 SAN 扩展**，否则即使勾选了本项也连不上——
+     客户端在解析阶段就会拒绝 v1 证书，那一步早于「是否校验签发者」的判断。
+     macOS 自带的 LibreSSL 用 `openssl req -x509` 默认生成的正是 v1，需要显式加
+     扩展：
+
+     ```bash
+     openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
+       -days 365 -nodes -subj "/CN=your.host" \
+       -addext "subjectAltName=DNS:your.host,IP:1.2.3.4"
+     ```
+
+     用 `openssl x509 -in cert.pem -noout -text | grep Version` 确认输出是
+     `Version: 3 (0x2)`。
 5. **静默自动装载剪贴板**（强烈推荐勾选）：
    * 开启后，远端传来的文件一经下载核验完成，无需手动点击，直接写入本地系统剪贴板。
 6. 点击 **“保存配置”**，客户端将即时热更新配置并自动重新建立安全连接，无需重启客户端。

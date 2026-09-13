@@ -93,11 +93,22 @@ impl rustls::client::danger::ServerCertVerifier for InsecureServerCertVerifier {
 /// 改造前这里**无条件**装载那个跳过校验的 verifier，也就是说即便连的是
 /// `wss://`，中间人也照样能接管连接。默认走真实校验是本轮的目的之一。
 pub fn create_tls_connector(allow_insecure: bool) -> Option<tokio_tungstenite::Connector> {
+    // 两档都要装 provider，即便默认档马上就 return None。
+    //
+    // 返回 None 之后由 tokio-tungstenite 自己构建 ClientConfig，而 rustls 0.23
+    // 在依赖树里同时存在 ring 与 aws-lc-rs 时（本项目正是如此）无法自动选定
+    // provider，会直接 panic 而不是返回 Err——发生在连接 actor 的 task 里，
+    // 整个重连循环就此死掉。
+    //
+    // 今天 lib.rs 的 run() 开头已经装过一次，所以这行是冗余的；写在这里是因为
+    // 默认档不该依赖一个远在别处的副作用才能不 panic。insecure 档本来就自带
+    // 初始化，只有默认档赤裸着——而它恰恰是绝大多数用户走的那条路。
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     if !allow_insecure {
         return None;
     }
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()

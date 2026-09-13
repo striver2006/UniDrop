@@ -162,3 +162,44 @@ client:  cargo test           78 passed
 但仍是一处未经验证的假设。同理，**默认档（传 `None` 的 connector）是否真的
 执行了 webpki 校验，本轮没有用自签证书实机验证过**——若该假设不成立，
 整个范围 B 等于没做。这是目前最值得补一次手工验证的地方。
+
+## 5. 审批后的实机验证与补充改动（**并入下一轮审查**）
+
+> 本节记录的改动发生在 code 阶段**审批之后**，因此不在本轮双审的快照里。
+> 用户已决定不为此单开一轮复审，而是并入下一轮（历史 / 缓存按账号分区）一起审。
+> 下一轮的审查员看到这两处时，它们不是来路不明的漂移。
+
+§4 列为「最值得补一次手工验证」的那条已经验证完毕：用自签证书起本地 TLS
+服务端 + badssl.com 的公网端点，对两档各跑一遍。
+
+**结论：范围 B 的核心假设成立。** 服务端日志是决定性证据：
+
+| 档位 | 服务端 | 客户端 |
+| :--- | :--- | :--- |
+| 默认（connector=None） | `HANDSHAKE REJECTED BY PEER: TLSV1_ALERT_UNKNOWN_CA` | `invalid peer certificate: UnknownIssuer` |
+| 不安全（Rustls + Insecure verifier） | `HANDSHAKE OK TLSv1.3 TLS_AES_256_GCM_SHA384` | 过 TLS，止步于 WS 握手（预期行为） |
+
+默认档对四种无效证书全部拒绝：self-signed / expired / wrong-host
+（badssl.com）加本地自签。顺带解答了两侧都列为盲区的那条——
+`is_cert_error()` 对这四种错误文本**全部命中**，没有漏判。
+
+验证过程中我出过两次错，记下来因为它们都是方法论问题：
+
+1. 一度断言「默认档没有拒绝自签证书，范围 B 等于没做」。那是假的：
+   `openssl s_server`（LibreSSL 3.3.6）与 rustls 0.23 协商不上，握手卡住，
+   而我的探测程序把 8 秒超时写成了「TLS 握手已通过」。**用超时推断握手成功
+   是错误的判据**，换成 Python 的 ssl 服务端后真相才出来。
+2. 一度报告「默认档会 panic，真实客户端一样会发生」。前半对、后半错：
+   `lib.rs:47` 在 `run()` 开头就装了 CryptoProvider，是我的验证程序缺了这一步。
+
+**两处补充改动**：
+
+- `client/src-tauri/src/core/connection_actor.rs`：`install_default()` 移到
+  两档都覆盖的位置。今天它是冗余的（`lib.rs` 已装），但默认档不该依赖一个
+  远在别处的副作用才能不 panic——而默认档恰恰是绝大多数用户走的那条路。
+  rustls 0.23 在 ring 与 aws-lc-rs 共存时（本项目正是）无法自动选定 provider，
+  失败形态是 panic 而不是 Err，发生在连接 actor 的 task 里会让整个重连循环死掉。
+- `docs/USER_GUIDE.md`：补上一条实测发现——**自签证书必须是 X.509 v3 且带
+  SAN**，否则勾选「允许不安全连接」也连不上。rustls 在**解析阶段**就拒绝 v1
+  证书，那一步早于「是否校验签发者」的判断，所以开关对它无效。macOS 自带
+  LibreSSL 的 `openssl req -x509` 默认生成的正是 v1，文档给出了带扩展的正确命令。
