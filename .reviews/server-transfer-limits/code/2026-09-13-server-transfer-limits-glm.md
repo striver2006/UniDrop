@@ -1,0 +1,169 @@
+---
+schema: trivium.review.v1
+topic: server-transfer-limits
+stage: code
+role: glm
+vendor: zcode
+agent_cli: zcode/0.16.5
+model_requested: GLM-5.3
+model_effective: bigmodel-coding-plan/GLM-5.3
+model_effective_source: trace
+model_route: config_copy
+run_id: 20260913T065303Z
+rerun_index: 1
+snapshot_hash: sha256:33a6d8830f252c9cdba05ad31a86befcf9d53c197c4cc857b5a5fd7628f0d905
+blind: true
+started_at: 2026-09-13T06:53:05.071Z
+finished_at: 2026-09-13T07:00:31.086Z
+duration_s: 446
+tool_calls:
+  read: 11
+  grep: 5
+  glob: 0
+  run_command: 0
+  project_reads: 12
+evidence_ok: true
+verdict: approve-with-nits
+findings_count:
+  blocker: 0
+  major: 0
+  minor: 3
+  nit: 2
+degraded: false
+parse_fallback: false
+peer_deny: false
+drift: false
+consulted_unverified: true
+heterogeneous: true
+session_id: sess_3a3b74f2-be13-4294-bd8d-7ba1efa1c54e
+---
+
+# 代码审查：server-transfer-limits
+
+> Critic-B · 智谱 ZCode ｜ 模型 `bigmodel-coding-plan/GLM-5.3`
+> ｜ 运行 `20260913T065303Z`
+
+> ⚠️ **路径级 deny 未生效**：本机该侧 CLI 不支持路径级读取拒绝，对方历史产出的屏蔽仅依赖任务书禁读清单与事后轨迹核验。
+
+## 总判断
+
+最值得处理的一条：按账号并发上限的计数与铸 token 不在同一把锁下（GLM-01），同账号多设备同时接受传输可越过配置的上限，属容量保护层面的有界超调。其次：本轮修了 pending_outbound 的失败清理，但对称的 pending_inbound 在新增的并发拒绝路径上必然泄漏（GLM-02）；ANSWER 并发拒绝的双向回送——恰是注释自认最容易接反的机关——没有任何测试钉住（GLM-04）。另有两条注释与实现/事实不符（GLM-03/05）。开发者点名的其余焦点核实无误：env 三态解析、None 退化路径与兜底常量独立、预检在哈希与 dispatch 之前、目录/不可读跳过口径与 prepare_offer 一致、OFFER 拒绝回送发送方且不转发。
+
+**结论**：`approve-with-nits`
+
+## 审查意见（共 5 条：次要 3 ｜ 吹毛求疵 2）
+
+### GLM-01 · 次要（minor）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `server/internal/controller/control_ws.go:303-319; server/internal/relay/relay_manager.go:67-121` |
+| 类别 | concurrency ｜ 层次 code |
+| 置信度 | high |
+
+**问题**：并发上限的检查与授权不是原子的。CountAuthorizedForAccount 只在 RLock 下计数（relay_manager.go:107-121），锁释放后才调用 ConcurrentViolation 判定，AuthorizeSession 又在另一把 m.mu.Lock 下铸 token（relay_manager.go:67-87）。同一账号两台接收设备的两个连接各自有独立读循环 goroutine（control_ws.go ServeHTTP 每连接一个），可以同时读到 inFlight=7、同时通过判定、同时授权，最终在途 9 个，超过配置的 8。单连接内部串行所以单设备不自竞争，但跨连接窗口必然存在；这正是该配置项要防的场景（一个失控客户端多设备并发开传输），全局 200 管道上限只是遥远的第二道闸。
+
+**依据**：control_ws.go:303（计数）→ :304（判定）→ :313（AuthorizeSession，另一次独立加锁）；relay_manager.go:107-121 计数只持 RLock，:67-87 授权持 Lock，两段之间无共同临界区。读自 server/internal/controller/control_ws.go 与 server/internal/relay/relay_manager.go 全文。
+
+**建议**：把「按账号计数 + 判定 + 铸 token」折叠为 RelayManager 的一个方法，在同一把 m.mu.Lock 内完成；limits 不必引入 relay，把 maxConcurrent 作为参数传入，由 manager 返回 token 或拒绝，controller 只消费结果。
+
+### GLM-02 · 次要（minor）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `client/src-tauri/src/lib.rs:269-280` |
+| 类别 | correctness ｜ 层次 code |
+| 置信度 | high |
+
+**问题**：本轮给 TRANSFER_FAILURE 分支补了 pending_outbound 清理，但对称的 pending_inbound 没有清。接收端收到 TRANSFER_OFFER 时插入 pending_inbound（lib.rs:185），唯一删除点是 token 回显路径（lib.rs:226-229）。新增的并发拒绝路径恰恰保证 token 回显永远不会发生：服务端拒掉 ANSWER 后 continue，既不授权也不转发（control_ws.go:303-311），于是接收端的 (offer, sender_device) 条目永久留在 map 里。用户可见面（卡片、历史）会被翻成 FAILED 收尾，泄漏只在内存里，但每次被并发拒绝的接收都留一份含完整 items 的 offer。
+
+**依据**：lib.rs:185（插入）、lib.rs:226-229（唯一删除点，仅在拿到 token 时）、lib.rs:276-280（失败分支只 remove pending_outbound）；control_ws.go:303-311（拒绝后无 AuthorizeSession、无回显）。读自 client/src-tauri/src/lib.rs 与 server/internal/controller/control_ws.go。
+
+**建议**：在 TRANSFER_FAILURE 分支里对同一 session_id 同时 remove pending_inbound（HashMap::remove 对不存在的 key 是 no-op，发送/接收两个方向可以无条件双清）。
+
+### GLM-04 · 次要（minor）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `server/internal/controller/limits_ws_test.go; server/internal/relay/relay_manager.go:107` |
+| 类别 | test-gap ｜ 层次 code |
+| 置信度 | high |
+
+**问题**：ANSWER 并发拒绝路径完全没有测试。limits_ws_test.go 的五个用例全部在 OFFER 路径（含方向断言），但并发拒绝「rejectToSelf 打给接收方、rejectToPeer 打给发送方」这个方向恰好相反的机关——control_ws.go:298-302 的注释自己都说复错助手会把拒绝信发错人——没有任何一条测试钉住；CountAuthorizedForAccount 的账号过滤、excludeSessionID、过期不计也无单测（grep 全 server 仅 control_ws.go:303 一处调用）。按「这条测试要怎样才会失败」的标准：现在方向接反或排除逻辑损坏，CI 依旧全绿，用户复现的恰是本轮要消灭的静默挂起。e2e_test.go 只有一次 happy-path 传输，不触及上限。
+
+**依据**：grep 'CountAuthorizedForAccount' 全 server/ 仅 control_ws.go:303 一处；limits_ws_test.go 五个用例（AUTH_RESPONSE 携带限额 / 超限拒发送方 / 畸形拒收 / 限额内放行 / 零上限放行）均无 ANSWER；e2e_test.go:120-152 仅一次正常 ANSWER。读自 server/internal/controller/limits_ws_test.go、server/internal/e2e_test.go（经 diff 全文）。
+
+**建议**：补一条 WS 级测试：设 MaxConcurrentTransfers=1（或预授权 N 个会话），两个连接完成 offer→answer 后，第三个会话 answer 被拒时断言接收方与发送方各收到带 session_id 的 TRANSFER_FAILURE、原 ANSWER 未被转发、且未铸出 token；再给 CountAuthorizedForAccount 补表驱动单测（异账号不计 / 排除自身 / 已过期不计）。
+
+### GLM-03 · 吹毛求疵（nit）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `server/internal/controller/control_ws.go:396-398` |
+| 类别 | maintainability ｜ 层次 code |
+| 置信度 | high |
+
+**问题**：rejectToSelf 的注释声称「写直接进 socket 而不经 SendChan，因此不会因发送队列瞬间占满而被丢」，与实现相反：代码调用 session.Send（:410），而 registry/session.go:59-69 的 Send 是向 256 容量 SendChan 的非阻塞入队、满即丢弃；紧邻的 :411-412 还在记录 queue full 的 warn，与注释自相矛盾。且「直写 socket」本身就是不可取的方向——写泵 goroutine（control_ws.go:203-224）持有该连接，coder/websocket 不允许并发 Write。结论是代码对、注释错：这条注释断言了一个投递保障，后来者要么误信、要么照注释去『修』出一个并发写竞态。
+
+**依据**：control_ws.go:396-398（注释）与 :410-413（session.Send + queue full warn）；registry/session.go:59-69（Send 语义：满即丢）。读自 server/internal/controller/control_ws.go 与 server/internal/registry/session.go。
+
+**建议**：把注释改为如实描述：经 SendChan 排队，队列满时会丢弃并留 warn。若确需不丢，方向是给拒绝信单独的保障策略（例如队列满时直接关闭该连接），而不是绕开队列直写。
+
+### GLM-05 · 吹毛求疵（nit）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `client/src-tauri/src/commands/clipboard_cmd.rs:91` |
+| 类别 | maintainability ｜ 层次 code |
+| 置信度 | high |
+
+**问题**：兜底常量上方的注释结尾说「`settings_cmd` 的测试把这两个数分别钉死」，但实际钉死 FALLBACK_TEXT_BYTES / FALLBACK_IMAGE_BYTES 的测试 fallback_constants_are_pinned_independently 在 clipboard_cmd.rs 自己的 tests 模块里；settings_cmd.rs 的测试只覆盖旧设置 JSON 的往返（grep 该文件无 FALLBACK 或 4MB/32MB 断言）。这段注释是本轮「兜底常量不得与服务端默认合并」论证的落点，指针指错文件，后来者会去错误的地方找守护测试，进而以为守护不存在。
+
+**依据**：clipboard_cmd.rs:91（注释）；钉死测试见同文件 tests 模块 fallback_constants_are_pinned_independently（diff 行 336-348）；settings_cmd.rs 内 grep 'FALLBACK|4 \* 1024|32 \* 1024' 无命中。读自 client/src-tauri/src/commands/clipboard_cmd.rs 与 settings_cmd.rs。
+
+**建议**：注释改为指向本文件 tests 的 fallback_constants_are_pinned_independently。
+
+## 认为正确的部分
+
+- env 三态解析正确且被钉死：unset/空串→默认、显式 0→0（不限制，与 unset 可区分）、非法/负数/带单位→默认值并打 warn；字节字段用 ParseInt 64 位避免 32 位构建溢出。TestInvalidEnvFallsBackToDefaultNotZero、TestExplicitZeroIsDistinguishableFromUnset、TestByteLimitsExceedingTwoGiB 把三种状态全覆盖。
+- 兜底常量未被合并：FALLBACK_TEXT_BYTES / FALLBACK_IMAGE_BYTES 是客户端自有常量，与服务端默认值无共享来源，数值被 fallback_constants_are_pinned_independently 钉死；lib.rs 对 resp.limits=None 原样存 None（无 unwrap_or_default），设置面板显示「未下发」而非 0 或默认值，三处（预检/UI/协议注释）口径一致。
+- 预检时序正确：cmd_send_files 在哈希与 dispatch_offer 之前预检，metadata IO 放在 spawn_blocking；目录与不可读项的跳过口径、全空报错的行为与 transfer_engine.rs prepare_offer 逐条一致，并有目录不计数、缺失不计数、恰好等于上限通过等单测。
+- OFFER 拒绝回送方向正确且有测试：拒给发送方（rejectToSelf）、不转发给接收方，TestOversizedOfferRejectedToSenderAndNotForwarded 两个断言齐全；畸形 offer 从改造前的「照单转发」改为「拒绝 + 打捞 session_id」是净修复，且有对应测试。
+- 服务端 CheckOffer 的分层与防绕过合理：内容维度按 data_type 互斥（图片不被单文件上限压制，仍受总量兜底）、负数大小直接拒、自报总量偏小时以求和为准、检查顺序固定使错误码确定。
+- pending_outbound 清理本身正确：TRANSFER_FAILURE 分支先删条目再翻卡片/历史，与 dispatch_offer 的写入顺序（先 pending、后历史）对得上；预检放在 dispatch 之前也避免了被拒发送留下 TRANSFERRING 死行。
+- config 清理干净：MaxItemsPerOffer / HeartbeatInterval 删除后全仓库无残留引用（grep 核实）；config.example.yaml 替换为 .env.example 与「服务端只读环境变量」的真实机制一致，且 .env.example 对 512KiB 读上限与条目数的相互约束有如实提醒。
+
+## 未覆盖范围（本侧盲区）
+
+- 未运行 go test / cargo test / vitest（审查只读），两套新测试的运行结果未亲自验证，结论基于读码与测试内容审读。
+- 客户端切换 server_url 或鉴权失败后，server_limits 会保留上一台服务端的值直到下次鉴权成功，此窗口内预检口径的漂移未深究（服务端仍是权威检查，仅影响本地提示）。
+- offer 因对端离线被 routeToPeer 静默丢弃时 pending_outbound 的残留是改造前既有行为，本轮未改，未计入结论。
+- 5 分钟授权 TTL 到期后仍在移动字节的长传输不再计入并发数（authSessions 过期即出表，管道另由 idle sweep 管理）——口径近似，代码注释已如实声明，未作为缺陷展开。
+- control_ws_test.go 与 e2e_test.go 用 limits.FromEnv() 构造，会继承运行环境里的 UNIDROP_* 变量，极端环境下可能导致测试漂移，未进一步评估。
+- 前端 App.test.tsx / SettingsModal.test.tsx 仅审了 diff 与 mock 结构（含新增的第 4 个 microtask 让位），未实际运行。
+
+## 实际查阅的项目文件
+
+- `.reviews/server-transfer-limits/code/_meta/changes-20260913T065303Z.diff`
+- `CLAUDE.md`
+- `AGENTS.md`
+- `README.md`
+- `server/internal/limits/limits.go`
+- `server/internal/controller/control_ws.go`
+- `server/internal/relay/relay_manager.go`
+- `server/internal/registry/session.go`
+- `server/internal/e2e_test.go`
+- `client/src-tauri/src/lib.rs`
+- `client/src-tauri/src/commands/clipboard_cmd.rs`
+- `client/src-tauri/src/commands/settings_cmd.rs`
+- `client/src-tauri/src/core/transfer_engine.rs`
+- `server/internal/limits/limits_test.go`
+- `server/internal/controller/limits_ws_test.go`
+- `server/internal/config/config.go`
+
+> 编排器从工具轨迹中记录到的读取次数：{"read":11,"grep":5,"glob":0,"run_command":0,"project_reads":12}
+
+---
+
+*本文档由 TriviumCode 编排器从 `glm` 侧的结构化输出渲染而成。
+审查员无写仓库权限，全部落盘由编排器完成。*

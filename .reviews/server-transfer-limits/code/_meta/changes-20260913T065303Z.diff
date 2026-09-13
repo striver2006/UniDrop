@@ -1,0 +1,2605 @@
+# trivium changes.diff
+# run_id: 20260913T065303Z
+# base: HEAD
+# head: f4d11677bd0d3c5ba03ed049dc6da7de17665770
+# files: 26
+#   client/src-tauri/src/app_state.rs
+#   client/src-tauri/src/commands/clipboard_cmd.rs
+#   client/src-tauri/src/commands/limits_cmd.rs
+#   client/src-tauri/src/commands/mod.rs
+#   client/src-tauri/src/commands/settings_cmd.rs
+#   client/src-tauri/src/core/cache_manager.rs
+#   client/src-tauri/src/lib.rs
+#   client/src-tauri/src/protocol/envelope.rs
+#   client/src/App.test.tsx
+#   client/src/App.tsx
+#   client/src/components/SettingsModal.test.tsx
+#   client/src/components/SettingsModal.tsx
+#   client/src/types/index.ts
+#   docker-compose.yml
+#   server/cmd/unidrop-server/main.go
+#   server/configs/.env.example
+#   server/configs/config.example.yaml
+#   server/internal/config/config.go
+#   server/internal/controller/control_ws.go
+#   server/internal/controller/control_ws_test.go
+#   server/internal/controller/limits_ws_test.go
+#   server/internal/e2e_test.go
+#   server/internal/limits/limits.go
+#   server/internal/limits/limits_test.go
+#   server/internal/protocol/envelope.go
+#   server/internal/relay/relay_manager.go
+diff --git a/client/src-tauri/src/app_state.rs b/client/src-tauri/src/app_state.rs
+index 60cb7eb..11e8142 100644
+--- a/client/src-tauri/src/app_state.rs
++++ b/client/src-tauri/src/app_state.rs
+@@ -7,7 +7,7 @@ use crate::commands::settings_cmd::AppSettings;
+ use crate::core::cache_manager::CacheManager;
+ use crate::core::connection_actor::ConnectionConfig;
+ use crate::core::transfer_engine::{TransferEngine, TransferSource};
+-use crate::protocol::{ControlEnvelope, OnlineDevice, TransferOfferPayload};
++use crate::protocol::{ControlEnvelope, OnlineDevice, ServerLimits, TransferOfferPayload};
+ 
+ /// 应用版本的唯一事实源，编译期取自 Cargo.toml 的 `version`。
+ ///
+@@ -30,6 +30,13 @@ pub struct AppState {
+     pub pending_outbound: Arc<Mutex<HashMap<String, (TransferOfferPayload, TransferSource)>>>,
+     pub config_actor: Arc<RwLock<ConnectionConfig>>,
+     pub reconnect_notify: Arc<Notify>,
++
++    /// 服务端在 AUTH_RESPONSE 里下发的传输限额。
++    ///
++    /// `None` 有两种来源，行为相同：尚未连上，或对端是不发这个字段的老服务端。
++    /// 两种情况都**不做本地预检**，沿用 `clipboard_cmd` 里的兜底常量——
++    /// 绝不能当成「无限制」或「全部为 0」来用。
++    pub server_limits: Arc<Mutex<Option<ServerLimits>>>,
+ }
+ 
+ impl AppState {
+@@ -62,6 +69,7 @@ impl AppState {
+             pending_outbound: Arc::new(Mutex::new(HashMap::new())),
+             config_actor,
+             reconnect_notify,
++            server_limits: Arc::new(Mutex::new(None)),
+         }
+     }
+ }
+diff --git a/client/src-tauri/src/commands/clipboard_cmd.rs b/client/src-tauri/src/commands/clipboard_cmd.rs
+index 306f937..5947999 100644
+--- a/client/src-tauri/src/commands/clipboard_cmd.rs
++++ b/client/src-tauri/src/commands/clipboard_cmd.rs
+@@ -13,8 +13,23 @@ use crate::platform::{
+ use crate::protocol::{ActionType, ControlEnvelope, TransferOfferPayload};
+ use crate::storage::HistoryRepo;
+ 
+-const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
+-const MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
++/// 服务端**未下发**限额时的兜底上限（老服务端，或尚未连上）。
++///
++/// 这两个数与服务端的默认值（文本 4 MB、图片 64 MB）是**两回事，不得合并**。
++///
++/// 图片那条一眼能看出来：兜底 32 MB ≠ 服务端默认 64 MB。跟着改成 64 MB 等于
++/// 在一台没装本轮改动的旧服务端上单方面放宽了限制——旧服务端不会拒绝，
++/// 于是 50 MB 的图片真的会被发出去，而它此前是被这里拦住的。
++///
++/// **文本那条是更阴的陷阱：兜底 4 MB 与服务端默认 4 MB 恰好相等。** 数值相同
++/// 会诱使人把它们收敛成同一个常量，但它们相等是巧合：兜底值表达「旧环境里的
++/// 原样」，正确性依据是改造前的取值；服务端默认值表达「新策略」，部署者随时
++/// 可能调整。共用一个常量后，将来有人把服务端文本上限调到 8 MB，兜底值会被
++/// 静默拖着一起变，旧服务端上的行为随之漂移，而改动者不知道自己动了两样东西。
++///
++/// `settings_cmd` 的测试把这两个数分别钉死。
++const FALLBACK_TEXT_BYTES: usize = 4 * 1024 * 1024;
++const FALLBACK_IMAGE_BYTES: usize = 32 * 1024 * 1024;
+ 
+ #[tauri::command]
+ pub async fn cmd_inject_files(
+@@ -118,6 +133,95 @@ pub async fn cmd_read_clipboard_preview() -> Result<ClipboardPreview, String> {
+         .map_err(|e| e.to_string())
+ }
+ 
++/// 把字节数格式化成「128.0 MB」这类可读文案。上限数字必须出现在提示里——
++/// 只说「文件太大」用户无从判断该删哪个、删到多少。
++fn human_bytes(n: i64) -> String {
++    const KB: f64 = 1024.0;
++    let v = n as f64;
++    if v < KB {
++        return format!("{} B", n);
++    }
++    if v < KB * KB {
++        return format!("{:.1} KB", v / KB);
++    }
++    if v < KB * KB * KB {
++        return format!("{:.1} MB", v / (KB * KB));
++    }
++    format!("{:.2} GB", v / (KB * KB * KB))
++}
++
++/// 一次 metadata 遍历：过滤掉目录与不可读项，同时累计大小并校验限额。
++///
++/// **这一趟必须发生在 `prepare_offer` 之前。** `prepare_offer` 会把每个文件
++/// 完整读一遍算 SHA-256；把预检放在它之后，等于超限的 100 GB 文件也要先花
++/// 几分钟算完哈希才弹提示——需求 3 要的「超出限制时弹出提示」就名存实亡了。
++/// 文件大小只需 `fs::metadata`，根本不需要哈希。
++///
++/// **条目计数必须与 `prepare_offer` 的跳过逻辑同口径**（`transfer_engine.rs`
++/// 遇到目录与不可读项都 `continue`）。若直接拿 `paths.len()` 去比上限，
++/// 用户选了 70 项、其中 10 项是目录时，实际只会产生 60 个 item（未超 64），
++/// 却会在这里被误拒。遍历 metadata 本来就要做，顺手过滤不增加任何 IO。
++///
++/// 返回过滤后的路径，供调用方原样交给 `prepare_offer`。
++fn precheck_file_paths(
++    paths: &[PathBuf],
++    limits: Option<&crate::protocol::ServerLimits>,
++) -> Result<Vec<PathBuf>, String> {
++    let mut usable: Vec<PathBuf> = Vec::with_capacity(paths.len());
++    let mut total: i64 = 0;
++
++    for p in paths {
++        let meta = match std::fs::metadata(p) {
++            Ok(m) => m,
++            Err(_) => continue, // 与 prepare_offer 一致：不可读的跳过
++        };
++        if meta.is_dir() {
++            continue; // 与 prepare_offer 一致：目录不展开也不计数
++        }
++
++        let size = meta.len() as i64;
++        if let Some(l) = limits {
++            if crate::protocol::ServerLimits::exceeds(l.max_single_file_bytes, size) {
++                let name = p
++                    .file_name()
++                    .map(|n| n.to_string_lossy().to_string())
++                    .unwrap_or_else(|| "该文件".to_string());
++                return Err(format!(
++                    "文件太大，无法传输：「{}」为 {}，单个文件最大 {}",
++                    name,
++                    human_bytes(size),
++                    human_bytes(l.max_single_file_bytes)
++                ));
++            }
++        }
++        total += size;
++        usable.push(p.clone());
++    }
++
++    if usable.is_empty() {
++        return Err("没有可发送的文件（目录不会被展开，请直接选择文件）".into());
++    }
++
++    if let Some(l) = limits {
++        if l.max_items_per_offer > 0 && usable.len() > l.max_items_per_offer as usize {
++            return Err(format!(
++                "文件太多，无法传输：本次选择了 {} 个，一次最多传输 {} 个",
++                usable.len(),
++                l.max_items_per_offer
++            ));
++        }
++        if crate::protocol::ServerLimits::exceeds(l.max_total_transfer_bytes, total) {
++            return Err(format!(
++                "内容太大，无法传输：本次共 {}，单次传输总量最大 {}",
++                human_bytes(total),
++                human_bytes(l.max_total_transfer_bytes)
++            ));
++        }
++    }
++
++    Ok(usable)
++}
++
+ /// Stores the pending outbound offer, sends TRANSFER_OFFER and records history.
+ async fn dispatch_offer(
+     state: &State<'_, AppState>,
+@@ -161,6 +265,21 @@ pub async fn cmd_send_files(state: State<'_, AppState>, target_device: String, p
+     let path_bufs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+     let session_id = Uuid::new_v4();
+ 
++    // 0. 限额预检——必须在算哈希之前，且必须在 dispatch_offer 之前。
++    //
++    //    在哈希之前：否则超限的大文件要等全量 SHA-256 算完才被拒（见
++    //    precheck_file_paths 的说明）。
++    //
++    //    在 dispatch_offer 之前：dispatch_offer 会先写 pending_outbound、
++    //    再落一行 TRANSFERRING 历史。在那之后才拒绝，会留下一张永远停在
++    //    「传输中」的卡片和一行没人收尾的历史——正是本轮要修的那个形态。
++    let limits_snapshot = { state.server_limits.lock().await.clone() };
++    let path_bufs = tokio::task::spawn_blocking(move || {
++        precheck_file_paths(&path_bufs, limits_snapshot.as_ref())
++    })
++    .await
++    .map_err(|e| e.to_string())??;
++
+     // 1. Prepare offer in spawn_blocking (P1-10: prevent hashing from blocking Tokio worker)
+     let paths_for_hash = path_bufs.clone();
+     let (offer_payload, valid_paths) = tokio::task::spawn_blocking(move || {
+@@ -177,24 +296,45 @@ pub async fn cmd_send_files(state: State<'_, AppState>, target_device: String, p
+ #[tauri::command]
+ pub async fn cmd_send_clipboard(state: State<'_, AppState>, target_device: String) -> Result<String, String> {
+     let session_id = Uuid::new_v4();
++    let limits_snapshot = { state.server_limits.lock().await.clone() };
+ 
+     let (offer_payload, source) = tokio::task::spawn_blocking(move || -> Result<(TransferOfferPayload, TransferSource), String> {
++        let limits = limits_snapshot.as_ref();
+         let content = read_clipboard();
+         match content {
+             ClipboardContent::Text(t) => {
+-                if t.len() > MAX_TEXT_BYTES {
+-                    return Err(format!("文本过大 ({:.1} MB)，超过 4 MB 上限", t.len() as f64 / 1024.0 / 1024.0));
++                // 检查仍在 prepare_offer_from_bytes 之前——这条路径改造前就是
++                // 哈希前检查，把它挪到之后会是倒退。
++                let cap = limits
++                    .map(|l| l.max_clipboard_text_bytes)
++                    .unwrap_or(FALLBACK_TEXT_BYTES as i64);
++                if crate::protocol::ServerLimits::exceeds(cap, t.len() as i64) {
++                    return Err(format!(
++                        "剪贴板内容太大，无法传输：文本为 {}，最大 {}",
++                        human_bytes(t.len() as i64),
++                        human_bytes(cap)
++                    ));
+                 }
+                 TransferEngine::prepare_offer_from_bytes(session_id, "TEXT", "clipboard.txt", t.into_bytes())
+             }
+             ClipboardContent::Image(png) => {
+-                if png.len() > MAX_IMAGE_BYTES {
+-                    return Err(format!("图片过大 ({:.1} MB)，超过 32 MB 上限", png.len() as f64 / 1024.0 / 1024.0));
++                let cap = limits
++                    .map(|l| l.max_clipboard_image_bytes)
++                    .unwrap_or(FALLBACK_IMAGE_BYTES as i64);
++                if crate::protocol::ServerLimits::exceeds(cap, png.len() as i64) {
++                    return Err(format!(
++                        "剪贴板内容太大，无法传输：图片为 {}，最大 {}",
++                        human_bytes(png.len() as i64),
++                        human_bytes(cap)
++                    ));
+                 }
+                 TransferEngine::prepare_offer_from_bytes(session_id, "IMAGE", "clipboard.png", png)
+             }
+             ClipboardContent::Files(paths) => {
+-                let (offer, valid) = TransferEngine::prepare_offer(session_id, &paths)?;
++                // 剪贴板里的文件走与 cmd_send_files 相同的预检，
++                // 否则「复制文件再发送」会绕开限额。
++                let usable = precheck_file_paths(&paths, limits)?;
++                let (offer, valid) = TransferEngine::prepare_offer(session_id, &usable)?;
+                 Ok((offer, TransferSource::Files(valid)))
+             }
+             ClipboardContent::Empty => Err("剪贴板为空或不包含可发送内容（支持文本 / 图片 / 文件）".into()),
+@@ -250,3 +390,195 @@ pub async fn cmd_inject_session(state: State<'_, AppState>, session_id: String)
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::protocol::ServerLimits;
++    use std::fs;
++
++    /// 独占临时目录，Drop 时递归清掉。与 cache_manager 的测试同样不引入
++    /// tempfile 依赖——std + 已有的 uuid 足够。
++    struct TempDir(PathBuf);
++
++    impl TempDir {
++        fn new() -> Self {
++            let p = std::env::temp_dir().join(format!("unidrop-precheck-{}", Uuid::new_v4()));
++            fs::create_dir_all(&p).unwrap();
++            Self(p)
++        }
++        fn file(&self, name: &str, size: usize) -> PathBuf {
++            let p = self.0.join(name);
++            fs::write(&p, vec![0u8; size]).unwrap();
++            p
++        }
++        fn dir(&self, name: &str) -> PathBuf {
++            let p = self.0.join(name);
++            fs::create_dir_all(&p).unwrap();
++            p
++        }
++    }
++
++    impl Drop for TempDir {
++        fn drop(&mut self) {
++            let _ = fs::remove_dir_all(&self.0);
++        }
++    }
++
++    fn limits(single: i64, total: i64, items: i32) -> ServerLimits {
++        ServerLimits {
++            max_single_file_bytes: single,
++            max_total_transfer_bytes: total,
++            max_clipboard_image_bytes: 0,
++            max_clipboard_text_bytes: 0,
++            max_items_per_offer: items,
++            max_concurrent_transfers: 0,
++        }
++    }
++
++    /// 服务端未下发限额（老服务端，或尚未连上）时**不做文件预检**。
++    ///
++    /// 这条守护 §4.3 的三选一：None 必须是「沿用改造前行为」，既不能当成
++    /// 「全部为 0」把一切拦死，也不该凭空造出限制。改造前 cmd_send_files
++    /// 本就不检查大小，所以「照旧」就是不检查。
++    #[test]
++    fn absent_limits_do_not_reject_anything() {
++        let tmp = TempDir::new();
++        let paths = vec![tmp.file("big.bin", 4096)];
++
++        let usable = precheck_file_paths(&paths, None).expect("未下发限额时不应拒绝");
++        assert_eq!(usable.len(), 1);
++    }
++
++    /// 兜底常量的具体数值钉死。
++    ///
++    /// 把图片兜底跟着服务端默认改成 64 MB，或把文本兜底与服务端默认文本上限
++    /// 合并成同一个常量，这条都会红。文本那两个 4 MB 相等纯属巧合，
++    /// 肉眼审查发现不了合并，只能靠这里挡。
++    #[test]
++    fn fallback_constants_are_pinned_independently() {
++        assert_eq!(
++            FALLBACK_TEXT_BYTES,
++            4 * 1024 * 1024,
++            "文本兜底必须保持改造前的 4 MB；它与服务端默认值相等是巧合，不得合并"
++        );
++        assert_eq!(
++            FALLBACK_IMAGE_BYTES,
++            32 * 1024 * 1024,
++            "图片兜底必须保持改造前的 32 MB，不得跟着服务端默认值改成 64 MB——\
++             那会在未升级的旧服务端上单方面放宽限制"
++        );
++    }
++
++    /// **目录不计入条目数。**
++    ///
++    /// prepare_offer 遇到目录直接跳过、不递归展开，所以预检的计数口径必须
++    /// 与它一致。若这里图省事写 paths.len()，用户选了 4 项（其中 2 个目录）
++    /// 在上限为 2 时会被误拒，而实际只会产生 2 个 item。
++    #[test]
++    fn directories_are_skipped_and_do_not_count_toward_item_limit() {
++        let tmp = TempDir::new();
++        let paths = vec![
++            tmp.file("a.txt", 10),
++            tmp.dir("sub1"),
++            tmp.dir("sub2"),
++            tmp.file("b.txt", 10),
++        ];
++
++        let usable = precheck_file_paths(&paths, Some(&limits(0, 0, 2)))
++            .expect("两个目录不应占用条目额度");
++        assert_eq!(usable.len(), 2, "只应保留两个真实文件");
++        assert!(usable.iter().all(|p| p.is_file()));
++    }
++
++    /// 不可读/不存在的路径同样跳过，与 prepare_offer 一致。
++    #[test]
++    fn missing_paths_are_skipped() {
++        let tmp = TempDir::new();
++        let paths = vec![tmp.file("a.txt", 10), tmp.0.join("does-not-exist.bin")];
++
++        let usable = precheck_file_paths(&paths, Some(&limits(0, 0, 1)))
++            .expect("不存在的路径不应占用条目额度");
++        assert_eq!(usable.len(), 1);
++    }
++
++    #[test]
++    fn item_count_over_limit_is_rejected_with_the_number() {
++        let tmp = TempDir::new();
++        let paths = vec![
++            tmp.file("a.txt", 10),
++            tmp.file("b.txt", 10),
++            tmp.file("c.txt", 10),
++        ];
++
++        let err = precheck_file_paths(&paths, Some(&limits(0, 0, 2))).unwrap_err();
++        assert!(err.contains("无法传输"), "文案应含统一的「无法传输」措辞：{}", err);
++        assert!(err.contains('2'), "文案必须写明上限数字，否则用户不知道该删到几个：{}", err);
++        assert!(err.contains('3'), "文案应写明当前数量：{}", err);
++    }
++
++    #[test]
++    fn single_file_over_limit_names_the_file() {
++        let tmp = TempDir::new();
++        let paths = vec![tmp.file("small.txt", 10), tmp.file("huge.bin", 5000)];
++
++        let err = precheck_file_paths(&paths, Some(&limits(1024, 0, 0))).unwrap_err();
++        assert!(
++            err.contains("huge.bin"),
++            "必须点名是哪个文件超限，否则多选时无从下手：{}",
++            err
++        );
++    }
++
++    #[test]
++    fn total_over_limit_is_rejected() {
++        let tmp = TempDir::new();
++        let paths = vec![tmp.file("a.bin", 600), tmp.file("b.bin", 600)];
++
++        // 单文件都不超，总量超
++        let err = precheck_file_paths(&paths, Some(&limits(1024, 1000, 0))).unwrap_err();
++        assert!(err.contains("总量"), "应报总量超限：{}", err);
++    }
++
++    #[test]
++    fn exactly_at_limit_passes() {
++        let tmp = TempDir::new();
++        let paths = vec![tmp.file("a.bin", 1024)];
++
++        precheck_file_paths(&paths, Some(&limits(1024, 1024, 1)))
++            .expect("恰好等于上限必须通过");
++    }
++
++    /// 限额为 0 = 不限制，三项都要覆盖。
++    #[test]
++    fn zero_limits_mean_unlimited() {
++        let tmp = TempDir::new();
++        let mut paths = Vec::new();
++        for i in 0..50 {
++            paths.push(tmp.file(&format!("f{}.bin", i), 2048));
++        }
++
++        precheck_file_paths(&paths, Some(&limits(0, 0, 0))).expect("限额全为 0 时不应拒绝");
++    }
++
++    /// 全是目录时给出可操作的提示，而不是笼统的「没有文件」。
++    #[test]
++    fn only_directories_yields_actionable_error() {
++        let tmp = TempDir::new();
++        let paths = vec![tmp.dir("only-a-dir")];
++
++        let err = precheck_file_paths(&paths, Some(&limits(0, 0, 0))).unwrap_err();
++        assert!(
++            err.contains("目录"),
++            "应说明目录不会被展开，否则用户不知道为什么发不出去：{}",
++            err
++        );
++    }
++
++    #[test]
++    fn human_bytes_is_readable() {
++        assert_eq!(human_bytes(512), "512 B");
++        assert_eq!(human_bytes(1024), "1.0 KB");
++        assert_eq!(human_bytes(128 * 1024 * 1024), "128.0 MB");
++    }
++}
+diff --git a/client/src-tauri/src/commands/mod.rs b/client/src-tauri/src/commands/mod.rs
+index 2418640..4a078ac 100644
+--- a/client/src-tauri/src/commands/mod.rs
++++ b/client/src-tauri/src/commands/mod.rs
+@@ -1,11 +1,13 @@
+ pub mod clipboard_cmd;
+ pub mod device_cmd;
+ pub mod history_cmd;
++pub mod limits_cmd;
+ pub mod settings_cmd;
+ pub mod window_cmd;
+ 
+ pub use clipboard_cmd::*;
+ pub use device_cmd::*;
+ pub use history_cmd::*;
++pub use limits_cmd::*;
+ pub use settings_cmd::*;
+ pub use window_cmd::*;
+diff --git a/client/src-tauri/src/commands/settings_cmd.rs b/client/src-tauri/src/commands/settings_cmd.rs
+index a394398..0fe40f5 100644
+--- a/client/src-tauri/src/commands/settings_cmd.rs
++++ b/client/src-tauri/src/commands/settings_cmd.rs
+@@ -9,7 +9,6 @@ pub struct AppSettings {
+     pub account_id: String,
+     pub psk_secret: String,
+     pub auto_inject: bool,
+-    pub rate_limit_mb: u32,
+     /// 启动时不弹出主窗口，仅在托盘常驻。对手动启动与开机自启同样生效。
+     ///
+     /// `#[serde(default)]` 不可删除：整份设置以一条 JSON 存在 SQLite 的
+@@ -93,7 +92,6 @@ impl AppSettings {
+             account_id: "default_user".to_string(),
+             psk_secret: "dev-insecure-psk-secret".to_string(),
+             auto_inject: false,
+-            rate_limit_mb: 10,
+             start_minimized: false,
+             history_max_entries: DEFAULT_HISTORY_MAX_ENTRIES,
+             transfer_card_retain_secs: DEFAULT_TRANSFER_CARD_RETAIN_SECS,
+@@ -246,8 +244,20 @@ pub async fn cmd_set_autostart(app: AppHandle, enabled: bool) -> Result<(), Stri
+ mod tests {
+     use super::*;
+ 
+-    /// 老库里的 JSON 没有 start_minimized 字段。本测试守护的是
+-    /// `#[serde(default)]`：删掉它，这里会红，而不是等到用户配置被静默冲掉。
++    /// 老库里的 JSON 没有 start_minimized 字段，却**有**已被删除的
++    /// rate_limit_mb 字段。本测试同时守护两个方向：
++    ///
++    /// - 缺字段：`#[serde(default)]` 删掉的话这里会红，而不是等到用户配置被静默冲掉；
++    /// - 多字段：serde 默认忽略未知键，所以删掉 rate_limit_mb 之后老 JSON 仍能读。
++    ///
++    /// **fixture 里的 rate_limit_mb 是故意留着的，不要"顺手清理"**——
++    /// 删掉它这条测试就不再覆盖「多出一个已删字段」这一半了。
++    ///
++    /// 注意「删字段安全」只对**升级**方向成立。反过来，用户若回滚到旧版客户端，
++    /// 新客户端写出的 JSON 里没有 rate_limit_mb，而旧结构体那个字段没有
++    /// `#[serde(default)]`，整条反序列化会失败并走 lib.rs 的 unwrap_or_else
++    /// 静默回落全部默认值，把 server_url / account_id / psk_secret 一起冲掉。
++    /// 本项目发签名 dmg，版本回退是现实场景——降级前应导出设置。
+     #[test]
+     fn legacy_settings_json_deserializes_without_data_loss() {
+         let legacy = r#"{
+@@ -265,7 +275,6 @@ mod tests {
+         assert_eq!(parsed.account_id, "alice");
+         assert_eq!(parsed.psk_secret, "user-configured-secret");
+         assert!(parsed.auto_inject);
+-        assert_eq!(parsed.rate_limit_mb, 42);
+         assert!(!parsed.start_minimized, "缺失的新字段应取默认值 false");
+ 
+         // 这两条守护的是 #[serde(default = "...")] 而不是裸 #[serde(default)]：
+@@ -357,7 +366,6 @@ mod tests {
+         assert_eq!(parsed.account_id, settings.account_id);
+         assert_eq!(parsed.psk_secret, settings.psk_secret);
+         assert_eq!(parsed.auto_inject, settings.auto_inject);
+-        assert_eq!(parsed.rate_limit_mb, settings.rate_limit_mb);
+         assert!(parsed.start_minimized);
+         assert_eq!(parsed.history_max_entries, settings.history_max_entries);
+         assert_eq!(parsed.transfer_card_retain_secs, settings.transfer_card_retain_secs);
+diff --git a/client/src-tauri/src/core/cache_manager.rs b/client/src-tauri/src/core/cache_manager.rs
+index 59dfb0b..f5a7363 100644
+--- a/client/src-tauri/src/core/cache_manager.rs
++++ b/client/src-tauri/src/core/cache_manager.rs
+@@ -474,7 +474,7 @@ mod tests {
+         assert!(f1.exists(), "免疫期内文件也不该被删，否则剪贴板里的引用会失效");
+     }
+ 
+-    // ---------- sweep：TTL 与容量清理（需求 9） ----------
++    // ---------- sweep：TTL 与容量清理（需求 8） ----------
+ 
+     /// 写入一个缓存条目，`age_secs` 指定它已存在多久（用于跨过 TTL 阈值）。
+     async fn seed_cache_file(
+diff --git a/client/src-tauri/src/lib.rs b/client/src-tauri/src/lib.rs
+index 9f67b99..158a485 100644
+--- a/client/src-tauri/src/lib.rs
++++ b/client/src-tauri/src/lib.rs
+@@ -267,6 +267,18 @@ pub fn run() {
+                                 .map(|s| s.to_string());
+ 
+                             if let Some(sid) = session_id {
++                                // 失败是这个会话的终点，待发队列里的条目必须一并释放。
++                                //
++                                // pending_outbound 此前只在 TRANSFER_ANSWER 且带 token 的
++                                // 那条路径上被删除，失败路径完全不碰它。本轮让服务端主动
++                                // 拒绝成为常规路径（超限即拒），这条泄漏随之从罕见变高频：
++                                // 每一次被拒的发送都会永久留下一份 offer 与文件路径列表。
++                                {
++                                    let state = app_handle.state::<AppState>();
++                                    let mut pending = state.pending_outbound.lock().await;
++                                    pending.remove(&sid);
++                                }
++
+                                 let brief = {
+                                     let state = app_handle.state::<AppState>();
+                                     let conn = state.db_conn.lock().await;
+@@ -313,6 +325,18 @@ pub fn run() {
+                                 if !resp.success {
+                                     let _ = app_handle.emit("auth-failed", resp.error_message);
+                                 } else {
++                                    // 存下服务端下发的限额，供发送前本地预检与设置面板展示。
++                                    //
++                                    // resp.limits 为 None（老服务端不发这个字段）时**原样存 None**，
++                                    // 不要 unwrap_or_default() —— 那会变成一组全 0，而 0 在这里
++                                    // 表示「不限制」，等于在老服务端上把限额整组关掉。
++                                    // None 的含义是「未知」，由发送端退回兜底常量处理。
++                                    {
++                                        let state = app_handle.state::<AppState>();
++                                        let mut slot = state.server_limits.lock().await;
++                                        *slot = resp.limits.clone();
++                                    }
++                                    let _ = app_handle.emit("server-limits-updated", &resp.limits);
+                                     let _ = app_handle.emit("auth-success", ());
+                                 }
+                             }
+@@ -480,6 +504,7 @@ pub fn run() {
+             commands::cmd_list_history,
+             commands::cmd_save_transfer_as,
+             commands::cmd_reveal_session,
++            commands::cmd_get_server_limits,
+         ])
+         .build(tauri::generate_context!())
+         .expect("error while building UniDrop application")
+diff --git a/client/src-tauri/src/protocol/envelope.rs b/client/src-tauri/src/protocol/envelope.rs
+index 967ce5b..031da71 100644
+--- a/client/src-tauri/src/protocol/envelope.rs
++++ b/client/src-tauri/src/protocol/envelope.rs
+@@ -53,6 +53,29 @@ pub struct AuthRequestPayload {
+     pub timestamp: i64,
+ }
+ 
++/// 服务端在鉴权成功后下发的传输限额。只读——由部署者在服务端 env 配置，
++/// 客户端改不了（这条边界是刻意的，理由见 `.reviews` 下 server-transfer-limits
++/// 主题计划的 §3）。
++///
++/// 任一项为 `0` 表示该项不限制。
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++pub struct ServerLimits {
++    pub max_single_file_bytes: i64,
++    pub max_total_transfer_bytes: i64,
++    pub max_clipboard_image_bytes: i64,
++    pub max_clipboard_text_bytes: i64,
++    pub max_items_per_offer: i32,
++    pub max_concurrent_transfers: i32,
++}
++
++impl ServerLimits {
++    /// `limit <= 0` 视为不限制。三处校验共用这一个判定，避免各写各的
++    /// `if x > 0 &&`，漏掉一处就是一项限额在某条路径上静默失效。
++    pub fn exceeds(limit: i64, actual: i64) -> bool {
++        limit > 0 && actual > limit
++    }
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct AuthResponsePayload {
+     pub success: bool,
+@@ -62,6 +85,15 @@ pub struct AuthResponsePayload {
+     pub error_message: Option<String>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     pub assigned_id: Option<String>,
++
++    /// 老服务端不发这个字段，于是这里是 `None`。
++    ///
++    /// **`None` 必须退回客户端自己的兜底常量，不得 `unwrap_or_default()`。**
++    /// 三种处理在代码上只差一个调用，后果却完全不同：
++    /// 沿用兜底 = 老服务器上一切照旧；全零 = 老服务器上限额全部失效；
++    /// 若把全零当"都为 0 即不限制"以外的含义用，还可能变成什么都发不出去。
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub limits: Option<ServerLimits>,
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+diff --git a/client/src/App.test.tsx b/client/src/App.test.tsx
+index 0914d8b..9f8ec34 100644
+--- a/client/src/App.test.tsx
++++ b/client/src/App.test.tsx
+@@ -24,7 +24,6 @@ const baseSettings: AppSettings = {
+   account_id: "alice",
+   psk_secret: "s",
+   auto_inject: false,
+-  rate_limit_mb: 10,
+   start_minimized: false,
+   history_max_entries: 100,
+   transfer_card_retain_secs: 30,
+@@ -58,13 +57,16 @@ async function renderApp(settings: Partial<AppSettings> = {}) {
+   invokeResults["cmd_get_online_devices"] = [];
+   invokeResults["cmd_get_settings"] = { ...baseSettings, ...settings };
+   invokeResults["cmd_list_history"] = [];
++  // 默认按「老服务端」处理：不下发限额。需要限额的用例自行覆盖。
++  invokeResults["cmd_get_server_limits"] = null;
+ 
+   const utils = render(<App />);
+-  // fetchInitialData 的三个 await 需要让出 microtask 队列
++  // fetchInitialData 的四个 await 需要让出 microtask 队列
+   await act(async () => {
+     await Promise.resolve();
+     await Promise.resolve();
+     await Promise.resolve();
++    await Promise.resolve();
+   });
+   return utils;
+ }
+diff --git a/client/src/App.tsx b/client/src/App.tsx
+index c5d7287..be765d8 100644
+--- a/client/src/App.tsx
++++ b/client/src/App.tsx
+@@ -12,7 +12,7 @@ import {
+   AlertCircle,
+   X,
+ } from "lucide-react";
+-import { OnlineDevice, AppSettings, ActiveTransfer } from "./types";
++import { OnlineDevice, AppSettings, ActiveTransfer , ServerLimits } from "./types";
+ import { DeviceList } from "./components/DeviceList";
+ import { TransferProgress } from "./components/TransferProgress";
+ import { SettingsModal } from "./components/SettingsModal";
+@@ -24,7 +24,6 @@ const defaultSettings: AppSettings = {
+   account_id: "default_user",
+   psk_secret: "dev-insecure-psk-secret",
+   auto_inject: false,
+-  rate_limit_mb: 10,
+   start_minimized: false,
+   // 与 Rust 侧 AppSettings::default_config() 必须保持一致（两份独立字面量）
+   history_max_entries: 100,
+@@ -43,6 +42,9 @@ export const App: React.FC = () => {
+   const [isRefreshing, setIsRefreshing] = useState(false);
+   const [selectedDeviceForSend, setSelectedDeviceForSend] = useState<OnlineDevice | null>(null);
+   const [authError, setAuthError] = useState<string | null>(null);
++  // 服务端下发的限额。null = 尚未拿到（未连接，或老服务端不发这个字段）。
++  // 不要用默认值顶上——那会让用户以为看到的就是实际生效的值。
++  const [serverLimits, setServerLimits] = useState<ServerLimits | null>(null);
+   const [notification, setNotification] = useState<{
+     type: "info" | "success" | "error";
+     text: string;
+@@ -105,6 +107,10 @@ export const App: React.FC = () => {
+         s.server_url = "wss://drop.yourdomain.com:58921";
+       }
+       setSettings(s);
++
++      // 事件是推送来的，打开设置面板时可能早已错过，所以这里主动补拉一次。
++      const limits = await invoke<ServerLimits | null>("cmd_get_server_limits");
++      setServerLimits(limits);
+     } catch (err: any) {
+       console.error("fetch initial data error:", err);
+       showNotification(typeof err === "string" ? err : "拉取初始状态失败", "error");
+@@ -183,7 +189,12 @@ export const App: React.FC = () => {
+       setIsSettingsOpen(true);
+     });
+ 
++    const unlistenLimitsPromise = listen<ServerLimits | null>("server-limits-updated", (event) => {
++      setServerLimits(event.payload ?? null);
++    });
++
+     return () => {
++      unlistenLimitsPromise.then((unlisten) => unlisten());
+       unlistenDevicesPromise.then((unlisten) => unlisten());
+       unlistenAuthPromise.then((unlisten) => unlisten());
+       unlistenAuthSuccessPromise.then((unlisten) => unlisten());
+@@ -391,6 +402,7 @@ export const App: React.FC = () => {
+           isOpen={isSettingsOpen}
+           onClose={() => setIsSettingsOpen(false)}
+           onSave={handleSaveSettings}
++          serverLimits={serverLimits}
+         />
+       )}
+ 
+diff --git a/client/src/components/SettingsModal.test.tsx b/client/src/components/SettingsModal.test.tsx
+index 68e97d1..923764b 100644
+--- a/client/src/components/SettingsModal.test.tsx
++++ b/client/src/components/SettingsModal.test.tsx
+@@ -7,14 +7,13 @@ import { invoke, invokeResults, resetTauriMock } from "../test/tauri-mock";
+ vi.mock("@tauri-apps/api/core", () => ({ invoke }));
+ 
+ import { SettingsModal } from "./SettingsModal";
+-import { AppSettings } from "../types";
++import { AppSettings, ServerLimits } from "../types";
+ 
+ const baseSettings: AppSettings = {
+   server_url: "wss://example.com:58921",
+   account_id: "alice",
+   psk_secret: "secret",
+   auto_inject: false,
+-  rate_limit_mb: 10,
+   start_minimized: false,
+   history_max_entries: 100,
+   transfer_card_retain_secs: 30,
+@@ -23,7 +22,10 @@ const baseSettings: AppSettings = {
+   cache_sweep_interval_minutes: 60,
+ };
+ 
+-function setup(settings: Partial<AppSettings> = {}) {
++function setup(
++  settings: Partial<AppSettings> = {},
++  serverLimits: ServerLimits | null = null
++) {
+   invokeResults["cmd_get_autostart"] = false;
+   const onSave = vi.fn().mockResolvedValue(undefined);
+   render(
+@@ -32,11 +34,21 @@ function setup(settings: Partial<AppSettings> = {}) {
+       isOpen
+       onClose={vi.fn()}
+       onSave={onSave}
++      serverLimits={serverLimits}
+     />
+   );
+   return { onSave, user: userEvent.setup() };
+ }
+ 
++const limitsFixture: ServerLimits = {
++  max_single_file_bytes: 128 * 1024 * 1024,
++  max_total_transfer_bytes: 256 * 1024 * 1024,
++  max_clipboard_image_bytes: 64 * 1024 * 1024,
++  max_clipboard_text_bytes: 4 * 1024 * 1024,
++  max_items_per_offer: 64,
++  max_concurrent_transfers: 8,
++};
++
+ const retainInput = () => screen.getByLabelText("完成任务在界面保持秒数");
+ const ttlInput = () => screen.getByLabelText("缓存保留小时数");
+ const sizeInput = () => screen.getByLabelText("缓存容量上限 (MB)");
+@@ -123,7 +135,7 @@ describe("设置面板的数值校验", () => {
+     expect(screen.getByText(/超出上限 4294967295/)).toBeInTheDocument();
+   });
+ 
+-  // ---------- 磁盘缓存清理（需求 9） ----------
++  // ---------- 磁盘缓存清理（需求 8） ----------
+ 
+   it("三个缓存字段正常提交", async () => {
+     const { onSave, user } = setup();
+@@ -216,3 +228,45 @@ describe("设置面板的数值校验", () => {
+     expect(onSave).not.toHaveBeenCalled();
+   });
+ });
++
++// ---------- 服务端限额只读展示（需求 3） ----------
++
++describe("服务端限额只读展示（需求 3）", () => {
++  beforeEach(() => resetTauriMock());
++
++  it("未下发时显示「未下发」，而不是 0，也不是默认值", () => {
++    setup({}, null);
++
++    expect(screen.getByText(/未下发/)).toBeInTheDocument();
++    // 不得拿默认值顶上——那会让用户以为这就是实际生效的值
++    expect(screen.queryByText("128.0 MB")).not.toBeInTheDocument();
++  });
++
++  it("下发后按可读单位展示各项", () => {
++    setup({}, limitsFixture);
++
++    expect(screen.getByText("128.0 MB")).toBeInTheDocument();
++    expect(screen.getByText("256.0 MB")).toBeInTheDocument();
++    expect(screen.getByText("64.0 MB")).toBeInTheDocument();
++    expect(screen.getByText("4.0 MB")).toBeInTheDocument();
++    expect(screen.getByText("64")).toBeInTheDocument();
++  });
++
++  it("某项为 0 时显示「不限制」——显示 0 会被读成配额为零，语义正好相反", () => {
++    setup({}, { ...limitsFixture, max_single_file_bytes: 0, max_items_per_offer: 0 });
++
++    expect(screen.getAllByText("不限制")).toHaveLength(2);
++    expect(screen.queryByText("0 B")).not.toBeInTheDocument();
++  });
++
++  it("只读分区不产生可提交字段，保存时不污染 payload", async () => {
++    const { onSave, user } = setup({}, limitsFixture);
++
++    await user.click(submit());
++
++    expect(onSave).toHaveBeenCalledTimes(1);
++    const submitted = onSave.mock.calls[0][0];
++    expect(submitted).not.toHaveProperty("max_single_file_bytes");
++    expect(submitted).not.toHaveProperty("rate_limit_mb");
++  });
++});
+diff --git a/client/src/components/SettingsModal.tsx b/client/src/components/SettingsModal.tsx
+index 2efebac..3879b47 100644
+--- a/client/src/components/SettingsModal.tsx
++++ b/client/src/components/SettingsModal.tsx
+@@ -1,7 +1,31 @@
+ import React, { useState, useEffect } from "react";
+ import { invoke } from "@tauri-apps/api/core";
+-import { X, Save, Shield, AlertCircle } from "lucide-react";
+-import { AppSettings } from "../types";
++import { X, Save, Shield, AlertCircle, Server as ServerIcon } from "lucide-react";
++import { AppSettings, ServerLimits } from "../types";
++
++/**
++ * 把一项限额格式化成可读文案。
++ *
++ * `0` 必须显示成「不限制」而不是「0 B」。两者语义正好相反——用户看到 0
++ * 会读成「配额为零、什么都发不了」，而它实际表示该项限制已被关闭。
++ */
++const formatLimitBytes = (n: number): string => {
++  if (!n || n <= 0) return "不限制";
++  const KB = 1024;
++  if (n < KB) return `${n} B`;
++  if (n < KB * KB) return `${(n / KB).toFixed(1)} KB`;
++  if (n < KB * KB * KB) return `${(n / (KB * KB)).toFixed(1)} MB`;
++  return `${(n / (KB * KB * KB)).toFixed(2)} GB`;
++};
++
++const formatLimitCount = (n: number): string => (!n || n <= 0 ? "不限制" : `${n}`);
++
++const LimitRow: React.FC<{ label: string; value: string }> = ({ label, value }) => (
++  <div className="flex justify-between">
++    <dt className="text-slate-500">{label}</dt>
++    <dd className="text-slate-300 tabular-nums">{value}</dd>
++  </div>
++);
+ 
+ /** Rust 侧两个字段都是 u32，超出这个范围反序列化会整单失败 */
+ const U32_MAX = 4294967295;
+@@ -60,9 +84,23 @@ interface SettingsModalProps {
+   isOpen: boolean;
+   onClose: () => void;
+   onSave: (newSettings: AppSettings) => void | Promise<void>;
++  /**
++   * 服务端下发的限额，只读展示。
++   *
++   * `null` = 尚未拿到（未连接，或对端是不下发这个字段的老服务端）。
++   * 此时显示「未下发」，**不要显示 0，也不要拿默认值顶上**——显示 0 会被读成
++   * 配额为零，显示默认值会让用户以为那就是实际生效的值。
++   */
++  serverLimits?: ServerLimits | null;
+ }
+ 
+-export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, onClose, onSave }) => {
++export const SettingsModal: React.FC<SettingsModalProps> = ({
++  settings,
++  isOpen,
++  onClose,
++  onSave,
++  serverLimits = null,
++}) => {
+   const [form, setForm] = useState<AppSettings>(settings);
+   const [saving, setSaving] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+@@ -421,6 +459,33 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen,
+               </div>
+             )}
+           </div>
++
++          {/* 服务端限额：纯展示，本轮没有任何输入框。
++              限额的事实源在服务端环境变量里，客户端只能看。不写明这一点的话，
++              用户会对着一组灰数字猜为什么改不了。 */}
++          <div className="pt-1">
++            <div className="flex items-center space-x-1.5 text-slate-300 mb-1">
++              <ServerIcon className="w-3.5 h-3.5 text-slate-500" />
++              <span className="font-medium">服务端限额</span>
++            </div>
++            <p className="text-[11px] text-slate-500 mb-2">
++              由服务端配置，客户端只读。如需调整请联系部署者
++            </p>
++            {serverLimits === null ? (
++              <div className="text-[11px] text-slate-500 bg-slate-800/50 border border-slate-800 rounded-lg px-3 py-2">
++                未下发（尚未连接，或服务端版本较旧）
++              </div>
++            ) : (
++              <dl className="text-[11px] bg-slate-800/50 border border-slate-800 rounded-lg px-3 py-2 space-y-1">
++                <LimitRow label="单个文件" value={formatLimitBytes(serverLimits.max_single_file_bytes)} />
++                <LimitRow label="单次总量" value={formatLimitBytes(serverLimits.max_total_transfer_bytes)} />
++                <LimitRow label="剪贴板图片" value={formatLimitBytes(serverLimits.max_clipboard_image_bytes)} />
++                <LimitRow label="剪贴板文本" value={formatLimitBytes(serverLimits.max_clipboard_text_bytes)} />
++                <LimitRow label="单次文件数" value={formatLimitCount(serverLimits.max_items_per_offer)} />
++                <LimitRow label="同时传输数" value={formatLimitCount(serverLimits.max_concurrent_transfers)} />
++              </dl>
++            )}
++          </div>
+           </div>
+ 
+           <div className="shrink-0 px-5 py-4 border-t border-slate-800 space-y-3">
+diff --git a/client/src/types/index.ts b/client/src/types/index.ts
+index 30d5b60..b4f3e36 100644
+--- a/client/src/types/index.ts
++++ b/client/src/types/index.ts
+@@ -11,7 +11,6 @@ export interface AppSettings {
+   account_id: string;
+   psk_secret: string;
+   auto_inject: boolean;
+-  rate_limit_mb: number;
+   /** 启动时不弹出主窗口，仅托盘常驻。对手动启动与开机自启同样生效。 */
+   start_minimized: boolean;
+   /** 传输历史最多保留的条数，超出的最旧记录连同缓存文件一起删除；0 = 不限制。 */
+@@ -26,6 +25,19 @@ export interface AppSettings {
+   cache_sweep_interval_minutes: number;
+ }
+ 
++/**
++ * 服务端下发的传输限额（只读）。由部署者在服务端环境变量配置，客户端改不了。
++ * 任一项为 0 表示该项不限制。
++ */
++export interface ServerLimits {
++  max_single_file_bytes: number;
++  max_total_transfer_bytes: number;
++  max_clipboard_image_bytes: number;
++  max_clipboard_text_bytes: number;
++  max_items_per_offer: number;
++  max_concurrent_transfers: number;
++}
++
+ export interface ActiveTransfer {
+   session_id: string;
+   preview_summary: string;
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 60d3472..ed2b73c 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -16,6 +16,16 @@ services:
+       - UNIDROP_PSK_SECRET=change-this-to-a-very-strong-secret-key-12345
+       - UNIDROP_STUN_ADDR=:3478
+       - UNIDROP_HEARTBEAT_TIMEOUT=45
++      # 传输限额。全部注释掉 = 全部取默认值，与不配置时行为一致。
++      # 单位为字节，1 MB = 1024×1024；设为 0 表示关闭该项限制。
++      # 填错（非数字、负数）会退回默认值并打 warn，不会静默变成 0。
++      # 完整说明见 server/configs/.env.example。
++      #- UNIDROP_MAX_SINGLE_FILE_BYTES=134217728      # 128 MB，仅对文件生效
++      #- UNIDROP_MAX_TOTAL_TRANSFER_BYTES=268435456   # 256 MB，对所有类型生效
++      #- UNIDROP_MAX_CLIPBOARD_IMAGE_BYTES=67108864   # 64 MB
++      #- UNIDROP_MAX_CLIPBOARD_TEXT_BYTES=4194304     # 4 MB
++      #- UNIDROP_MAX_ITEMS_PER_OFFER=64               # 一次最多选几个文件，调大前见 .env.example
++      #- UNIDROP_MAX_CONCURRENT_TRANSFERS=8           # 单账号并发，按自报 account_id 计数
+     healthcheck:
+       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/healthz"]
+       interval: 30s
+diff --git a/server/cmd/unidrop-server/main.go b/server/cmd/unidrop-server/main.go
+index 1291b09..0ee4a3c 100644
+--- a/server/cmd/unidrop-server/main.go
++++ b/server/cmd/unidrop-server/main.go
+@@ -14,6 +14,7 @@ import (
+ 	"github.com/unidrop/unidrop-server/internal/auth"
+ 	"github.com/unidrop/unidrop-server/internal/config"
+ 	"github.com/unidrop/unidrop-server/internal/controller"
++	"github.com/unidrop/unidrop-server/internal/limits"
+ 	"github.com/unidrop/unidrop-server/internal/registry"
+ 	"github.com/unidrop/unidrop-server/internal/relay"
+ 	"github.com/unidrop/unidrop-server/internal/stun"
+@@ -38,6 +39,9 @@ func main() {
+ 		os.Exit(1)
+ 	}
+ 
++	transferLimits := limits.FromEnv()
++	limits.LogSummary(transferLimits)
++
+ 	devRegistry := registry.NewDeviceRegistry()
+ 	relayManager := relay.NewRelayManager()
+ 
+@@ -74,7 +78,7 @@ func main() {
+ 	mux := http.NewServeMux()
+ 	mux.HandleFunc("GET /healthz", controller.HealthHandler(devRegistry, relayManager))
+ 	mux.HandleFunc("GET /metrics", controller.MetricsHandler(devRegistry, relayManager))
+-	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, devRegistry, relayManager))
++	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, devRegistry, relayManager, transferLimits))
+ 	mux.Handle("GET /ws/data", controller.NewDataWSHandler(relayManager))
+ 
+ 	server := &http.Server{
+diff --git a/server/configs/config.example.yaml b/server/configs/config.example.yaml
+deleted file mode 100644
+index f0684ba..0000000
+--- a/server/configs/config.example.yaml
++++ /dev/null
+@@ -1,22 +0,0 @@
+-# UniDrop Relay Server Configuration Template
+-
+-server:
+-  # HTTP & WebSocket listen address
+-  listen_addr: ":8080"
+-
+-  # Pre-Shared Key for client authentication.
+-  # Recommendation: Inject via UNIDROP_PSK_SECRET environment variable in production.
+-  psk_secret: "YOUR_SHARED_SECRET_KEY_HERE"
+-
+-  # Lightweight STUN server for NAT traversal assistance (RFC 8489)
+-  stun_addr: ":3478"
+-
+-limits:
+-  # Maximum items per transfer offer
+-  max_items_per_offer: 1000
+-
+-  # Idle timeout in seconds before closing inactive transfer pipes
+-  pipe_idle_timeout_seconds: 60
+-
+-  # Heartbeat ping timeout in seconds
+-  heartbeat_timeout_seconds: 45
+diff --git a/server/internal/config/config.go b/server/internal/config/config.go
+index 736bf75..17523f8 100644
+--- a/server/internal/config/config.go
++++ b/server/internal/config/config.go
+@@ -6,24 +6,31 @@ import (
+ )
+ 
+ // Config stores application configuration settings.
++//
++// Every field here must be read somewhere. Two former fields, MaxItemsPerOffer
++// and HeartbeatInterval, were defined and assigned but never read by anything:
++// the offer limit that actually applied was a bare 1000 literal in
++// control_ws.go, so editing the config had no effect and produced no warning
++// either (an exported struct field is never reported as unused). The offer
++// limit now lives in internal/limits; the heartbeat interval is the client's
++// decision, and the server only needs the timeout it sweeps against.
+ type Config struct {
+-	ListenAddr        string
+-	PSKSecret         string
+-	STUNAddr          string
+-	MaxItemsPerOffer  int
+-	HeartbeatInterval int // seconds
+-	HeartbeatTimeout  int // seconds
++	ListenAddr       string
++	PSKSecret        string
++	STUNAddr         string
++	HeartbeatTimeout int // seconds
+ }
+ 
+ // Load loads configuration from environment variables with sensible defaults.
++//
++// Transfer limits are deliberately not read here — see internal/limits, which
++// owns both their defaults and their parsing.
+ func Load() *Config {
+ 	cfg := &Config{
+-		ListenAddr:        ":8080",
+-		PSKSecret:         "default-insecure-psk-change-me",
+-		STUNAddr:          ":3478",
+-		MaxItemsPerOffer:  1000,
+-		HeartbeatInterval: 15,
+-		HeartbeatTimeout:  45,
++		ListenAddr:       ":8080",
++		PSKSecret:        "default-insecure-psk-change-me",
++		STUNAddr:         ":3478",
++		HeartbeatTimeout: 45,
+ 	}
+ 
+ 	if addr := os.Getenv("UNIDROP_LISTEN_ADDR"); addr != "" {
+diff --git a/server/internal/controller/control_ws.go b/server/internal/controller/control_ws.go
+index d2877d5..54a796b 100644
+--- a/server/internal/controller/control_ws.go
++++ b/server/internal/controller/control_ws.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/coder/websocket"
+ 	"github.com/google/uuid"
+ 	"github.com/unidrop/unidrop-server/internal/auth"
++	"github.com/unidrop/unidrop-server/internal/limits"
+ 	"github.com/unidrop/unidrop-server/internal/protocol"
+ 	"github.com/unidrop/unidrop-server/internal/registry"
+ 	"github.com/unidrop/unidrop-server/internal/relay"
+@@ -20,14 +21,16 @@ type ControlWSHandler struct {
+ 	verifier     *auth.Verifier
+ 	registry     *registry.DeviceRegistry
+ 	relayManager *relay.RelayManager
++	limits       limits.Limits
+ }
+ 
+ // NewControlWSHandler creates a new ControlWSHandler.
+-func NewControlWSHandler(v *auth.Verifier, reg *registry.DeviceRegistry, rm *relay.RelayManager) *ControlWSHandler {
++func NewControlWSHandler(v *auth.Verifier, reg *registry.DeviceRegistry, rm *relay.RelayManager, lim limits.Limits) *ControlWSHandler {
+ 	return &ControlWSHandler{
+ 		verifier:     v,
+ 		registry:     reg,
+ 		relayManager: rm,
++		limits:       lim,
+ 	}
+ }
+ 
+@@ -143,10 +146,14 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 
+ 	slog.Info("device authenticated", "device", session.DeviceID, "account", session.AccountID, "os", session.OSType)
+ 
+-	// Send AUTH_RESPONSE success
++	// Send AUTH_RESPONSE success, carrying the transfer limits so the client can
++	// refuse an oversized selection locally instead of learning about it a
++	// round trip later.
++	effectiveLimits := h.limits
+ 	authSuccessPayload, _ := json.Marshal(protocol.AuthResponsePayload{
+ 		Success:    true,
+ 		AssignedID: session.DeviceID,
++		Limits:     &effectiveLimits,
+ 	})
+ 	authSuccessEnv, _ := json.Marshal(protocol.ControlEnvelope{
+ 		Version:   1,
+@@ -249,13 +256,25 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 			if env.ToDevice == "" {
+ 				continue
+ 			}
+-			// P1-8: Enforce max items per offer limit (<= 1000)
+ 			var offer protocol.TransferOfferPayload
+-			if err := json.Unmarshal(env.Payload, &offer); err == nil {
+-				if len(offer.Items) > 1000 {
+-					slog.Warn("transfer offer exceeded items limit", "items", len(offer.Items), "device", session.DeviceID)
+-					continue
+-				}
++			if err := json.Unmarshal(env.Payload, &offer); err != nil {
++				// A malformed payload is refused rather than forwarded. The
++				// previous `if err == nil` guard only ran the limit check when
++				// the payload parsed, so anything unparsable sailed straight
++				// past it to the peer.
++				slog.Warn("malformed transfer offer refused", "device", session.DeviceID, "error", err)
++				h.rejectToSelf(ctx, session, salvageSessionID(env.Payload), &limits.Violation{
++					Code:    limits.CodeMalformedOffer,
++					Message: "传输请求格式无法解析，已拒绝",
++				})
++				continue
++			}
++			if v := limits.CheckOffer(h.limits, &offer); v != nil {
++				slog.Info("transfer offer refused by limits",
++					"device", session.DeviceID, "session", offer.SessionID,
++					"code", v.Code, "items", len(offer.Items), "total_size", offer.TotalSize)
++				h.rejectToSelf(ctx, session, offer.SessionID, v)
++				continue
+ 			}
+ 			h.routeToPeer(session, env)
+ 
+@@ -266,6 +285,31 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 			// P0-1, P2-7: Authorize session in RelayManager when receiver accepts offer
+ 			var answer protocol.TransferAnswerPayload
+ 			if err := json.Unmarshal(env.Payload, &answer); err == nil && answer.Accepted && h.relayManager != nil {
++				// Per-account concurrency is checked before a token is minted.
++				//
++				// On refusal the original answer is NOT forwarded. Forwarding a
++				// token-less answer is what the old code did on authorization
++				// failure, and the client skips such an answer silently
++				// (`if let Some(token)`), leaving the sender waiting forever —
++				// the same silent hang this round exists to remove, re-entered
++				// through a different door. Both peers are told instead: the
++				// receiver is this session, and the sender is env.ToDevice.
++				//
++				// Note the direction is the opposite of the OFFER rejection
++				// above. For an OFFER the sender is the current session; for an
++				// ANSWER the current session is the receiver and ToDevice is the
++				// sender. Reusing one helper for both would send "your file is
++				// too large" to the wrong peer.
++				inFlight := h.relayManager.CountAuthorizedForAccount(session.AccountID, answer.SessionID, time.Now())
++				if v := limits.ConcurrentViolation(h.limits, inFlight); v != nil {
++					slog.Info("transfer answer refused by concurrency limit",
++						"account", session.AccountID, "session", answer.SessionID,
++						"in_flight", inFlight, "code", v.Code)
++					h.rejectToSelf(ctx, session, answer.SessionID, v)
++					h.rejectToPeer(session, env.ToDevice, answer.SessionID, v)
++					continue
++				}
++
+ 				token, authErr := h.relayManager.AuthorizeSession(
+ 					answer.SessionID,
+ 					env.ToDevice,     // Sender is ToDevice
+@@ -309,6 +353,112 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	}
+ }
+ 
++// buildFailure wraps a limit violation as a TRANSFER_FAILURE envelope.
++func buildFailure(fromDevice, toDevice, sessionID string, v *limits.Violation) ([]byte, bool) {
++	// The client matches a failure to a card by session_id and does nothing at
++	// all when it is absent, so sending one without an id would be a rejection
++	// that reaches the wire and lands nowhere.
++	if sessionID == "" {
++		return nil, false
++	}
++	payload, err := json.Marshal(protocol.TransferFailurePayload{
++		SessionID:    sessionID,
++		ErrorCode:    v.Code,
++		ErrorMessage: v.Message,
++	})
++	if err != nil {
++		return nil, false
++	}
++	envBytes, err := json.Marshal(protocol.ControlEnvelope{
++		Version:    1,
++		TraceID:    uuid.NewString(),
++		Action:     protocol.ActionTransferFailure,
++		FromDevice: fromDevice,
++		ToDevice:   toDevice,
++		Timestamp:  time.Now().UnixMilli(),
++		Payload:    payload,
++	})
++	if err != nil {
++		return nil, false
++	}
++	return envBytes, true
++}
++
++// rejectToSelf sends a TRANSFER_FAILURE back to the device that sent the
++// message being refused.
++//
++// This deliberately does not go through routeToPeer: that helper delivers to
++// env.ToDevice, which for an OFFER is the *receiver*. Routing a rejection
++// there would tell the wrong device that its file is too large while the
++// sender kept waiting — leaving the very hang being fixed in place, now with a
++// misleading message attached.
++//
++// The write goes directly to the socket rather than through session.SendChan
++// because the refusal happens inside the read loop and should not be dropped
++// if the send queue is momentarily full.
++func (h *ControlWSHandler) rejectToSelf(ctx context.Context, session *registry.DeviceSession, sessionID string, v *limits.Violation) {
++	envBytes, ok := buildFailure("server", session.DeviceID, sessionID, v)
++	if !ok {
++		// Reachable when the payload was too broken to yield a session_id. The
++		// sender's card stays pending in that case; it is a known, accepted
++		// edge (only an out-of-spec client can produce it) and is logged so it
++		// is not mistaken for a missing feature.
++		slog.Warn("cannot deliver limit rejection: no session_id in payload",
++			"device", session.DeviceID, "code", v.Code)
++		return
++	}
++	if !session.Send(envBytes) {
++		slog.Warn("failed to deliver limit rejection to sender (queue full)",
++			"device", session.DeviceID, "code", v.Code)
++	}
++}
++
++// rejectToPeer sends a TRANSFER_FAILURE to the other party of a session.
++//
++// Used for the ANSWER path, where refusing the transfer must also unstick the
++// peer: by the time an answer is sent the receiver has already recorded its own
++// in-progress row, and the sender is still waiting on a reply that will now
++// never carry a token.
++func (h *ControlWSHandler) rejectToPeer(session *registry.DeviceSession, peerDevice, sessionID string, v *limits.Violation) {
++	if peerDevice == "" {
++		return
++	}
++	target, ok := h.registry.Get(peerDevice)
++	if !ok {
++		slog.Debug("peer offline for limit rejection", "to_device", peerDevice)
++		return
++	}
++	if target.AccountID != session.AccountID {
++		slog.Warn("cross-account limit rejection blocked", "from", session.AccountID, "to_device", peerDevice)
++		return
++	}
++	envBytes, ok := buildFailure("server", peerDevice, sessionID, v)
++	if !ok {
++		return
++	}
++	if !target.Send(envBytes) {
++		slog.Warn("failed to deliver limit rejection to peer (queue full)",
++			"to_device", peerDevice, "code", v.Code)
++	}
++}
++
++// salvageSessionID makes one lenient attempt to read session_id out of a
++// payload that failed strict decoding.
++//
++// The common malformed case is structurally valid JSON whose fields have the
++// wrong shape; session_id usually survives that, and recovering it is the
++// difference between a rejection the user sees and one that vanishes. When
++// even this fails the caller logs and gives up.
++func salvageSessionID(payload []byte) string {
++	var minimal struct {
++		SessionID string `json:"session_id"`
++	}
++	if err := json.Unmarshal(payload, &minimal); err != nil {
++		return ""
++	}
++	return minimal.SessionID
++}
++
+ // routeToPeer routes a control message to target peer and logs drops (P1-1).
+ func (h *ControlWSHandler) routeToPeer(session *registry.DeviceSession, env protocol.ControlEnvelope) {
+ 	if env.ToDevice == "" {
+diff --git a/server/internal/controller/control_ws_test.go b/server/internal/controller/control_ws_test.go
+index a5b2e18..ef8f2fb 100644
+--- a/server/internal/controller/control_ws_test.go
++++ b/server/internal/controller/control_ws_test.go
+@@ -11,6 +11,7 @@ import (
+ 	"github.com/coder/websocket"
+ 	"github.com/unidrop/unidrop-server/internal/auth"
+ 	"github.com/unidrop/unidrop-server/internal/controller"
++	"github.com/unidrop/unidrop-server/internal/limits"
+ 	"github.com/unidrop/unidrop-server/internal/registry"
+ 	"github.com/unidrop/unidrop-server/internal/relay"
+ )
+@@ -25,7 +26,7 @@ func TestDataWSUnauthorizedAccessRejected(t *testing.T) {
+ 	relayMgr := relay.NewRelayManager()
+ 
+ 	mux := http.NewServeMux()
+-	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, reg, relayMgr))
++	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, reg, relayMgr, limits.FromEnv()))
+ 	mux.Handle("GET /ws/data", controller.NewDataWSHandler(relayMgr))
+ 
+ 	server := httptest.NewServer(mux)
+diff --git a/server/internal/e2e_test.go b/server/internal/e2e_test.go
+index b2bde52..5285a89 100644
+--- a/server/internal/e2e_test.go
++++ b/server/internal/e2e_test.go
+@@ -17,6 +17,7 @@ import (
+ 	"github.com/google/uuid"
+ 	"github.com/unidrop/unidrop-server/internal/auth"
+ 	"github.com/unidrop/unidrop-server/internal/controller"
++	"github.com/unidrop/unidrop-server/internal/limits"
+ 	"github.com/unidrop/unidrop-server/internal/protocol"
+ 	"github.com/unidrop/unidrop-server/internal/registry"
+ 	"github.com/unidrop/unidrop-server/internal/relay"
+@@ -37,7 +38,7 @@ func TestEndToEndTransfer(t *testing.T) {
+ 
+ 	mux := http.NewServeMux()
+ 	mux.HandleFunc("GET /healthz", controller.HealthHandler(reg, relayMgr))
+-	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, reg, relayMgr))
++	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, reg, relayMgr, limits.FromEnv()))
+ 	mux.Handle("GET /ws/data", controller.NewDataWSHandler(relayMgr))
+ 
+ 	server := httptest.NewServer(mux)
+diff --git a/server/internal/protocol/envelope.go b/server/internal/protocol/envelope.go
+index 6a24aa2..30796d8 100644
+--- a/server/internal/protocol/envelope.go
++++ b/server/internal/protocol/envelope.go
+@@ -58,12 +58,35 @@ type AuthRequestPayload struct {
+ 	Timestamp  int64  `json:"timestamp"`
+ }
+ 
++// ServerLimits is the transfer limit set the server advertises to a client
++// right after authentication. It is configured by the operator through
++// environment variables and is read-only from the client's point of view.
++//
++// A zero on any field means that limit is switched off. Defaults and parsing
++// live in internal/limits, which is the sole source of truth for the values;
++// only the wire shape belongs here.
++type ServerLimits struct {
++	MaxSingleFileBytes     int64 `json:"max_single_file_bytes"`
++	MaxTotalTransferBytes  int64 `json:"max_total_transfer_bytes"`
++	MaxClipboardImageBytes int64 `json:"max_clipboard_image_bytes"`
++	MaxClipboardTextBytes  int64 `json:"max_clipboard_text_bytes"`
++	MaxItemsPerOffer       int   `json:"max_items_per_offer"`
++	MaxConcurrentTransfers int   `json:"max_concurrent_transfers"`
++}
++
+ // AuthResponsePayload is returned to client with auth outcome.
++//
++// Limits is a pointer with omitempty so that an older server — which simply
++// does not send the field — is distinguishable on the client from a server
++// that sent an all-zero set. The two must not be conflated: absent means
++// "unknown, fall back to the client's own constants", whereas all-zero would
++// mean "every limit switched off".
+ type AuthResponsePayload struct {
+-	Success      bool   `json:"success"`
+-	ErrorCode    string `json:"error_code,omitempty"`
+-	ErrorMessage string `json:"error_message,omitempty"`
+-	AssignedID   string `json:"assigned_id,omitempty"`
++	Success      bool          `json:"success"`
++	ErrorCode    string        `json:"error_code,omitempty"`
++	ErrorMessage string        `json:"error_message,omitempty"`
++	AssignedID   string        `json:"assigned_id,omitempty"`
++	Limits       *ServerLimits `json:"limits,omitempty"`
+ }
+ 
+ // OnlineDevice represents an active peer device.
+diff --git a/server/internal/relay/relay_manager.go b/server/internal/relay/relay_manager.go
+index 819e533..8420465 100644
+--- a/server/internal/relay/relay_manager.go
++++ b/server/internal/relay/relay_manager.go
+@@ -86,6 +86,40 @@ func (m *RelayManager) AuthorizeSession(sessionID, senderDevice, receiverDevice,
+ 	return token, nil
+ }
+ 
++// CountAuthorizedForAccount returns how many transfers the account currently
++// has in flight, where "in flight" means authorized and not yet finished.
++//
++// authSessions is the right set to count, not pipes: a pipe is only created
++// once both peers have connected to /ws/data, so counting pipes would miss
++// every transfer that has been granted a token but has not started moving
++// bytes — exactly the window a client would sit in while opening many
++// transfers at once. Entries leave this map through RemovePipe (on
++// COMPLETE/FAILURE/CANCEL), through SweepIdlePipes, or by expiry.
++//
++// excludeSessionID lets a re-authorization of an already-tracked session avoid
++// counting itself and being refused its own retry.
++//
++// The linear scan runs under RLock. It is deliberate: the map is bounded by
++// the 5 minute TTL and swept every 10 seconds, so it holds tens of entries,
++// and a scan costs microseconds. A per-account counter would be O(1) but adds
++// an invariant that has to be decremented correctly on all three removal
++// paths — more ways to be silently wrong than this is worth.
++func (m *RelayManager) CountAuthorizedForAccount(accountID, excludeSessionID string, now time.Time) int {
++	m.mu.RLock()
++	defer m.mu.RUnlock()
++
++	count := 0
++	for id, auth := range m.authSessions {
++		if id == excludeSessionID || auth.AccountID != accountID {
++			continue
++		}
++		if now.Before(auth.ExpiresAt) {
++			count++
++		}
++	}
++	return count
++}
++
+ // HasAuthSessions returns whether any authorization sessions are tracked.
+ func (m *RelayManager) HasAuthSessions() bool {
+ 	m.mu.RLock()
+diff --git a/client/src-tauri/src/commands/limits_cmd.rs b/client/src-tauri/src/commands/limits_cmd.rs
+new file mode 100644
+index 0000000..5dce2b0
+--- /dev/null
++++ b/client/src-tauri/src/commands/limits_cmd.rs
+@@ -0,0 +1,31 @@
++//! 服务端传输限额的只读查询（需求 3）。
++//!
++//! 限额的事实源在服务端的环境变量里，经 AUTH_RESPONSE 下发。本模块只负责把
++//! 已下发的那份读出来给界面看——**没有写回命令，这是刻意的**。
++//!
++//! 曾经的需求第 6 条要求「客户端可以设置服务端的一些参数」，论证后发现在当前
++//! 架构下无法成立：整个部署共用一把 PSK，account_id 由客户端自报，按字面实现
++//! 等于任何能连上的客户端都能改写全服务端策略。该条需求随后被删除。
++//! 三个候选方案的完整论证存档在 `.reviews/server-transfer-limits/plan/` 下，
++//! 日后若重新提上日程不必再推导一遍。
++//!
++//! 这里也**不预留任何「为将来准备」的空壳**——空壳本身就会变成下一个
++//! MaxItemsPerOffer：看起来是事实源，实际没人读。
++
++use tauri::State;
++
++use crate::app_state::AppState;
++use crate::protocol::ServerLimits;
++
++/// 读取服务端下发的传输限额。
++///
++/// 返回 `None` 表示尚未拿到：要么还没连上，要么对端是不下发这个字段的老服务端。
++/// 界面必须把 `None` 显示成「未下发」，**不要显示 0，也不要显示默认值**——
++/// 显示 0 会被读成「配额为零」，显示默认值会让用户以为那就是实际生效的值。
++#[tauri::command]
++pub async fn cmd_get_server_limits(
++    state: State<'_, AppState>,
++) -> Result<Option<ServerLimits>, String> {
++    let limits = state.server_limits.lock().await;
++    Ok(limits.clone())
++}
+diff --git a/server/configs/.env.example b/server/configs/.env.example
+new file mode 100644
+index 0000000..40ef977
+--- /dev/null
++++ b/server/configs/.env.example
+@@ -0,0 +1,78 @@
++# UniDrop 中继服务端配置模板
++#
++# 服务端**只读环境变量**，不解析任何配置文件。此前这里放的是一份
++# config.example.yaml，但全仓库没有一行 YAML 解析代码——照那份文件配置的人
++# 得到的是完全的静默无效。本文件与实际生效的机制一致。
++#
++# 用法（任选其一）：
++#   1. docker compose：把需要的项写进 docker-compose.yml 的 environment 块
++#   2. 直接运行：  set -a; . ./configs/.env; set +a; ./unidrop-server
++#   3. systemd：   EnvironmentFile=/etc/unidrop/env
++
++# ---------- 基础 ----------
++
++# HTTP / WebSocket 监听地址
++UNIDROP_LISTEN_ADDR=:8080
++
++# 客户端鉴权用的预共享密钥。**生产环境必须修改**，否则服务端会在启动日志里
++# 持续告警。注意它是整个部署共用的一把钥匙：知道它的客户端可以声明任意
++# account_id，账号隔离是便利分区而非安全边界。
++UNIDROP_PSK_SECRET=YOUR_SHARED_SECRET_KEY_HERE
++
++# 内建 STUN 服务监听地址（RFC 8489），留空则不启动
++UNIDROP_STUN_ADDR=:3478
++
++# 心跳超时秒数：超过这个时长没收到 ping 的会话会被清理
++UNIDROP_HEARTBEAT_TIMEOUT=45
++
++# ---------- 传输限额 ----------
++#
++# 以下五项决定「多大的东西允许经本服务端中转」。超限时服务端会向发送方回一条
++# TRANSFER_FAILURE，客户端据此提示「文件/剪贴板内容太大，无法传输」；
++# 客户端在鉴权后会收到这组值，并在发送前先本地拦一道。
++#
++# 取值规则（三态）：
++#   - 不设置该变量  → 取下面注释里的默认值
++#   - 设为 0        → **关闭该项限制**
++#   - 设为其它非负整数 → 原样生效
++#
++# 写错会怎样：非数字（如 "2GB"）、负数、带空格的值一律**退回默认值并打 warn**，
++# 不会变成 0。这一点是刻意的——0 在这里表示「不限制」，若解析失败直接取 0，
++# 一个拼错的值就会静默解除限制，而你以为刚刚配好了上限。
++# 启动日志里有一行 "transfer limits in effect"，核对它即可确认实际生效值。
++#
++# 单位一律是**字节**，且 1 MB = 1024×1024。
++
++# 单个文件字节上限（默认 134217728 = 128 MB）
++# 只对 data_type=FILES 生效；剪贴板图片/文本走下面各自的那条，互不叠加。
++#UNIDROP_MAX_SINGLE_FILE_BYTES=134217728
++
++# 单次传输总字节上限（默认 268435456 = 256 MB）
++# 对所有类型生效，包括剪贴板图片。调高图片上限时别忘了它，
++# 否则图片会先撞这条。
++#UNIDROP_MAX_TOTAL_TRANSFER_BYTES=268435456
++
++# 剪贴板图片字节上限（默认 67108864 = 64 MB）
++#UNIDROP_MAX_CLIPBOARD_IMAGE_BYTES=67108864
++
++# 剪贴板文本字节上限（默认 4194304 = 4 MB）
++# 4 MB 文本约等于四百万字符，正常剪贴内容达不到；超过多半是误操作或程序输出。
++#UNIDROP_MAX_CLIPBOARD_TEXT_BYTES=4194304
++
++# 单次 offer 的条目数上限（默认 64）
++#
++# 客户端不会递归展开目录，所以这个数的用户可见含义就是「一次最多选几个文件」。
++#
++# **调大它之前先看这条**：控制面单条消息有 512 KiB 的读上限
++# （control_ws.go 的 SetReadLimit），而 offer 的每个条目大约占 200–400 字节
++# （含相对路径与 64 字符的 sha256，路径越长越大）。条目数调到 1000 以上时，
++# offer 报文可能越过 512 KiB —— 那种情况下 websocket 库会**直接断连**，
++# 服务端根本没机会回这条 TRANSFER_FAILURE，用户看到的是掉线而不是拒绝提示。
++# 保守建议不超过 512。
++#UNIDROP_MAX_ITEMS_PER_OFFER=64
++
++# 单账号同时进行的传输数上限（默认 8）
++#
++# 「同时进行」= 已授权但尚未终结的会话。注意它按 account_id 计数，而
++# account_id 由客户端自报，所以这是**容量保护**，不是安全边界。
++#UNIDROP_MAX_CONCURRENT_TRANSFERS=8
+diff --git a/server/internal/controller/limits_ws_test.go b/server/internal/controller/limits_ws_test.go
+new file mode 100644
+index 0000000..af08224
+--- /dev/null
++++ b/server/internal/controller/limits_ws_test.go
+@@ -0,0 +1,342 @@
++package controller_test
++
++import (
++	"context"
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/coder/websocket"
++	"github.com/google/uuid"
++	"github.com/unidrop/unidrop-server/internal/auth"
++	"github.com/unidrop/unidrop-server/internal/controller"
++	"github.com/unidrop/unidrop-server/internal/limits"
++	"github.com/unidrop/unidrop-server/internal/protocol"
++	"github.com/unidrop/unidrop-server/internal/registry"
++	"github.com/unidrop/unidrop-server/internal/relay"
++)
++
++const testPSK = "test-psk-for-limits"
++
++// ---------- 握手脚手架 ----------
++//
++// 控制面握手原本只存在于 internal/e2e_test.go，跨包无法复用；本文件按需在
++// controller 包内重建一份最小实现。计划原稿曾误称 control_ws_test.go 里
++// 已有握手可复用——那里其实只有两个数据面测试。
++
++type limitsHarness struct {
++	server   *httptest.Server
++	verifier *auth.Verifier
++}
++
++func newLimitsHarness(t *testing.T, lim limits.Limits) *limitsHarness {
++	t.Helper()
++
++	verifier, err := auth.NewVerifier(testPSK)
++	if err != nil {
++		t.Fatalf("初始化校验器失败: %v", err)
++	}
++	reg := registry.NewDeviceRegistry()
++	relayMgr := relay.NewRelayManager()
++
++	mux := http.NewServeMux()
++	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, reg, relayMgr, lim))
++
++	srv := httptest.NewServer(mux)
++	t.Cleanup(srv.Close)
++
++	return &limitsHarness{server: srv, verifier: verifier}
++}
++
++// connect 完成 AUTH_CHALLENGE → AUTH_REQUEST → AUTH_RESPONSE，返回已鉴权的连接
++// 与服务端下发的 AUTH_RESPONSE。
++func (h *limitsHarness) connect(t *testing.T, ctx context.Context, accountID, deviceID string) (*websocket.Conn, protocol.AuthResponsePayload) {
++	t.Helper()
++
++	wsURL := "ws" + strings.TrimPrefix(h.server.URL, "http")
++	ws, _, err := websocket.Dial(ctx, wsURL+"/ws/control", nil)
++	if err != nil {
++		t.Fatalf("连接控制面失败: %v", err)
++	}
++	t.Cleanup(func() { _ = ws.CloseNow() })
++
++	_, challengeBytes, err := ws.Read(ctx)
++	if err != nil {
++		t.Fatalf("读取 challenge 失败: %v", err)
++	}
++	var challengeEnv protocol.ControlEnvelope
++	if err := json.Unmarshal(challengeBytes, &challengeEnv); err != nil ||
++		challengeEnv.Action != protocol.ActionAuthChallenge {
++		t.Fatalf("期望 AUTH_CHALLENGE，实际: %s", challengeBytes)
++	}
++	var challenge protocol.AuthChallengePayload
++	_ = json.Unmarshal(challengeEnv.Payload, &challenge)
++
++	now := time.Now().UnixMilli()
++	nonce := uuid.NewString()
++	sig := h.verifier.GenerateSignatureWithSalt(accountID, deviceID, nonce, now, challenge.NonceSalt)
++
++	reqPayload, _ := json.Marshal(protocol.AuthRequestPayload{
++		AccountID:  accountID,
++		DeviceID:   deviceID,
++		Hostname:   deviceID,
++		OSType:     "macos",
++		AppVersion: "test",
++		Signature:  sig,
++		Nonce:      nonce,
++		Timestamp:  now,
++	})
++	reqEnv, _ := json.Marshal(protocol.ControlEnvelope{
++		Version:   1,
++		TraceID:   uuid.NewString(),
++		Action:    protocol.ActionAuthRequest,
++		Timestamp: now,
++		Payload:   reqPayload,
++	})
++	if err := ws.Write(ctx, websocket.MessageText, reqEnv); err != nil {
++		t.Fatalf("发送 AUTH_REQUEST 失败: %v", err)
++	}
++
++	_, respBytes, err := ws.Read(ctx)
++	if err != nil {
++		t.Fatalf("读取 AUTH_RESPONSE 失败: %v", err)
++	}
++	var respEnv protocol.ControlEnvelope
++	_ = json.Unmarshal(respBytes, &respEnv)
++	var resp protocol.AuthResponsePayload
++	_ = json.Unmarshal(respEnv.Payload, &resp)
++	if !resp.Success {
++		t.Fatalf("鉴权失败: %s", resp.ErrorMessage)
++	}
++
++	// 紧随其后的 DEVICE_LIST_SYNC 先读掉，免得污染后续断言
++	_, _, _ = ws.Read(ctx)
++
++	return ws, resp
++}
++
++func sendOffer(t *testing.T, ctx context.Context, ws *websocket.Conn, from, to string, offer protocol.TransferOfferPayload) {
++	t.Helper()
++	payload, _ := json.Marshal(offer)
++	envBytes, _ := json.Marshal(protocol.ControlEnvelope{
++		Version:    1,
++		TraceID:    uuid.NewString(),
++		Action:     protocol.ActionTransferOffer,
++		FromDevice: from,
++		ToDevice:   to,
++		Timestamp:  time.Now().UnixMilli(),
++		Payload:    payload,
++	})
++	if err := ws.Write(ctx, websocket.MessageText, envBytes); err != nil {
++		t.Fatalf("发送 offer 失败: %v", err)
++	}
++}
++
++// readAction 读到指定 action 为止，跳过途中的拓扑广播。
++func readAction(t *testing.T, ctx context.Context, ws *websocket.Conn, want protocol.ActionType) protocol.ControlEnvelope {
++	t.Helper()
++	for i := 0; i < 8; i++ {
++		_, msgBytes, err := ws.Read(ctx)
++		if err != nil {
++			t.Fatalf("等待 %s 时读取失败: %v", want, err)
++		}
++		var env protocol.ControlEnvelope
++		if err := json.Unmarshal(msgBytes, &env); err != nil {
++			continue
++		}
++		if env.Action == want {
++			return env
++		}
++	}
++	t.Fatalf("未等到 %s", want)
++	return protocol.ControlEnvelope{}
++}
++
++func oversizedOffer() protocol.TransferOfferPayload {
++	return protocol.TransferOfferPayload{
++		SessionID:      uuid.NewString(),
++		DataType:       "FILES",
++		TotalSize:      limits.DefaultMaxSingleFileBytes + 1,
++		TotalItems:     1,
++		PreviewSummary: "huge.bin",
++		Items: []protocol.TransferItemPayload{
++			{ItemIndex: 0, RelativePath: "huge.bin", Size: limits.DefaultMaxSingleFileBytes + 1},
++		},
++	}
++}
++
++// ---------- AUTH_RESPONSE 下发限额 ----------
++
++func TestAuthResponseCarriesLimits(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++
++	h := newLimitsHarness(t, limits.FromEnv())
++	_, resp := h.connect(t, ctx, "acct", "dev-a")
++
++	if resp.Limits == nil {
++		t.Fatal("AUTH_RESPONSE 必须带上 limits，否则客户端无法做本地预检")
++	}
++	if resp.Limits.MaxSingleFileBytes != limits.DefaultMaxSingleFileBytes {
++		t.Fatalf("下发的单文件上限应为 %d，实际 %d",
++			limits.DefaultMaxSingleFileBytes, resp.Limits.MaxSingleFileBytes)
++	}
++	if resp.Limits.MaxItemsPerOffer != limits.DefaultMaxItemsPerOffer {
++		t.Fatalf("下发的条目数上限应为 %d，实际 %d",
++			limits.DefaultMaxItemsPerOffer, resp.Limits.MaxItemsPerOffer)
++	}
++}
++
++// ---------- 超限 offer：拒绝信必须到达发送方 ----------
++
++// 这条同时钉死两件事：拒绝信到达**发送方**（而不是被 routeToPeer 发给接收方），
++// 以及超限 offer **不被转发**给接收方。
++func TestOversizedOfferRejectedToSenderAndNotForwarded(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++
++	h := newLimitsHarness(t, limits.FromEnv())
++	sender, _ := h.connect(t, ctx, "acct", "dev-sender")
++	receiver, _ := h.connect(t, ctx, "acct", "dev-receiver")
++
++	offer := oversizedOffer()
++	sendOffer(t, ctx, sender, "dev-sender", "dev-receiver", offer)
++
++	// 发送方收到 TRANSFER_FAILURE
++	env := readAction(t, ctx, sender, protocol.ActionTransferFailure)
++	var failure protocol.TransferFailurePayload
++	if err := json.Unmarshal(env.Payload, &failure); err != nil {
++		t.Fatalf("解析 TRANSFER_FAILURE 失败: %v", err)
++	}
++	if failure.SessionID != offer.SessionID {
++		t.Fatalf("失败信必须带回原 session_id，否则客户端匹配不到卡片；期望 %s，实际 %q",
++			offer.SessionID, failure.SessionID)
++	}
++	if failure.ErrorCode != limits.CodeFileTooLarge {
++		t.Fatalf("错误码应为 %s，实际 %s", limits.CodeFileTooLarge, failure.ErrorCode)
++	}
++	if !strings.Contains(failure.ErrorMessage, "128.0 MB") {
++		t.Fatalf("文案必须写明上限，实际: %q", failure.ErrorMessage)
++	}
++
++	// 接收方不应收到这条 offer
++	readCtx, readCancel := context.WithTimeout(ctx, 600*time.Millisecond)
++	defer readCancel()
++	for {
++		_, msgBytes, err := receiver.Read(readCtx)
++		if err != nil {
++			break // 超时即符合预期：没有 offer 被转发过来
++		}
++		var env protocol.ControlEnvelope
++		if json.Unmarshal(msgBytes, &env) == nil && env.Action == protocol.ActionTransferOffer {
++			t.Fatal("超限 offer 不得被转发给接收方")
++		}
++	}
++}
++
++// 畸形 payload 必须被拒绝而不是放行。改造前的 `if err == nil` 只在解析成功时
++// 才做限额检查，解不开的 payload 反而被直接转发。
++func TestMalformedOfferRejectedNotForwarded(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++
++	h := newLimitsHarness(t, limits.FromEnv())
++	sender, _ := h.connect(t, ctx, "acct", "dev-sender")
++	receiver, _ := h.connect(t, ctx, "acct", "dev-receiver")
++
++	sessionID := uuid.NewString()
++	// JSON 结构合法但 items 的类型不对：严格解析失败，而 session_id 仍可打捞
++	badPayload := []byte(`{"session_id":"` + sessionID + `","data_type":"FILES","items":"not-an-array"}`)
++	envBytes, _ := json.Marshal(protocol.ControlEnvelope{
++		Version:    1,
++		TraceID:    uuid.NewString(),
++		Action:     protocol.ActionTransferOffer,
++		FromDevice: "dev-sender",
++		ToDevice:   "dev-receiver",
++		Timestamp:  time.Now().UnixMilli(),
++		Payload:    badPayload,
++	})
++	if err := sender.Write(ctx, websocket.MessageText, envBytes); err != nil {
++		t.Fatalf("发送畸形 offer 失败: %v", err)
++	}
++
++	env := readAction(t, ctx, sender, protocol.ActionTransferFailure)
++	var failure protocol.TransferFailurePayload
++	_ = json.Unmarshal(env.Payload, &failure)
++	if failure.ErrorCode != limits.CodeMalformedOffer {
++		t.Fatalf("错误码应为 %s，实际 %s", limits.CodeMalformedOffer, failure.ErrorCode)
++	}
++	// 打捞出的 session_id 让这条拒绝真的能落到卡片上
++	if failure.SessionID != sessionID {
++		t.Fatalf("应从畸形 payload 中打捞出 session_id %s，实际 %q", sessionID, failure.SessionID)
++	}
++
++	readCtx, readCancel := context.WithTimeout(ctx, 600*time.Millisecond)
++	defer readCancel()
++	for {
++		_, msgBytes, err := receiver.Read(readCtx)
++		if err != nil {
++			break
++		}
++		var got protocol.ControlEnvelope
++		if json.Unmarshal(msgBytes, &got) == nil && got.Action == protocol.ActionTransferOffer {
++			t.Fatal("畸形 offer 不得被转发给接收方")
++		}
++	}
++}
++
++// 限额内的 offer 必须照常转发——否则上面两条测试用「全都拒绝」也能通过。
++func TestWithinLimitOfferStillForwarded(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++
++	h := newLimitsHarness(t, limits.FromEnv())
++	sender, _ := h.connect(t, ctx, "acct", "dev-sender")
++	receiver, _ := h.connect(t, ctx, "acct", "dev-receiver")
++
++	offer := protocol.TransferOfferPayload{
++		SessionID:      uuid.NewString(),
++		DataType:       "FILES",
++		TotalSize:      1024,
++		TotalItems:     1,
++		PreviewSummary: "small.txt",
++		Items: []protocol.TransferItemPayload{
++			{ItemIndex: 0, RelativePath: "small.txt", Size: 1024},
++		},
++	}
++	sendOffer(t, ctx, sender, "dev-sender", "dev-receiver", offer)
++
++	env := readAction(t, ctx, receiver, protocol.ActionTransferOffer)
++	var got protocol.TransferOfferPayload
++	_ = json.Unmarshal(env.Payload, &got)
++	if got.SessionID != offer.SessionID {
++		t.Fatalf("限额内的 offer 应原样转发，期望 %s，实际 %s", offer.SessionID, got.SessionID)
++	}
++}
++
++// 上限设为 0（不限制）时，超大 offer 照常放行。
++func TestZeroLimitDisablesEnforcement(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++
++	lim := limits.FromEnv()
++	lim.MaxSingleFileBytes = 0
++	lim.MaxTotalTransferBytes = 0
++
++	h := newLimitsHarness(t, lim)
++	sender, _ := h.connect(t, ctx, "acct", "dev-sender")
++	receiver, _ := h.connect(t, ctx, "acct", "dev-receiver")
++
++	offer := oversizedOffer()
++	sendOffer(t, ctx, sender, "dev-sender", "dev-receiver", offer)
++
++	env := readAction(t, ctx, receiver, protocol.ActionTransferOffer)
++	var got protocol.TransferOfferPayload
++	_ = json.Unmarshal(env.Payload, &got)
++	if got.SessionID != offer.SessionID {
++		t.Fatalf("上限为 0 时应放行，期望 %s，实际 %s", offer.SessionID, got.SessionID)
++	}
++}
+diff --git a/server/internal/limits/limits.go b/server/internal/limits/limits.go
+new file mode 100644
+index 0000000..8c67dd5
+--- /dev/null
++++ b/server/internal/limits/limits.go
+@@ -0,0 +1,308 @@
++// Package limits owns the server-side transfer limit set: its defaults, its
++// environment parsing, and the single place an offer is checked against it.
++//
++// This package is the only source of truth for those five numbers. It reads
++// the environment itself rather than going through internal/config so that
++// the values exist in exactly one struct — routing them through Config first
++// would mean the same five numbers live in two places, which is the very
++// defect this round was opened to remove (config.MaxItemsPerOffer was defined,
++// assigned, and never read, while a bare literal in control_ws.go decided
++// the actual behaviour).
++package limits
++
++import (
++	"fmt"
++	"log/slog"
++	"os"
++	"strconv"
++
++	"github.com/unidrop/unidrop-server/internal/protocol"
++)
++
++// Default limits. Byte counts are binary (1 MB = 1024*1024), matching the
++// convention already used by the client's cache_max_size_mb.
++const (
++	DefaultMaxSingleFileBytes     int64 = 128 * 1024 * 1024 // 128 MB
++	DefaultMaxTotalTransferBytes  int64 = 256 * 1024 * 1024 // 256 MB
++	DefaultMaxClipboardImageBytes int64 = 64 * 1024 * 1024  // 64 MB
++	DefaultMaxClipboardTextBytes  int64 = 4 * 1024 * 1024   // 4 MB
++	DefaultMaxItemsPerOffer       int   = 64
++	DefaultMaxConcurrentTransfers int   = 8
++)
++
++// Environment variable names.
++const (
++	EnvMaxSingleFileBytes     = "UNIDROP_MAX_SINGLE_FILE_BYTES"
++	EnvMaxTotalTransferBytes  = "UNIDROP_MAX_TOTAL_TRANSFER_BYTES"
++	EnvMaxClipboardImageBytes = "UNIDROP_MAX_CLIPBOARD_IMAGE_BYTES"
++	EnvMaxClipboardTextBytes  = "UNIDROP_MAX_CLIPBOARD_TEXT_BYTES"
++	EnvMaxItemsPerOffer       = "UNIDROP_MAX_ITEMS_PER_OFFER"
++	EnvMaxConcurrentTransfers = "UNIDROP_MAX_CONCURRENT_TRANSFERS"
++)
++
++// Violation error codes sent to the client in TRANSFER_FAILURE.
++const (
++	CodeFileTooLarge      = "LIMIT_FILE_TOO_LARGE"
++	CodeTotalTooLarge     = "LIMIT_TOTAL_TOO_LARGE"
++	CodeImageTooLarge     = "LIMIT_IMAGE_TOO_LARGE"
++	CodeTextTooLarge      = "LIMIT_TEXT_TOO_LARGE"
++	CodeTooManyItems      = "LIMIT_TOO_MANY_ITEMS"
++	CodeTooManyConcurrent = "LIMIT_TOO_MANY_CONCURRENT"
++	CodeMalformedOffer    = "LIMIT_MALFORMED_OFFER"
++)
++
++// Violation describes a rejected offer. Message is user-facing Chinese text
++// and always carries both the actual value and the limit: a user who only
++// reads "文件太大" cannot tell what to change.
++type Violation struct {
++	Code    string
++	Message string
++}
++
++func (v *Violation) Error() string { return v.Code + ": " + v.Message }
++
++// Limits is an alias for the wire type. The struct itself lives in
++// internal/protocol because it crosses the network; the rules that give it
++// meaning live here.
++type Limits = protocol.ServerLimits
++
++// FromEnv builds the limit set from the environment.
++//
++// Each variable follows a three-state rule:
++//
++//	unset (or empty)   -> the default
++//	parses and >= 0    -> taken as-is, where 0 means "no limit"
++//	unparsable or < 0  -> the default, with a warning
++//
++// The third state is the one that matters. strconv's failure value is 0, and
++// 0 here means "unlimited" — so a typo'd variable name or a value written as
++// "2GB" would, with the obvious `v, _ := strconv.ParseInt(...)`, silently turn
++// a limit off while the operator believes they just configured it. The warning
++// is the only signal they will ever get, so it must not be skipped.
++func FromEnv() Limits {
++	return Limits{
++		MaxSingleFileBytes:     envInt64(EnvMaxSingleFileBytes, DefaultMaxSingleFileBytes),
++		MaxTotalTransferBytes:  envInt64(EnvMaxTotalTransferBytes, DefaultMaxTotalTransferBytes),
++		MaxClipboardImageBytes: envInt64(EnvMaxClipboardImageBytes, DefaultMaxClipboardImageBytes),
++		MaxClipboardTextBytes:  envInt64(EnvMaxClipboardTextBytes, DefaultMaxClipboardTextBytes),
++		MaxItemsPerOffer:       envInt(EnvMaxItemsPerOffer, DefaultMaxItemsPerOffer),
++		MaxConcurrentTransfers: envInt(EnvMaxConcurrentTransfers, DefaultMaxConcurrentTransfers),
++	}
++}
++
++// envInt64 is used for byte counts. ParseInt with an explicit 64-bit width is
++// required rather than strconv.Atoi: Atoi returns int, which is 32 bits on a
++// 32-bit build, and these values routinely exceed 2 GiB once an operator
++// raises them.
++func envInt64(name string, def int64) int64 {
++	raw, ok := os.LookupEnv(name)
++	if !ok || raw == "" {
++		return def
++	}
++	v, err := strconv.ParseInt(raw, 10, 64)
++	if err != nil || v < 0 {
++		slog.Warn("invalid transfer limit, keeping default",
++			"var", name, "value", raw, "default", def)
++		return def
++	}
++	return v
++}
++
++func envInt(name string, def int) int {
++	raw, ok := os.LookupEnv(name)
++	if !ok || raw == "" {
++		return def
++	}
++	v, err := strconv.Atoi(raw)
++	if err != nil || v < 0 {
++		slog.Warn("invalid transfer limit, keeping default",
++			"var", name, "value", raw, "default", def)
++		return def
++	}
++	return v
++}
++
++// LogSummary records the effective limits at startup. Without it there is no
++// way to tell a default apart from a deliberate configuration after the fact.
++func LogSummary(l Limits) {
++	slog.Info("transfer limits in effect",
++		"single_file", describe(l.MaxSingleFileBytes),
++		"total_transfer", describe(l.MaxTotalTransferBytes),
++		"clipboard_image", describe(l.MaxClipboardImageBytes),
++		"clipboard_text", describe(l.MaxClipboardTextBytes),
++		"items_per_offer", describeCount(l.MaxItemsPerOffer),
++		"concurrent_transfers", describeCount(l.MaxConcurrentTransfers),
++	)
++}
++
++// CheckOffer validates an offer against the limits and returns nil when it
++// passes.
++//
++// The limits fall into two tiers that must not be mixed:
++//
++//   - Universal: item count and total bytes apply to every data_type. They
++//     protect relay capacity, which no content type is exempt from.
++//   - Content: mutually exclusive by data_type. FILES is bounded by
++//     MaxSingleFileBytes, IMAGE by MaxClipboardImageBytes, TEXT by
++//     MaxClipboardTextBytes.
++//
++// The exclusivity is the point. Applying the file limit to a clipboard image
++// as well would let MaxSingleFileBytes silently override an image limit the
++// operator deliberately raised, which turns MaxClipboardImageBytes into
++// another knob that looks configured but does nothing — and it would report
++// "文件太大" for something the user pasted rather than picked, contradicting
++// the requirement's own wording. An oversized image is still caught by the
++// universal total, which reports accurately.
++//
++// Check order is fixed rather than map-driven so the reported code is
++// deterministic when several limits are exceeded at once: count, then the
++// content dimension, then the total. Content precedes total because "one file
++// is over 128 MB" tells the user exactly which file to drop, whereas the
++// aggregate leaves them removing items one at a time.
++func CheckOffer(l Limits, offer *protocol.TransferOfferPayload) *Violation {
++	// Negative sizes are rejected outright. They are not reachable from an
++	// honest client, and left alone they would drag the computed total down
++	// and slip a genuinely oversized transfer past the total check.
++	for i := range offer.Items {
++		if offer.Items[i].Size < 0 {
++			return &Violation{
++				Code:    CodeMalformedOffer,
++				Message: "传输请求包含非法的文件大小，已拒绝",
++			}
++		}
++	}
++	if offer.TotalSize < 0 {
++		return &Violation{
++			Code:    CodeMalformedOffer,
++			Message: "传输请求包含非法的总大小，已拒绝",
++		}
++	}
++
++	if l.MaxItemsPerOffer > 0 && len(offer.Items) > l.MaxItemsPerOffer {
++		return &Violation{
++			Code: CodeTooManyItems,
++			Message: fmt.Sprintf("一次最多传输 %d 个文件，本次选择了 %d 个，无法传输",
++				l.MaxItemsPerOffer, len(offer.Items)),
++		}
++	}
++
++	if v := checkContent(l, offer); v != nil {
++		return v
++	}
++
++	// The declared total is not trusted over the items it claims to summarise:
++	// a client that under-reports TotalSize would otherwise buy itself room it
++	// has not been granted. This does not make the limit enforceable against a
++	// tampered client (nothing here counts bytes on the wire) — it just stops
++	// the cheapest way of getting it wrong.
++	total := offer.TotalSize
++	var sum int64
++	for i := range offer.Items {
++		sum += offer.Items[i].Size
++	}
++	if sum > total {
++		total = sum
++	}
++
++	if l.MaxTotalTransferBytes > 0 && total > l.MaxTotalTransferBytes {
++		return &Violation{
++			Code: CodeTotalTooLarge,
++			Message: fmt.Sprintf("单次传输总量最大 %s，本次为 %s，无法传输",
++				humanBytes(l.MaxTotalTransferBytes), humanBytes(total)),
++		}
++	}
++
++	return nil
++}
++
++func checkContent(l Limits, offer *protocol.TransferOfferPayload) *Violation {
++	switch offer.DataType {
++	case "IMAGE":
++		return clipboardViolation(offer, l.MaxClipboardImageBytes, CodeImageTooLarge, "剪贴板图片")
++	case "TEXT":
++		return clipboardViolation(offer, l.MaxClipboardTextBytes, CodeTextTooLarge, "剪贴板文本")
++	default:
++		// FILES, and anything a future client sends that we do not recognise.
++		// Falling back to the file rule keeps an unknown type bounded instead
++		// of unbounded.
++		if l.MaxSingleFileBytes <= 0 {
++			return nil
++		}
++		for i := range offer.Items {
++			if offer.Items[i].Size > l.MaxSingleFileBytes {
++				return &Violation{
++					Code: CodeFileTooLarge,
++					Message: fmt.Sprintf("单个文件最大 %s，「%s」为 %s，无法传输",
++						humanBytes(l.MaxSingleFileBytes),
++						offer.Items[i].RelativePath,
++						humanBytes(offer.Items[i].Size)),
++				}
++			}
++		}
++		return nil
++	}
++}
++
++// clipboardViolation bounds a clipboard offer by both its declared total and
++// each of its items. In practice a clipboard offer carries exactly one item,
++// so the two agree; checking both costs nothing and avoids a gap if that ever
++// stops being true.
++func clipboardViolation(offer *protocol.TransferOfferPayload, limit int64, code, label string) *Violation {
++	if limit <= 0 {
++		return nil
++	}
++	largest := offer.TotalSize
++	for i := range offer.Items {
++		if offer.Items[i].Size > largest {
++			largest = offer.Items[i].Size
++		}
++	}
++	if largest > limit {
++		return &Violation{
++			Code: code,
++			Message: fmt.Sprintf("%s最大 %s，本次为 %s，无法传输",
++				label, humanBytes(limit), humanBytes(largest)),
++		}
++	}
++	return nil
++}
++
++// ConcurrentViolation is reported when an account already has the maximum
++// number of authorized-but-unfinished sessions.
++func ConcurrentViolation(l Limits, inFlight int) *Violation {
++	if l.MaxConcurrentTransfers <= 0 || inFlight < l.MaxConcurrentTransfers {
++		return nil
++	}
++	return &Violation{
++		Code: CodeTooManyConcurrent,
++		Message: fmt.Sprintf("最多同时进行 %d 个传输，当前已有 %d 个，请稍后重试",
++			l.MaxConcurrentTransfers, inFlight),
++	}
++}
++
++func humanBytes(n int64) string {
++	const unit = 1024
++	if n < unit {
++		return fmt.Sprintf("%d B", n)
++	}
++	div, exp := int64(unit), 0
++	for v := n / unit; v >= unit && exp < 3; v /= unit {
++		div *= unit
++		exp++
++	}
++	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGT"[exp])
++}
++
++func describe(n int64) string {
++	if n <= 0 {
++		return "unlimited"
++	}
++	return humanBytes(n)
++}
++
++func describeCount(n int) string {
++	if n <= 0 {
++		return "unlimited"
++	}
++	return strconv.Itoa(n)
++}
+diff --git a/server/internal/limits/limits_test.go b/server/internal/limits/limits_test.go
+new file mode 100644
+index 0000000..78f6515
+--- /dev/null
++++ b/server/internal/limits/limits_test.go
+@@ -0,0 +1,352 @@
++package limits
++
++import (
++	"testing"
++
++	"github.com/unidrop/unidrop-server/internal/protocol"
++)
++
++func filesOffer(sizes ...int64) *protocol.TransferOfferPayload {
++	offer := &protocol.TransferOfferPayload{DataType: "FILES"}
++	for i, s := range sizes {
++		offer.Items = append(offer.Items, protocol.TransferItemPayload{
++			ItemIndex:    uint32(i),
++			RelativePath: "f.bin",
++			Size:         s,
++		})
++		offer.TotalSize += s
++	}
++	offer.TotalItems = len(offer.Items)
++	return offer
++}
++
++func clipOffer(dataType string, size int64) *protocol.TransferOfferPayload {
++	return &protocol.TransferOfferPayload{
++		DataType:   dataType,
++		TotalSize:  size,
++		TotalItems: 1,
++		Items: []protocol.TransferItemPayload{
++			{ItemIndex: 0, RelativePath: "clipboard", Size: size},
++		},
++	}
++}
++
++func defaults() Limits {
++	return Limits{
++		MaxSingleFileBytes:     DefaultMaxSingleFileBytes,
++		MaxTotalTransferBytes:  DefaultMaxTotalTransferBytes,
++		MaxClipboardImageBytes: DefaultMaxClipboardImageBytes,
++		MaxClipboardTextBytes:  DefaultMaxClipboardTextBytes,
++		MaxItemsPerOffer:       DefaultMaxItemsPerOffer,
++		MaxConcurrentTransfers: DefaultMaxConcurrentTransfers,
++	}
++}
++
++// ---------- 边界：恰好等于上限必须通过 ----------
++
++func TestExactlyAtLimitPasses(t *testing.T) {
++	l := defaults()
++
++	if v := CheckOffer(l, filesOffer(DefaultMaxSingleFileBytes)); v != nil {
++		t.Fatalf("单文件恰好等于上限应通过，却被拒：%v", v)
++	}
++	if v := CheckOffer(l, clipOffer("IMAGE", DefaultMaxClipboardImageBytes)); v != nil {
++		t.Fatalf("图片恰好等于上限应通过，却被拒：%v", v)
++	}
++	if v := CheckOffer(l, clipOffer("TEXT", DefaultMaxClipboardTextBytes)); v != nil {
++		t.Fatalf("文本恰好等于上限应通过，却被拒：%v", v)
++	}
++
++	// 条目数恰好等于上限
++	sizes := make([]int64, DefaultMaxItemsPerOffer)
++	for i := range sizes {
++		sizes[i] = 1
++	}
++	if v := CheckOffer(l, filesOffer(sizes...)); v != nil {
++		t.Fatalf("条目数恰好等于上限应通过，却被拒：%v", v)
++	}
++}
++
++func TestOneOverLimitRejected(t *testing.T) {
++	l := defaults()
++
++	if v := CheckOffer(l, filesOffer(DefaultMaxSingleFileBytes+1)); v == nil {
++		t.Fatal("单文件超上限 1 字节必须被拒")
++	} else if v.Code != CodeFileTooLarge {
++		t.Fatalf("错误码应为 %s，实际 %s", CodeFileTooLarge, v.Code)
++	}
++
++	if v := CheckOffer(l, clipOffer("IMAGE", DefaultMaxClipboardImageBytes+1)); v == nil {
++		t.Fatal("图片超上限必须被拒")
++	} else if v.Code != CodeImageTooLarge {
++		t.Fatalf("错误码应为 %s，实际 %s", CodeImageTooLarge, v.Code)
++	}
++
++	if v := CheckOffer(l, clipOffer("TEXT", DefaultMaxClipboardTextBytes+1)); v == nil {
++		t.Fatal("文本超上限必须被拒")
++	} else if v.Code != CodeTextTooLarge {
++		t.Fatalf("错误码应为 %s，实际 %s", CodeTextTooLarge, v.Code)
++	}
++
++	sizes := make([]int64, DefaultMaxItemsPerOffer+1)
++	for i := range sizes {
++		sizes[i] = 1
++	}
++	if v := CheckOffer(l, filesOffer(sizes...)); v == nil {
++		t.Fatal("条目数超上限必须被拒")
++	} else if v.Code != CodeTooManyItems {
++		t.Fatalf("错误码应为 %s，实际 %s", CodeTooManyItems, v.Code)
++	}
++}
++
++// ---------- 0 = 不限制 ----------
++
++func TestZeroMeansUnlimited(t *testing.T) {
++	l := Limits{} // 全 0
++
++	huge := int64(1) << 40 // 1 TiB
++	if v := CheckOffer(l, filesOffer(huge)); v != nil {
++		t.Fatalf("单文件上限为 0 时任意大小都应通过，却被拒：%v", v)
++	}
++	if v := CheckOffer(l, clipOffer("IMAGE", huge)); v != nil {
++		t.Fatalf("图片上限为 0 时任意大小都应通过，却被拒：%v", v)
++	}
++
++	sizes := make([]int64, 5000)
++	for i := range sizes {
++		sizes[i] = 1
++	}
++	if v := CheckOffer(l, filesOffer(sizes...)); v != nil {
++		t.Fatalf("条目数上限为 0 时任意条数都应通过，却被拒：%v", v)
++	}
++
++	if v := ConcurrentViolation(l, 9999); v != nil {
++		t.Fatalf("并发上限为 0 时不应拒绝：%v", v)
++	}
++}
++
++// ---------- 内容维度按 data_type 互斥 ----------
++
++// 这条守护的是计划 §4.4 的分层裁决（AGY-02）：图片走图片上限，**不再**
++// 叠加单文件上限。若有人把两者改成「同时适用取更严」，运营调高的图片上限
++// 会被单文件上限静默压制——那正是本轮要消灭的「配了不生效」。
++func TestClipboardImageNotBoundBySingleFileLimit(t *testing.T) {
++	l := defaults()
++	l.MaxClipboardImageBytes = 512 * 1024 * 1024 // 运营特意调高到 512 MB
++	l.MaxTotalTransferBytes = 0                  // 单独考察内容维度
++	// 单文件上限保持 128 MB
++
++	offer := clipOffer("IMAGE", 200*1024*1024) // 200 MB，高于单文件上限
++	if v := CheckOffer(l, offer); v != nil {
++		t.Fatalf("图片只应受图片上限约束，不应被单文件上限拦下：%v", v)
++	}
++}
++
++// 反向：文件仍然受单文件上限约束，不会因为图片上限调高而放行。
++func TestFilesStillBoundBySingleFileLimit(t *testing.T) {
++	l := defaults()
++	l.MaxClipboardImageBytes = 512 * 1024 * 1024
++	l.MaxTotalTransferBytes = 0
++
++	if v := CheckOffer(l, filesOffer(200*1024*1024)); v == nil {
++		t.Fatal("FILES 必须仍受单文件上限约束")
++	}
++}
++
++// 超大图片仍被「通用维度」的总量上限兜住，且报的是准确的那条错误码。
++func TestOversizedImageStillCaughtByTotalLimit(t *testing.T) {
++	l := defaults()
++	l.MaxClipboardImageBytes = 512 * 1024 * 1024
++
++	v := CheckOffer(l, clipOffer("IMAGE", 300*1024*1024)) // > 256 MB 总量
++	if v == nil {
++		t.Fatal("超过总量上限的图片必须被拒")
++	}
++	if v.Code != CodeTotalTooLarge {
++		t.Fatalf("应报总量超限而非图片超限，实际 %s", v.Code)
++	}
++}
++
++// ---------- 多项同时超限时错误码确定 ----------
++
++func TestViolationOrderIsDeterministic(t *testing.T) {
++	l := defaults()
++
++	// 条目数、单文件、总量三者同时超限
++	sizes := make([]int64, DefaultMaxItemsPerOffer+1)
++	for i := range sizes {
++		sizes[i] = DefaultMaxSingleFileBytes + 1
++	}
++	offer := filesOffer(sizes...)
++
++	for i := 0; i < 50; i++ {
++		v := CheckOffer(l, offer)
++		if v == nil || v.Code != CodeTooManyItems {
++			t.Fatalf("第 %d 次：条目数应优先报出，实际 %v", i, v)
++		}
++	}
++
++	// 单文件与总量同时超限时，报更可操作的单文件
++	v := CheckOffer(l, filesOffer(DefaultMaxSingleFileBytes+1, DefaultMaxTotalTransferBytes))
++	if v == nil || v.Code != CodeFileTooLarge {
++		t.Fatalf("单文件应优先于总量报出，实际 %v", v)
++	}
++}
++
++// ---------- 文案必须带具体数字 ----------
++
++// 计划 §4.1.1：条目数与总量是最常触发的两条，只说「太多」「太大」用户
++// 无从下手。这条测试把「文案里必须出现上限数字」钉死。
++func TestMessagesCarryActionableNumbers(t *testing.T) {
++	l := defaults()
++
++	sizes := make([]int64, DefaultMaxItemsPerOffer+1)
++	for i := range sizes {
++		sizes[i] = 1
++	}
++	v := CheckOffer(l, filesOffer(sizes...))
++	if v == nil || !contains(v.Message, "64") {
++		t.Fatalf("条目数超限文案必须写明上限 64，实际：%q", msgOf(v))
++	}
++
++	v = CheckOffer(l, filesOffer(DefaultMaxSingleFileBytes+1))
++	if v == nil || !contains(v.Message, "128.0 MB") {
++		t.Fatalf("单文件超限文案必须写明上限，实际：%q", msgOf(v))
++	}
++}
++
++// ---------- 非法大小 ----------
++
++func TestNegativeSizesRejected(t *testing.T) {
++	l := defaults()
++
++	// 负数会把求和拉低，从而把真正超限的传输混过总量检查。
++	offer := filesOffer(DefaultMaxTotalTransferBytes, -DefaultMaxTotalTransferBytes)
++	v := CheckOffer(l, offer)
++	if v == nil || v.Code != CodeMalformedOffer {
++		t.Fatalf("含负数大小的 offer 必须被拒为畸形，实际 %v", v)
++	}
++}
++
++// 自报总量小于各条目之和时，以求和为准。
++func TestUnderreportedTotalDoesNotBuyHeadroom(t *testing.T) {
++	l := defaults()
++
++	offer := filesOffer(100*1024*1024, 100*1024*1024, 100*1024*1024) // 实为 300 MB
++	offer.TotalSize = 1                                              // 自报 1 字节
++
++	v := CheckOffer(l, offer)
++	if v == nil || v.Code != CodeTotalTooLarge {
++		t.Fatalf("自报总量偏小不应换来额度，实际 %v", v)
++	}
++}
++
++// ---------- env 三态解析 ----------
++
++func TestEnvUnsetTakesDefault(t *testing.T) {
++	l := FromEnv()
++	if l.MaxSingleFileBytes != DefaultMaxSingleFileBytes {
++		t.Fatalf("未设置时应取默认值 %d，实际 %d", DefaultMaxSingleFileBytes, l.MaxSingleFileBytes)
++	}
++	if l.MaxItemsPerOffer != DefaultMaxItemsPerOffer {
++		t.Fatalf("未设置时应取默认值 %d，实际 %d", DefaultMaxItemsPerOffer, l.MaxItemsPerOffer)
++	}
++}
++
++// 这条是本包最重要的一条。strconv 失败返回 0，而 0 在这里表示「不限制」，
++// 所以一个写错的变量值（拼错、带单位、负数）若被直接采用，会**静默解除限制**，
++// 而运营以为自己刚配好了上限。三态规则要求这种情况退回默认值。
++func TestInvalidEnvFallsBackToDefaultNotZero(t *testing.T) {
++	cases := []string{"2GB", "abc", "-1", "12.5", " 128", ""}
++
++	for _, raw := range cases {
++		t.Run("raw="+raw, func(t *testing.T) {
++			t.Setenv(EnvMaxSingleFileBytes, raw)
++			t.Setenv(EnvMaxItemsPerOffer, raw)
++
++			l := FromEnv()
++			if l.MaxSingleFileBytes != DefaultMaxSingleFileBytes {
++				t.Fatalf("非法值 %q 必须退回默认值 %d，实际 %d —— 若为 0 则限制被静默解除",
++					raw, DefaultMaxSingleFileBytes, l.MaxSingleFileBytes)
++			}
++			if l.MaxItemsPerOffer != DefaultMaxItemsPerOffer {
++				t.Fatalf("非法值 %q 必须退回默认值 %d，实际 %d",
++					raw, DefaultMaxItemsPerOffer, l.MaxItemsPerOffer)
++			}
++		})
++	}
++}
++
++// 「显式设 0」与「未设置」必须可区分：前者是运营明确要关掉该项，
++// 后者是没表态。两者若混为一谈，就无法关掉任何一项限制。
++func TestExplicitZeroIsDistinguishableFromUnset(t *testing.T) {
++	t.Setenv(EnvMaxSingleFileBytes, "0")
++	t.Setenv(EnvMaxItemsPerOffer, "0")
++
++	l := FromEnv()
++	if l.MaxSingleFileBytes != 0 {
++		t.Fatalf("显式设 0 应得到 0（不限制），实际 %d", l.MaxSingleFileBytes)
++	}
++	if l.MaxItemsPerOffer != 0 {
++		t.Fatalf("显式设 0 应得到 0（不限制），实际 %d", l.MaxItemsPerOffer)
++	}
++
++	// 而未设置的那几项仍是默认值，证明两种状态确实分得开
++	if l.MaxClipboardImageBytes != DefaultMaxClipboardImageBytes {
++		t.Fatalf("未设置项应保持默认值，实际 %d", l.MaxClipboardImageBytes)
++	}
++}
++
++func TestValidEnvIsTakenAsIs(t *testing.T) {
++	t.Setenv(EnvMaxTotalTransferBytes, "1048576")
++	t.Setenv(EnvMaxConcurrentTransfers, "3")
++
++	l := FromEnv()
++	if l.MaxTotalTransferBytes != 1048576 {
++		t.Fatalf("合法值应原样采用，实际 %d", l.MaxTotalTransferBytes)
++	}
++	if l.MaxConcurrentTransfers != 3 {
++		t.Fatalf("合法值应原样采用，实际 %d", l.MaxConcurrentTransfers)
++	}
++}
++
++// 字节字段必须能表达超过 2 GiB 的值。用 strconv.Atoi 时在 32 位构建上会溢出。
++func TestByteLimitsExceedingTwoGiB(t *testing.T) {
++	t.Setenv(EnvMaxTotalTransferBytes, "8589934592") // 8 GiB
++
++	l := FromEnv()
++	if l.MaxTotalTransferBytes != 8589934592 {
++		t.Fatalf("8 GiB 应被完整解析，实际 %d", l.MaxTotalTransferBytes)
++	}
++}
++
++// ---------- 并发 ----------
++
++func TestConcurrentViolation(t *testing.T) {
++	l := defaults() // 上限 8
++
++	if v := ConcurrentViolation(l, 7); v != nil {
++		t.Fatalf("低于上限不应拒绝：%v", v)
++	}
++	if v := ConcurrentViolation(l, 8); v == nil {
++		t.Fatal("已达上限时新会话必须被拒")
++	} else if v.Code != CodeTooManyConcurrent {
++		t.Fatalf("错误码应为 %s，实际 %s", CodeTooManyConcurrent, v.Code)
++	}
++}
++
++func contains(s, sub string) bool {
++	for i := 0; i+len(sub) <= len(s); i++ {
++		if s[i:i+len(sub)] == sub {
++			return true
++		}
++	}
++	return false
++}
++
++func msgOf(v *Violation) string {
++	if v == nil {
++		return "<nil>"
++	}
++	return v.Message
++}

@@ -1,0 +1,169 @@
+---
+schema: trivium.review.v1
+topic: server-transfer-limits
+stage: code
+role: gemini
+vendor: antigravity
+agent_cli: agy/1.2.2
+model_requested: gemini-3.8-flash-high
+model_effective: gemini-3.8-flash-high
+model_effective_source: envelope
+effort: high
+run_id: 20260913T065303Z
+rerun_index: 1
+snapshot_hash: sha256:33a6d8830f252c9cdba05ad31a86befcf9d53c197c4cc857b5a5fd7628f0d905
+blind: true
+started_at: 2026-09-13T06:53:05.071Z
+finished_at: 2026-09-13T07:00:31.086Z
+duration_s: 201
+tool_calls:
+  read: 38
+  grep: 12
+  glob: 1
+  run_command: 0
+  project_reads: 16
+evidence_ok: true
+verdict: approve-with-nits
+findings_count:
+  blocker: 0
+  major: 0
+  minor: 4
+  nit: 0
+degraded: false
+parse_fallback: false
+peer_deny: false
+drift: false
+consulted_unverified: true
+heterogeneous: true
+session_id: 89e696e5-521a-4bc8-8363-dd03bf3a647e
+---
+
+# 代码审查：server-transfer-limits
+
+> Critic-A · Google Antigravity ｜ 模型 `gemini-3.8-flash-high`
+> ｜ 运行 `20260913T065303Z`
+
+> ⚠️ **路径级 deny 未生效**：本机该侧 CLI 不支持路径级读取拒绝，对方历史产出的屏蔽仅依赖任务书禁读清单与事后轨迹核验。
+
+## 总判断
+
+1. 接收端处理 TRANSFER_FAILURE 时遗漏了 pending_inbound 清理，并发拒绝时会残留 offer 导致内存泄漏；
+2. rejectToSelf 注释与实际调用 session.Send 相反且残留未用 ctx，存在维护性误导；
+3. 账号并发统计与授权之间存在 TOCTOU 读写锁间隙，极高并发下可能轻微击穿上限；
+4. CountAuthorizedForAccount 及 Answer 并发拒绝双向回送链路缺乏测试覆盖；
+总体而言，核心设计落地扎实：env 三态解析规范，兜底常量隔离正确，预检前置与目录跳过口径统一，旧版本兼容与双向拒绝机制基本闭环，同意合入并建议跟进上述细节。
+
+**结论**：`approve-with-nits`
+
+## 审查意见（共 4 条：次要 4）
+
+### AGY-01 · 次要（minor）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `client/src-tauri/src/lib.rs:276` |
+| 类别 | correctness ｜ 层次 code |
+| 置信度 | high |
+
+**问题**：接收端收到 TRANSFER_FAILURE 时仅清理了 pending_outbound，遗漏了 pending_inbound，导致并发限额等场景被服务端拒绝的接收会话发生内存泄漏
+
+**依据**：在 client/src-tauri/src/lib.rs:185 中，接收端收到 TRANSFER_OFFER 后会向 pending_inbound_ref 插入 (offer, sender_device) 并回送 TRANSFER_ANSWER。当服务端因并发限额等原因在 control_ws.go:309 调用 rejectToSelf 向接收端回送 TRANSFER_FAILURE 时，lib.rs:276-280 仅执行了 pending_outbound.lock().await.remove(&sid)，未对 pending_inbound_ref 执行 remove(&sid)，使得被拒绝的接收任务在 pending_inbound 中永久残留。
+
+**建议**：在 client/src-tauri/src/lib.rs 的 TRANSFER_FAILURE 分支中，同步对 pending_inbound_ref 执行 remove(&sid) 清理，保持两端待处理会话映射的生命周期一致。
+
+### AGY-02 · 次要（minor）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `server/internal/controller/control_ws.go:396` |
+| 类别 | maintainability ｜ 层次 code |
+| 置信度 | high |
+
+**问题**：rejectToSelf 的代码注释与实际行为完全相反，且携带了未使用的 ctx 形参
+
+**依据**：在 server/internal/controller/control_ws.go:396-398 中，注释声称「The write goes directly to the socket rather than through session.SendChan because the refusal happens inside the read loop...」，但第 410 行实际调用的是 session.Send(envBytes) 入队到 SendChan，并在队列满时丢弃；且函数签名中的 ctx 参数从未使用。注释与实现恰好相反，容易误导维护者。
+
+**建议**：修正 control_ws.go:396 处的注释，说明此处使用 session.Send 是为了遵循单一 WritePump 协程以避免底层 websocket 并发写入冲突；同时移除未使用的 ctx 形参。
+
+### AGY-03 · 次要（minor）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `server/internal/controller/control_ws.go:303` |
+| 类别 | concurrency ｜ 层次 code |
+| 置信度 | medium |
+
+**问题**：按账号并发限额检查与会话授权之间存在 TOCTOU 竞争窗口，突发并发可能击穿上限
+
+**依据**：在 server/internal/controller/control_ws.go:303-319 中，CountAuthorizedForAccount（仅获取读锁 RLock 并释放）与 AuthorizeSession（获取写锁 Lock）为两次独立加锁。当同一账号下的多个 TRANSFER_ANSWER 在同一时刻到达时，均可在第一阶段检测到未超限，随后相继成功授权，导致短时间内并发传输数突破 UNIDROP_MAX_CONCURRENT_TRANSFERS。
+
+**建议**：将并发统计与授权检查收敛到 RelayManager 内的一个原子方法中（如 AuthorizeSessionIfUnderLimit），在持有写锁的临界区内完成统计与 token 生成。
+
+### AGY-04 · 次要（minor）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `server/internal/relay/relay_manager.go:107` |
+| 类别 | test-gap ｜ 层次 code |
+| 置信度 | high |
+
+**问题**：CountAuthorizedForAccount 核心统计逻辑与 WebSocket 接收端并发限额拒绝路径均缺乏自动化测试覆盖
+
+**依据**：全仓检索发现 CountAuthorizedForAccount 仅在 server/internal/relay/relay_manager.go 与 server/internal/controller/control_ws.go 出现，在 server/internal/relay/relay_test.go 中无任何单元测试；同时 server/internal/controller/limits_ws_test.go 仅覆盖了 ActionTransferOffer 的限额拦截，对 ActionTransferAnswer 触发的并发拒绝路径（双向回送 TRANSFER_FAILURE、拦截 token 下发）未作集成测试验证。
+
+**建议**：在 relay_test.go 中补充针对 CountAuthorizedForAccount 的多账号、过期时间过滤、排除自身 session_id 等边界测试；在 limits_ws_test.go 中增加模拟并发超限时双端均收到 TRANSFER_FAILURE 的用例。
+
+## 认为正确的部分
+
+- env 三态解析（未设置退回默认、>=0 生效包含 0 不限制、非法值/负数退回默认并告警）逻辑严密，并在 limits_test.go 中覆盖了 2GiB 以上大数与格式解析测试
+- 客户端 limits 缺失时的退化路径设计合理，严格区分了 None（未知）与 0（不限制），兜底常量 FALLBACK_TEXT_BYTES(4MB) 与 FALLBACK_IMAGE_BYTES(32MB) 独立锁定未被合并，有效防止旧服务端环境行为漂移
+- 预检逻辑 precheck_file_paths 严格置于 prepare_offer 哈希计算及 dispatch_offer 记录历史之前，且对目录与不可读文件的过滤口径与底层传输引擎完全一致，避免大文件哈希开销与死卡片残留
+- OFFER 超限与 ANSWER 并发超限的两条拒绝路径回送方向清晰：OFFER 仅向发送端回送 TRANSFER_FAILURE 且不转发对端，ANSWER 同时向双方通知 TRANSFER_FAILURE 并阻断 token 签发与旧版静默挂起
+- SettingsModal 前端与 Rust 侧彻底清理了无用的 rate_limit_mb，且通过单测严格保障了旧版持久化配置反序列化时的向前兼容性
+
+## 未覆盖范围（本侧盲区）
+
+- 跨不同操作系统真实文件系统（如 Windows CF_HDROP、长路径或受限权限文件）的预检 metadata 获取行为差异
+- STUN 穿透与真实数据通道（/ws/data）在发生限额拒绝时的连接耗尽与反向代理长连接保活场景
+- 前端 UI 在高频连续触发超限弹窗时的实际交互与防抖渲染表现
+
+## 实际查阅的项目文件
+
+- `CLAUDE.md`
+- `AGENTS.md`
+- `README.md`
+- `server/cmd/unidrop-server/main.go`
+- `server/configs/.env.example`
+- `server/internal/config/config.go`
+- `server/internal/controller/control_ws.go`
+- `server/internal/controller/control_ws_test.go`
+- `server/internal/controller/limits_ws_test.go`
+- `server/internal/e2e_test.go`
+- `server/internal/limits/limits.go`
+- `server/internal/limits/limits_test.go`
+- `server/internal/protocol/envelope.go`
+- `server/internal/registry/session.go`
+- `server/internal/relay/relay_manager.go`
+- `server/internal/relay/relay_test.go`
+- `client/src-tauri/src/app_state.rs`
+- `client/src-tauri/src/commands/clipboard_cmd.rs`
+- `client/src-tauri/src/commands/limits_cmd.rs`
+- `client/src-tauri/src/commands/mod.rs`
+- `client/src-tauri/src/commands/settings_cmd.rs`
+- `client/src-tauri/src/core/cache_manager.rs`
+- `client/src-tauri/src/core/transfer_engine.rs`
+- `client/src-tauri/src/lib.rs`
+- `client/src-tauri/src/protocol/envelope.rs`
+- `client/src/App.test.tsx`
+- `client/src/App.tsx`
+- `client/src/components/SettingsModal.test.tsx`
+- `client/src/components/SettingsModal.tsx`
+- `client/src/types/index.ts`
+- `docker-compose.yml`
+
+> 编排器从工具轨迹中记录到的读取次数：{"read":38,"grep":12,"glob":1,"run_command":0,"project_reads":16}
+
+---
+
+*本文档由 TriviumCode 编排器从 `gemini` 侧的结构化输出渲染而成。
+审查员无写仓库权限，全部落盘由编排器完成。*
