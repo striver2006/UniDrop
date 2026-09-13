@@ -1,0 +1,3629 @@
+# trivium changes.diff
+# run_id: 20260913T093116Z
+# base: HEAD
+# head: 84749491ddddd34a5e4f7d89805f45183c433e2d
+# files: 34
+#   client/src-tauri/src/commands/settings_cmd.rs
+#   client/src-tauri/src/core/connection_actor.rs
+#   client/src-tauri/src/core/transfer_engine.rs
+#   client/src-tauri/src/lib.rs
+#   client/src-tauri/src/storage/db.rs
+#   client/src/App.test.tsx
+#   client/src/App.tsx
+#   client/src/components/SettingsModal.test.tsx
+#   client/src/components/SettingsModal.tsx
+#   client/src/types/index.ts
+#   docs/USER_GUIDE.md
+#   docs/design/DESIGN.md
+#   docs/需求.md
+#   server/cmd/unidrop-server/main.go
+#   server/configs/.env.example
+#   server/internal/auth/identity.go
+#   server/internal/auth/identity_test.go
+#   server/internal/auth/verifier.go
+#   server/internal/controller/control_ws.go
+#   server/internal/controller/control_ws_test.go
+#   server/internal/controller/cross_account_ws_test.go
+#   server/internal/controller/data_ws.go
+#   server/internal/controller/health.go
+#   server/internal/controller/health_test.go
+#   server/internal/controller/identity_ws_test.go
+#   server/internal/controller/limits_ws_test.go
+#   server/internal/e2e_test.go
+#   server/internal/limits/limits.go
+#   server/internal/protocol/envelope.go
+#   server/internal/registry/registry.go
+#   server/internal/registry/registry_test.go
+#   server/internal/relay/pipe.go
+#   server/internal/relay/relay_manager.go
+#   server/internal/relay/relay_test.go
+diff --git a/client/src-tauri/src/commands/settings_cmd.rs b/client/src-tauri/src/commands/settings_cmd.rs
+index 0fe40f5..0fb9dff 100644
+--- a/client/src-tauri/src/commands/settings_cmd.rs
++++ b/client/src-tauri/src/commands/settings_cmd.rs
+@@ -47,6 +47,19 @@ pub struct AppSettings {
+     #[serde(default = "default_cache_max_size_mb")]
+     pub cache_max_size_mb: u32,
+ 
++    /// 允许不安全的 TLS 连接：跳过服务器证书校验。
++    ///
++    /// 需要它的部署有三类：自签证书、直连 IP（证书上没有对应名字）、
++    /// 以及证书由**非公共 CA**（企业内部 CA）签发——webpki 根存储不含后者，
++    /// 所以合法的内部证书同样过不了默认校验。
++    ///
++    /// 这里用裸 `#[serde(default)]` 是对的，与上面几个字段相反：
++    /// `bool` 的 `Default` 是 `false`，而 `false` 恰好是安全值，
++    /// 老库升级后默认变成「校验证书」。上面那些字段之所以要自定义 default，
++    /// 是因为它们的零值 `0` 被定义成「关闭限制」——不安全的那一侧。
++    #[serde(default)]
++    pub allow_insecure_tls: bool,
++
+     /// 后台清理间隔（分钟），最小 1。
+     ///
+     /// 这个字段的裸 `#[serde(default)]` 后果最严重：`0` 会让调度循环拿到
+@@ -98,10 +111,33 @@ impl AppSettings {
+             cache_ttl_hours: crate::core::retention::DEFAULT_CACHE_TTL_HOURS,
+             cache_max_size_mb: crate::core::retention::DEFAULT_CACHE_MAX_SIZE_MB,
+             cache_sweep_interval_minutes: crate::core::retention::DEFAULT_SWEEP_INTERVAL_MINUTES,
++            allow_insecure_tls: false,
+         }
+     }
+ }
+ 
++/// 账号标识的合法性校验，规则必须与服务端 `auth/identity.go` 保持一致：
++/// 1..=64 字节的 `[A-Za-z0-9._@-]`。
++///
++/// 为什么客户端也要校验一遍：设置面板不是唯一的写入方。`default_config()`
++/// 与老库里反序列化出来的 JSON 都会直接流进 `config_actor`（见 lib.rs），
++/// 不经过面板那一层。仓库里已有同形态的先例——`cache_sweep_interval_minutes`
++/// 就是前后端各校验一次。
++///
++/// 两边不一致时的表现是：客户端放行、服务端拒绝，用户看到顶部红色横幅。
++/// 也就是说这一层是体验优化，服务端那一层才是约束。
++pub fn validate_account_id(s: &str) -> Result<(), String> {
++    if s.is_empty() || s.len() > 64 {
++        return Err("账号标识不能为空，长度需在 1-64 之间".to_string());
++    }
++    if !s.bytes().all(|c| {
++        c.is_ascii_alphanumeric() || c == b'_' || c == b'-' || c == b'.' || c == b'@'
++    }) {
++        return Err("账号标识只能包含字母、数字与 . _ @ -".to_string());
++    }
++    Ok(())
++}
++
+ #[tauri::command]
+ pub async fn cmd_get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
+     let s = state.settings.lock().await;
+@@ -115,6 +151,12 @@ pub async fn cmd_save_settings(
+     new_settings: AppSettings,
+ ) -> Result<(), String> {
+     let mut clean_settings = new_settings;
++
++    // 账号标识：先 trim 再校验。
++    // 面板那一层已经拦过一次，这里是兜底——理由见 validate_account_id。
++    clean_settings.account_id = clean_settings.account_id.trim().to_string();
++    validate_account_id(&clean_settings.account_id)?;
++
+     clean_settings.server_url = clean_settings
+         .server_url
+         .chars()
+@@ -153,6 +195,7 @@ pub async fn cmd_save_settings(
+         cfg.server_url = clean_settings.server_url.clone();
+         cfg.account_id = clean_settings.account_id.clone();
+         cfg.psk_secret = clean_settings.psk_secret.clone();
++        cfg.allow_insecure_tls = clean_settings.allow_insecure_tls;
+     }
+ 
+     // 3. Clear online devices from previous server/account and notify frontend
+@@ -380,4 +423,80 @@ mod tests {
+         let json = serde_json::to_string(&AppSettings::default_config()).expect("序列化失败");
+         assert!(!json.contains("autostart"));
+     }
++
++    #[test]
++    fn account_id_empty_is_rejected() {
++        assert!(validate_account_id("").is_err(), "空账号标识必须被拒绝");
++    }
++
++    #[test]
++    fn account_id_whitespace_only_is_rejected() {
++        // 面板的原生 required 放行纯空格，而 handleSubmit 的 trim 会把它变成空串。
++        // 这里校验的是 trim 之后的值，所以等价于空串。
++        assert!(validate_account_id("   ".trim()).is_err(), "纯空格账号标识必须被拒绝");
++    }
++
++    #[test]
++    fn account_id_with_newline_is_rejected() {
++        // canonical string 以换行分隔字段，放行换行就等于放行分隔符注入
++        assert!(validate_account_id("acct\nUNIDROP_V1").is_err());
++    }
++
++    #[test]
++    fn account_id_non_ascii_is_rejected() {
++        // NFC / NFD 两种字节形式肉眼相同，会静默分成两个账号桶
++        assert!(validate_account_id("团队").is_err());
++    }
++
++    #[test]
++    fn default_config_account_id_passes_validation() {
++        // 钉死「新规则没有把随发的默认值打死」——它红了就说明默认安装连不上
++        let cfg = AppSettings::default_config();
++        assert!(
++            validate_account_id(&cfg.account_id).is_ok(),
++            "默认账号标识 {} 必须通过校验",
++            cfg.account_id
++        );
++    }
++
++    #[test]
++    fn account_id_accepts_documented_shapes() {
++        for s in ["default_user", "my_team_sync", "user@example.com", "a.b", "A-1_2"] {
++            assert!(validate_account_id(s).is_ok(), "合法账号标识被误拒: {}", s);
++        }
++    }
++
++    #[test]
++    fn legacy_settings_json_with_invalid_account_id_still_deserializes() {
++        // 反序列化**不得**因账号非法而失败。
++        // 校验只发生在保存与连接时；若读库这一步就整条失败，
++        // lib.rs 的 unwrap_or_else 会回落到全部默认值，
++        // 把用户已配置的 server_url / psk_secret 一起冲掉 ——
++        // 那正是本文件其他注释反复强调要避免的形态。
++        let legacy = r#"{
++            "server_url": "wss://example.com",
++            "account_id": "",
++            "psk_secret": "secret",
++            "auto_inject": false
++        }"#;
++        let parsed: AppSettings = serde_json::from_str(legacy).expect("老库 JSON 必须仍能反序列化");
++        assert_eq!(parsed.server_url, "wss://example.com");
++        assert_eq!(parsed.psk_secret, "secret");
++        assert!(validate_account_id(&parsed.account_id).is_err(), "但它的账号标识确实非法");
++    }
++
++    #[test]
++    fn allow_insecure_tls_defaults_to_secure_on_legacy_db() {
++        // 老库的 JSON 没有这个字段，缺省必须是 false（= 校验证书）。
++        // bool 的 Default 恰好是安全值，这也是它可以用裸 serde(default) 的原因。
++        let legacy = r#"{
++            "server_url": "wss://example.com",
++            "account_id": "acct",
++            "psk_secret": "secret",
++            "auto_inject": false
++        }"#;
++        let parsed: AppSettings = serde_json::from_str(legacy).expect("反序列化失败");
++        assert!(!parsed.allow_insecure_tls, "老库升级后必须默认校验证书");
++        assert!(!AppSettings::default_config().allow_insecure_tls);
++    }
+ }
+diff --git a/client/src-tauri/src/core/connection_actor.rs b/client/src-tauri/src/core/connection_actor.rs
+index da82ed7..c693ebb 100644
+--- a/client/src-tauri/src/core/connection_actor.rs
++++ b/client/src-tauri/src/core/connection_actor.rs
+@@ -4,6 +4,7 @@ use futures_util::{SinkExt, StreamExt};
+ use hmac::{Hmac, Mac};
+ use sha2::Sha256;
+ use tokio::sync::{mpsc, Notify, RwLock};
++use tauri::Emitter;
+ use tokio_tungstenite::tungstenite::Message;
+ use uuid::Uuid;
+ 
+@@ -20,12 +21,30 @@ pub struct ConnectionConfig {
+     pub hostname: String,
+     pub os_type: String,
+     pub app_version: String,
++
++    /// 跳过 TLS 服务器证书校验。默认 false。
++    ///
++    /// 见 `create_tls_connector`：打开它就等于接受任何出示证书的中间人。
++    pub allow_insecure_tls: bool,
+ }
+ 
++/// 一个**不校验服务器身份**的证书校验器。
++///
++/// `verify_server_cert` 无条件返回成功：它不看证书链、不看域名、不看有效期。
++/// 后果要说清楚——启用之后，任何位于中间的人只要出示一张自签证书就能接管
++/// 这条连接，读走经由它传输的剪贴板明文与文件字节。TLS 仍在加密，但加密的
++/// 对端是谁不再有任何保证。
++///
++/// 它只在用户显式勾选「允许不安全连接」时才被装上，用于自签证书、IP 直连、
++/// 或证书由非公共 CA 签发的内网部署。下面两个签名校验函数是真的——
++/// 握手本身仍需自洽，只是「对方是不是你要找的那台服务器」不再被验证。
++///
++/// 改名自 `CustomServerCertVerifier`：原名听起来像是某种定制策略，
++/// 而它实际做的事只有「跳过」。
+ #[derive(Debug)]
+-pub struct CustomServerCertVerifier(pub Arc<rustls::crypto::CryptoProvider>);
++pub struct InsecureServerCertVerifier(pub Arc<rustls::crypto::CryptoProvider>);
+ 
+-impl rustls::client::danger::ServerCertVerifier for CustomServerCertVerifier {
++impl rustls::client::danger::ServerCertVerifier for InsecureServerCertVerifier {
+     fn verify_server_cert(
+         &self,
+         _end_entity: &rustls::pki_types::CertificateDer<'_>,
+@@ -60,17 +79,49 @@ impl rustls::client::danger::ServerCertVerifier for CustomServerCertVerifier {
+     }
+ }
+ 
+-pub fn create_tls_connector() -> tokio_tungstenite::Connector {
++/// 构造 WebSocket 的 TLS 连接器。
++///
++/// `allow_insecure = false`（默认）时返回 `None`，由 tokio-tungstenite 走它
++/// 自带的 webpki 根证书校验。刻意**不**在这里手搓 `ClientConfig`：
++/// `rustls-tls-webpki-roots` 是 tokio-tungstenite 的 feature，它不会把
++/// `webpki_roots` 这个 crate 注入本包，自己构造就得额外声明一条依赖，
++/// 而交给它自己加载既省依赖、也少一处可能配错的地方。
++///
++/// `allow_insecure = true` 时才装上 `InsecureServerCertVerifier`——
++/// 读那个类型上的注释，它说明了代价。
++///
++/// 改造前这里**无条件**装载那个跳过校验的 verifier，也就是说即便连的是
++/// `wss://`，中间人也照样能接管连接。默认走真实校验是本轮的目的之一。
++pub fn create_tls_connector(allow_insecure: bool) -> Option<tokio_tungstenite::Connector> {
++    if !allow_insecure {
++        return None;
++    }
++
+     let _ = rustls::crypto::ring::default_provider().install_default();
+     let provider = Arc::new(rustls::crypto::ring::default_provider());
+     let client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
+         .with_safe_default_protocol_versions()
+         .expect("valid tls protocol versions")
+         .dangerous()
+-        .with_custom_certificate_verifier(Arc::new(CustomServerCertVerifier(provider)))
++        .with_custom_certificate_verifier(Arc::new(InsecureServerCertVerifier(provider)))
+         .with_no_client_auth();
+ 
+-    tokio_tungstenite::Connector::Rustls(Arc::new(client_config))
++    Some(tokio_tungstenite::Connector::Rustls(Arc::new(client_config)))
++}
++
++/// 判断一个 tungstenite 错误是否为 TLS 证书校验失败。
++///
++/// rustls 把证书问题归到 `rustls::Error::InvalidCertificate`，经 tungstenite
++/// 包装后只剩下 IO/Tls 层的字符串，因此这里按错误文本匹配。这不优雅，也不够
++/// 稳固——rustls 改文案就会漏判——但漏判的后果只是退回到通用的「连接失败」
++/// 提示，不会误导用户去关掉校验，所以这个不精确是可接受的方向。
++fn is_cert_error(err: &tokio_tungstenite::tungstenite::Error) -> bool {
++    let text = err.to_string();
++    text.contains("certificate")
++        || text.contains("CertificateError")
++        || text.contains("UnknownIssuer")
++        || text.contains("NotValidForName")
++        || text.contains("invalid peer certificate")
+ }
+ 
+ pub struct ConnectionActor {
+@@ -108,7 +159,15 @@ impl ConnectionActor {
+     }
+ 
+     /// Background loop with exponential backoff and jitter, with instant wakeup on configuration change.
+-    pub async fn run(mut self, incoming_tx: mpsc::Sender<ControlEnvelope>) {
++    ///
++    /// `app_handle` 只用于一件事：把 TLS 证书校验失败直接报到界面上。
++    /// 它必须走这条路而不是既有的 `incoming_tx`——握手失败发生在 WebSocket
++    /// 建立**之前**，此时根本不存在可以塞进通道的 ControlEnvelope。
++    ///
++    /// 也考虑过合成一条 AUTH_RESPONSE 丢进 incoming_tx 来复用 `auth-failed`，
++    /// 但那是把传输层错误伪装成鉴权失败：事件名会就此名不副实，
++    /// lib.rs 里那段 AUTH_RESPONSE 处理逻辑（它还负责存服务端限额）也会被污染。
++    pub async fn run(mut self, incoming_tx: mpsc::Sender<ControlEnvelope>, app_handle: tauri::AppHandle) {
+         let mut backoff = Duration::from_secs(1);
+         let max_backoff = Duration::from_secs(30);
+ 
+@@ -128,8 +187,8 @@ impl ConnectionActor {
+             };
+             log::info!("Connecting to control server: {}", ws_url);
+ 
+-            let connector = create_tls_connector();
+-            match tokio_tungstenite::connect_async_tls_with_config(&ws_url, None, false, Some(connector)).await {
++            let connector = create_tls_connector(current_cfg.allow_insecure_tls);
++            match tokio_tungstenite::connect_async_tls_with_config(&ws_url, None, false, connector).await {
+                 Ok((ws_stream, _)) => {
+                     log::info!("Connected to control server");
+                     backoff = Duration::from_secs(1); // Reset backoff
+@@ -287,7 +346,23 @@ impl ConnectionActor {
+                     }
+                 }
+                 Err(err) => {
+-                    log::warn!("Connection failed: {}, retrying...", err);
++                    // 证书失败要单独报，否则用户只会看到反复重连，
++                    // 完全无从知道是「证书不受信任」还是服务端没起来——
++                    // 而这正是本轮默认开启校验之后，自签证书部署升级时的第一现场。
++                    if is_cert_error(&err) && !current_cfg.allow_insecure_tls {
++                        log::warn!("TLS certificate verification failed: {}", err);
++                        let _ = app_handle.emit(
++                            "tls-cert-failed",
++                            format!(
++                                "无法验证服务器证书：{}。\n\
++                                 若服务端使用自签证书、直连 IP，或证书由非公共 CA 签发，\
++                                 请在「设置」中勾选「允许不安全连接」。",
++                                err
++                            ),
++                        );
++                    } else {
++                        log::warn!("Connection failed: {}, retrying...", err);
++                    }
+                 }
+             }
+ 
+diff --git a/client/src-tauri/src/core/transfer_engine.rs b/client/src-tauri/src/core/transfer_engine.rs
+index c035a51..e03b8e6 100644
+--- a/client/src-tauri/src/core/transfer_engine.rs
++++ b/client/src-tauri/src/core/transfer_engine.rs
+@@ -229,6 +229,9 @@ impl TransferEngine {
+     /// Connects to /ws/data as Sender and executes Sliding Window ARQ transfer (P0-3).
+     pub async fn start_sender_task(
+         server_url: String,
++        // 与 server_url 同路取自设置：数据面必须与控制面用同一套 TLS 策略，
++        // 否则用户在界面上关掉的校验会在这条连接上悄悄恢复（反之亦然）。
++        allow_insecure_tls: bool,
+         session_id: String,
+         token: String,
+         from_device: String,
+@@ -253,12 +256,16 @@ impl TransferEngine {
+ 
+         log::info!("Sender connecting to data plane: {}", ws_data_url);
+ 
+-        // Same TLS policy as the control plane (supports self-signed / direct-IP deployments)
++        // 与控制面同一套 TLS 策略：默认校验证书，勾选后才跳过。
++        //
++        // 注意一处有意接受的取舍：这里的证书失败**不做**专门提示，只会以
++        // 「数据通道连接失败」呈现。控制面连不上时数据面根本不会启动，
++        // 所以这条路径实际不可达，不值得再铺一条通知链路。
+         let (ws_stream, _) = match connect_async_tls_with_config(
+             &ws_data_url,
+             None,
+             false,
+-            Some(create_tls_connector()),
++            create_tls_connector(allow_insecure_tls),
+         )
+         .await
+         {
+@@ -559,6 +566,7 @@ impl TransferEngine {
+     /// Connects to /ws/data as Receiver, writes chunks into sandbox, verifies SHA256 and sends ACKs (P0-3, P1-6).
+     pub async fn start_receiver_task(
+         server_url: String,
++        allow_insecure_tls: bool,
+         session_id: String,
+         token: String,
+         from_device: String,
+@@ -584,12 +592,16 @@ impl TransferEngine {
+ 
+         log::info!("Receiver connecting to data plane: {}", ws_data_url);
+ 
+-        // Same TLS policy as the control plane (supports self-signed / direct-IP deployments)
++        // 与控制面同一套 TLS 策略：默认校验证书，勾选后才跳过。
++        //
++        // 注意一处有意接受的取舍：这里的证书失败**不做**专门提示，只会以
++        // 「数据通道连接失败」呈现。控制面连不上时数据面根本不会启动，
++        // 所以这条路径实际不可达，不值得再铺一条通知链路。
+         let (ws_stream, _) = match connect_async_tls_with_config(
+             &ws_data_url,
+             None,
+             false,
+-            Some(create_tls_connector()),
++            create_tls_connector(allow_insecure_tls),
+         )
+         .await
+         {
+diff --git a/client/src-tauri/src/lib.rs b/client/src-tauri/src/lib.rs
+index 6660654..608ed6c 100644
+--- a/client/src-tauri/src/lib.rs
++++ b/client/src-tauri/src/lib.rs
+@@ -73,6 +73,7 @@ pub fn run() {
+         hostname: app_state::whoami_hostname(),
+         os_type: std::env::consts::OS.to_string(),
+         app_version: app_state::APP_VERSION.to_string(),
++        allow_insecure_tls: initial_settings.allow_insecure_tls,
+     };
+ 
+     let config_actor = Arc::new(tokio::sync::RwLock::new(config));
+@@ -133,7 +134,7 @@ pub fn run() {
+                 let cache_manager_ref = cache_manager_for_actor;
+                 let settings_ref = settings_for_actor;
+                 let (internal_tx, mut internal_rx) = mpsc::channel(128);
+-                tokio::spawn(actor.run(internal_tx));
++                tokio::spawn(actor.run(internal_tx, app_handle.clone()));
+ 
+                 while let Some(env) = internal_rx.recv().await {
+                     match env.action {
+@@ -206,12 +207,13 @@ pub fn run() {
+ 
+                                         if let Some((offer, source)) = outbound_entry {
+                                             log::info!("Starting Sender task for session {}", answer.session_id);
+-                                            let active_server_url = {
++                                            let (active_server_url, allow_insecure_tls) = {
+                                                 let s = settings_ref.lock().await;
+-                                                s.server_url.clone()
++                                                (s.server_url.clone(), s.allow_insecure_tls)
+                                             };
+                                             tokio::spawn(TransferEngine::start_sender_task(
+                                                 active_server_url,
++                                                allow_insecure_tls,
+                                                 answer.session_id.clone(),
+                                                 token.clone(),
+                                                 self_device_id.clone(),
+@@ -229,13 +231,14 @@ pub fn run() {
+                                             };
+ 
+                                             if let Some((offer, sender_device)) = inbound_entry {
+-                                                let (auto_inject, active_server_url) = {
++                                                let (auto_inject, active_server_url, allow_insecure_tls) = {
+                                                     let s = settings_ref.lock().await;
+-                                                    (s.auto_inject, s.server_url.clone())
++                                                    (s.auto_inject, s.server_url.clone(), s.allow_insecure_tls)
+                                                 };
+                                                 log::info!("Starting Receiver task for session {}, auto_inject={}", answer.session_id, auto_inject);
+                                                 tokio::spawn(TransferEngine::start_receiver_task(
+                                                     active_server_url,
++                                                    allow_insecure_tls,
+                                                     answer.session_id.clone(),
+                                                     token,
+                                                     sender_device,
+diff --git a/client/src-tauri/src/storage/db.rs b/client/src-tauri/src/storage/db.rs
+index ce8cf4f..7ffc5e6 100644
+--- a/client/src-tauri/src/storage/db.rs
++++ b/client/src-tauri/src/storage/db.rs
+@@ -20,6 +20,21 @@ pub fn init_database(db_path: Option<PathBuf>) -> Result<Connection, rusqlite::E
+     // Errors (duplicate column) are intentionally ignored.
+     let _ = conn.execute_batch("ALTER TABLE transfer_tasks ADD COLUMN preview_summary TEXT;");
+ 
++    // 删除 paired_devices。
++    //
++    // 这张表自建库起就没有任何读写：全仓库对它的引用只有一条建表语句，
++    // 既没有 repo 模块也没有任何 SQL，配对与 E2EE 都还停在设计稿上。
++    // 它与 config.go 顶部注释里被删掉的那两个「定义了、赋值了、从来没人读」
++    // 的字段是同一类东西。
++    //
++    // 更糟的是它**主动制造了账号分区的假象**：一个 `account_id TEXT NOT NULL`
++    // 的列会让读 schema 的人以为配对表已经按账号分区了，本轮的需求正是被它
++    // 误导出来的（而这已经是它第二次造成误判，上一次见 2026-09-11 的审查留痕）。
++    //
++    // DROP 在这里可证明无损，因为从来不存在写入方。**不要**把这个模式抄到
++    // 任何有数据的表上——那需要真正的迁移，而不是一句 DROP。
++    let _ = conn.execute_batch("DROP TABLE IF EXISTS paired_devices;");
++
+     Ok(conn)
+ }
+ 
+@@ -65,17 +80,7 @@ pub fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+             PRIMARY KEY (session_id, item_index, chunk_index)
+         );
+ 
+-        -- 4. Paired Trusted Devices
+-        CREATE TABLE IF NOT EXISTS paired_devices (
+-            device_id TEXT PRIMARY KEY,
+-            account_id TEXT NOT NULL,
+-            alias TEXT NOT NULL,
+-            os_type TEXT NOT NULL,
+-            ed25519_pubkey BLOB NOT NULL,
+-            x25519_pubkey BLOB NOT NULL,
+-            paired_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+-            is_trusted INTEGER DEFAULT 1
+-        );
++        -- 4. （原 paired_devices 表已删除，见 init_database 的迁移说明）
+ 
+         -- 5. Cache Lifecycle with 2h Clipboard Immunity Lock
+         CREATE TABLE IF NOT EXISTS cache_entries (
+diff --git a/client/src/App.test.tsx b/client/src/App.test.tsx
+index 9f8ec34..e0b6082 100644
+--- a/client/src/App.test.tsx
++++ b/client/src/App.test.tsx
+@@ -30,6 +30,7 @@ const baseSettings: AppSettings = {
+   cache_ttl_hours: 24,
+   cache_max_size_mb: 10240,
+   cache_sweep_interval_minutes: 60,
++  allow_insecure_tls: false,
+ };
+ 
+ function transfer(overrides: Partial<ActiveTransfer> = {}): ActiveTransfer {
+diff --git a/client/src/App.tsx b/client/src/App.tsx
+index be765d8..7c1a781 100644
+--- a/client/src/App.tsx
++++ b/client/src/App.tsx
+@@ -31,6 +31,7 @@ const defaultSettings: AppSettings = {
+   cache_ttl_hours: 24,
+   cache_max_size_mb: 10240,
+   cache_sweep_interval_minutes: 60,
++  allow_insecure_tls: false,
+ };
+ 
+ export const App: React.FC = () => {
+diff --git a/client/src/components/SettingsModal.test.tsx b/client/src/components/SettingsModal.test.tsx
+index 923764b..e9911f1 100644
+--- a/client/src/components/SettingsModal.test.tsx
++++ b/client/src/components/SettingsModal.test.tsx
+@@ -1,5 +1,5 @@
+ import { describe, it, expect, beforeEach, vi } from "vitest";
+-import { render, screen } from "@testing-library/react";
++import { render, screen, waitFor } from "@testing-library/react";
+ import userEvent from "@testing-library/user-event";
+ 
+ import { invoke, invokeResults, resetTauriMock } from "../test/tauri-mock";
+@@ -20,6 +20,7 @@ const baseSettings: AppSettings = {
+   cache_ttl_hours: 24,
+   cache_max_size_mb: 10240,
+   cache_sweep_interval_minutes: 60,
++  allow_insecure_tls: false,
+ };
+ 
+ function setup(
+@@ -270,3 +271,60 @@ describe("服务端限额只读展示（需求 3）", () => {
+     expect(submitted).not.toHaveProperty("rate_limit_mb");
+   });
+ });
++
++describe("账号标识校验", () => {
++  const accountInput = () => screen.getByLabelText("账号标识 (Account ID)");
++
++  it("空账号被拦下且不提交", async () => {
++    const { onSave, user } = setup();
++    await user.clear(accountInput());
++    await user.click(submit());
++
++    expect(await screen.findByText("不能为空")).toBeInTheDocument();
++    expect(onSave).not.toHaveBeenCalled();
++  });
++
++  // 原生 required 判定纯空格为「已填写」，而提交前的 trim 会把它变成空串 ——
++  // 一个原生校验放行的值恰好是服务端必然拒绝的值。这条钉死我们自己拦住它。
++  it("纯空格账号被拦下", async () => {
++    const { onSave, user } = setup();
++    await user.clear(accountInput());
++    await user.type(accountInput(), "   ");
++    await user.click(submit());
++
++    expect(await screen.findByText("不能为空")).toBeInTheDocument();
++    expect(onSave).not.toHaveBeenCalled();
++  });
++
++  it("含空格或斜杠的账号被拦下", async () => {
++    const { onSave, user } = setup();
++    for (const bad of ["a b", "acct/other"]) {
++      await user.clear(accountInput());
++      await user.type(accountInput(), bad);
++      await user.click(submit());
++      expect(await screen.findByText("只能包含字母、数字与 . _ @ -")).toBeInTheDocument();
++    }
++    expect(onSave).not.toHaveBeenCalled();
++  });
++
++  it("超长账号被拦下", async () => {
++    const { onSave, user } = setup();
++    await user.clear(accountInput());
++    await user.type(accountInput(), "a".repeat(65));
++    await user.click(submit());
++
++    expect(await screen.findByText("长度不能超过 64")).toBeInTheDocument();
++    expect(onSave).not.toHaveBeenCalled();
++  });
++
++  // 正例：防止规则被收紧成拒绝一切
++  it("合法账号正常提交，且被 trim", async () => {
++    const { onSave, user } = setup();
++    await user.clear(accountInput());
++    await user.type(accountInput(), "  my_team_sync  ");
++    await user.click(submit());
++
++    await waitFor(() => expect(onSave).toHaveBeenCalled());
++    expect(onSave.mock.calls[0][0]).toMatchObject({ account_id: "my_team_sync" });
++  });
++});
+diff --git a/client/src/components/SettingsModal.tsx b/client/src/components/SettingsModal.tsx
+index 3879b47..d4360ce 100644
+--- a/client/src/components/SettingsModal.tsx
++++ b/client/src/components/SettingsModal.tsx
+@@ -71,6 +71,21 @@ const parseU32 = (
+   return { value };
+ };
+ 
++/// 校验账号标识。规则必须与服务端 `auth/identity.go` 一致：
++/// 1..=64 字节的 `[A-Za-z0-9._@-]`。
++///
++/// 形态对齐 parseU32：返回 `{value}` 或 `{error}`，由 handleSubmit 汇总进
++/// fieldErrors，用同一套红字渲染。
++const parseAccountId = (raw: string): { value: string } | { error: string } => {
++  const trimmed = raw.trim();
++  if (trimmed === "") return { error: "不能为空" };
++  if (trimmed.length > 64) return { error: "长度不能超过 64" };
++  if (!/^[A-Za-z0-9._@-]+$/.test(trimmed)) {
++    return { error: "只能包含字母、数字与 . _ @ -" };
++  }
++  return { value: trimmed };
++};
++
+ /** 缓存保留小时数上限：1 年 */
+ const MAX_CACHE_TTL_HOURS = 8760;
+ /** 缓存容量上限：1 TB（MB 计） */
+@@ -115,6 +130,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
+     String(settings.cache_sweep_interval_minutes)
+   );
+   const [fieldErrors, setFieldErrors] = useState<{
++    account?: string;
+     history?: string;
+     retain?: string;
+     ttl?: string;
+@@ -195,6 +211,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
+ 
+     // 先做字段级校验再提交。后端 u32 反序列化失败只会返回笼统的「保存设置失败」，
+     // 用户看不出是哪个字段的问题，所以小数、负数、超上限都必须在这里拦住。
++    const account = parseAccountId(form.account_id);
+     const history = parseU32(historyLimitInput);
+     // 保持秒数额外受 setTimeout 的 32 位上限约束，不能放行到 u32::MAX
+     const retain = parseU32(retainSecsInput, MAX_RETAIN_SECS);
+@@ -207,6 +224,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
+       MIN_SWEEP_INTERVAL_MINUTES
+     );
+     const nextFieldErrors = {
++      account: "error" in account ? account.error : undefined,
+       history: "error" in history ? history.error : undefined,
+       retain: "error" in retain ? retain.error : undefined,
+       ttl: "error" in ttl ? ttl.error : undefined,
+@@ -230,7 +248,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
+       await onSave({
+         ...form,
+         server_url: cleanUrl,
+-        account_id: form.account_id.trim(),
++        account_id: (account as { value: string }).value,
+         psk_secret: form.psk_secret.trim(),
+         history_max_entries: (history as { value: number }).value,
+         transfer_card_retain_secs: (retain as { value: number }).value,
+@@ -276,14 +294,28 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
+           </div>
+ 
+           <div>
+-            <label className="block text-slate-400 mb-1">账号标识 (Account ID)</label>
++            <label htmlFor="account-id" className="block text-slate-400 mb-1">
++              账号标识 (Account ID)
++            </label>
++            {/* 这里刻意**不加** required，与上面的 server_url 不同。
++                理由同数字输入框那条注释：原生校验在 submit 之前拦下，handleSubmit
++                根本不跑，用户看到的是样式不可控的英文原生气泡，而填非法字符时
++                看到的却是我们的中文红字——同一个输入框两套错误呈现。
++                更要命的是 required 判定 "   " 为已填写，而提交前的 trim 会把它
++                变成空串，于是一个原生校验放行的值恰好是服务端必然拒绝的值。
++                server_url / psk_secret 的 required 本轮不动，这处不一致是有意的。 */}
+             <input
++              id="account-id"
+               type="text"
+               value={form.account_id}
+               onChange={(e) => setForm({ ...form, account_id: e.target.value })}
+               className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-teal-500"
+-              required
+             />
++            {fieldErrors.account && (
++              <p className="mt-1 text-[11px] text-rose-400 flex items-start gap-1">
++                <span>{fieldErrors.account}</span>
++              </p>
++            )}
+           </div>
+ 
+           <div>
+@@ -297,6 +329,30 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
+             />
+           </div>
+ 
++          {/* 文案要说清后果，而不是只说「允许自签证书」：用户据此做的是
++              一个安全取舍，不告诉他代价就等于替他做了决定。
++              三类场景都要列全——少写「非公共 CA」那一类，用内部 CA 的用户会
++              以为这个开关与自己无关，最后仍然被引导来勾选它。 */}
++          <div className="flex items-center justify-between pt-2">
++            <div className="pr-3">
++              <span className="font-medium text-slate-200">允许不安全连接</span>
++              <p className="text-[11px] text-slate-500">
++                跳过服务器证书校验，用于自签证书、IP 直连或非公共 CA 签发的部署
++              </p>
++              {form.allow_insecure_tls && (
++                <p className="mt-1 text-[11px] text-amber-400">
++                  已关闭证书校验：任何中间人都可冒充服务器读取你传输的内容
++                </p>
++              )}
++            </div>
++            <input
++              type="checkbox"
++              checked={form.allow_insecure_tls}
++              onChange={(e) => setForm({ ...form, allow_insecure_tls: e.target.checked })}
++              className="w-4 h-4 rounded text-teal-500 focus:ring-teal-400 bg-slate-800 border-slate-700"
++            />
++          </div>
++
+           <div className="flex items-center justify-between pt-2">
+             <div>
+               <span className="font-medium text-slate-200">静默自动装载剪贴板</span>
+diff --git a/client/src/types/index.ts b/client/src/types/index.ts
+index b4f3e36..1747a44 100644
+--- a/client/src/types/index.ts
++++ b/client/src/types/index.ts
+@@ -23,6 +23,8 @@ export interface AppSettings {
+   cache_max_size_mb: number;
+   /** 后台清理间隔（分钟），最小 1。 */
+   cache_sweep_interval_minutes: number;
++  /** 跳过 TLS 服务器证书校验；默认 false（= 校验）。 */
++  allow_insecure_tls: boolean;
+ }
+ 
+ /**
+diff --git a/docs/USER_GUIDE.md b/docs/USER_GUIDE.md
+index b45397a..d91331f 100644
+--- a/docs/USER_GUIDE.md
++++ b/docs/USER_GUIDE.md
+@@ -52,11 +52,24 @@ UniDrop 与传统文件传输工具（如网盘、微信文件传输助手、隔
+    * 生产环境填写您自己搭建或团队提供的安全地址（如 `wss://unidrop.yourdomain.com`）。
+ 2. **账号标识 (Account ID)**：
+    * 需协同流转的多台设备必须填入**相同的 Account ID**，以归属在同一个安全工作区内。
++   * **格式要求**：1–64 个字符，只能使用字母、数字与 `.` `_` `@` `-`。
++     不支持中文与空格——服务端按字节匹配账号，而同一个中文名在不同系统上
++     可能产生不同的字节形式，看起来一样却会被分进两个互不相通的工作区。
++   * 填错时不会静默失败：客户端顶部会出现红色横幅，写明具体的格式规则。
+ 3. **预共享密钥 (PSK Secret Key)**：
+    * 填入中继服务器预设的高强度密钥字符串。
+-4. **静默自动装载剪贴板**（强烈推荐勾选）：
++4. **允许不安全连接**（默认关闭，**请尽量保持关闭**）：
++   * 关闭时，客户端会校验服务器的 TLS 证书，确认连上的确实是目标服务器。
++   * 需要勾选的情况有三类：服务端使用**自签证书**、直接用 **IP 地址**连接
++     （证书上没有对应的名字）、或证书由**企业内部 CA** 签发（公共根证书库里没有它）。
++   * 勾选的代价要清楚：一旦关闭校验，任何位于网络中间的人只要出示一张自签
++     证书就能冒充服务器，读取经由它传输的剪贴板内容与文件。连接仍然是加密的，
++     但**加密的对端是谁不再有保证**。
++   * 若升级后突然连不上，且界面提示「无法验证服务器证书」，说明你的部署属于
++     上述三类之一。首选做法是给服务器换一张受信任的证书，其次才是勾选此项。
++5. **静默自动装载剪贴板**（强烈推荐勾选）：
+    * 开启后，远端传来的文件一经下载核验完成，无需手动点击，直接写入本地系统剪贴板。
+-5. 点击 **“保存配置”**，客户端将即时热更新配置并自动重新建立安全连接，无需重启客户端。
++6. 点击 **“保存配置”**，客户端将即时热更新配置并自动重新建立安全连接，无需重启客户端。
+ 
+ > [!TIP]
+ > 如果顶部出现红色横幅提示 **“鉴权失败: signature mismatch / timestamp expired”**，说明密钥填写有误或本机系统时间与服务器误差超过 60 秒，请点击“检查密钥”重新校对。
+diff --git a/docs/design/DESIGN.md b/docs/design/DESIGN.md
+index 264a997..a90e2b6 100644
+--- a/docs/design/DESIGN.md
++++ b/docs/design/DESIGN.md
+@@ -572,6 +572,18 @@ func (p *RelayPipe) Push(data *[]byte, timeout time.Duration) error {
+    ```text
+    canonical_string = "UNIDROP_V1\n" + account_id + "\n" + device_id + "\n" + nonce + "\n" + timestamp_ms
+    ```
++   **标识符格式契约**（服务端在验签**之前**强制校验，见 `internal/auth/identity.go`）：
++   * `account_id`：1–64 字节，仅允许 `[A-Za-z0-9._@-]`
++   * `device_id`：1–64 字节，仅允许 `[A-Za-z0-9_-]`
++
++   禁止换行不是风格约束：上面这个串以 `\n` 分隔字段，若标识符里可以带换行，
++   客户端就能重排它自己待签名内容的字段边界（分隔符注入）。
++   限定 ASCII 则是因为 `account_id` 是**匹配键**——同一个名字的 NFC 与 NFD
++   两种字节形式肉眼无法区分，却会被分进两个互不相通的工作区。
++
++   校验排在验签之前，因此格式错误**不会**消耗防重放的 nonce：
++   第三方实现若在 60s 窗口内复用 nonce 重试，仍会得到「格式非法」而不是
++   「重放攻击」这一误导性结论。
+ 3. **计算签名**：
+    $$\text{Signature} = \text{hex\_encode}(\text{HMAC\_SHA256}(\text{PSK\_SECRET}, \text{canonical\_string}))$$
+ 4. **服务端防重放窗口**：
+@@ -589,7 +601,20 @@ func (p *RelayPipe) Push(data *[]byte, timeout time.Duration) error {
+ ### 4.6 可观测性设计 (Prometheus Metrics & Tracing)
+ 解决评审 P2-11 可观测性缺失：
+ * 统一集成 Prometheus Exporter（`/metrics` 端点），暴露关键业务与运行指标：
+-  * `unidrop_connected_devices{account_id, os_type}`：当前在线长连接设备数。
++  * `unidrop_online_devices`：当前在线长连接设备数（**无 label**）。
++  * `unidrop_online_accounts`：当前有设备在线的账号数。
++  * `unidrop_max_devices_per_account` / `unidrop_max_pipes_per_account`：
++    单账号持有量的峰值，用于回答「是否某一个账号吃满了整台机器」。
++  * `unidrop_auth_rejected_total{reason}`：握手拒绝计数，`reason` 取值为
++    `invalid_account_id` / `invalid_device_id` / `unauthorized` 三者之一。
++
++  > **不得按 `account_id` 打 label。** 本节原先规定的是
++  > `unidrop_connected_devices{account_id, os_type}`，那是一条照做会有害的规范：
++  > `account_id` 是未鉴权、客户端自报的任意字符串，单个客户端循环握手就能铸出
++  > 无限多个值，每一个都会在 exporter 里留下一条常驻时序——这使 `/metrics`
++  > 成为针对服务端与抓取端的内存放大面。上面那两个「峰值」指标正是为了用
++  > **一个数**回答同样的运维问题而设。
++  > `{reason}` 这类**代码内定义的闭集枚举**不受此限，它的基数由构造保证有界。
+   * `unidrop_relay_bytes_total{direction}`：流式中转吞吐累计字节数。
+   * `unidrop_active_relay_pipes`：当前活跃数据管道数。
+   * `unidrop_chunk_retransmit_total{reason}`：分片重传累计次数（区分 timeout 或 nack）。
+@@ -1014,6 +1039,10 @@ CREATE TABLE IF NOT EXISTS chunk_bitmaps (
+ );
+ 
+ -- 4. 已配对信任设备表 (E2EE 长期公钥存储)
++--
++-- 【未实现】配对与 E2EE 仍停留在设计阶段。此表曾被真实建出来却零读零写，
++-- 而它的 account_id 列会让人误以为配对数据已按账号分区，先后造成过两次误判，
++-- 因此已从 create_schema 中删除并在升级时 DROP。真正落地 E2EE 时按本节重建。
+ CREATE TABLE IF NOT EXISTS paired_devices (
+     device_id TEXT PRIMARY KEY,
+     account_id TEXT NOT NULL,
+@@ -1048,7 +1077,7 @@ CREATE TABLE IF NOT EXISTS cache_entries (
+    * 客户端在本地生成各自唯一的长期身份密钥对：
+      * 签名密钥：`Ed25519` (32 字节)
+      * 加密密钥：`X25519` (32 字节)
+-   * 双端首次互联时，通过展示/扫描带有公钥指纹的二维码或预共享码完成互相确认，公钥持久化至本地 `paired_devices` 表中。
++   * 双端首次互联时，通过展示/扫描带有公钥指纹的二维码或预共享码完成互相确认，公钥持久化至本地 `paired_devices` 表中（**该表尚未实现，见上文 schema 注记**）。
+ 2. **会话握手与身份验签**：
+    * 发送端生成临时密钥对 `(e_priv_A, e_pub_A)`；
+    * 发送端使用自身的长期身份密钥对 `e_pub_A` 进行数字签名：
+diff --git a/docs/需求.md b/docs/需求.md
+index 5289012..a9f6356 100644
+--- a/docs/需求.md
++++ b/docs/需求.md
+@@ -79,7 +79,38 @@
+    因为错误 toast 仅 4 秒，卡片再自动消失就没有入口能看到失败原因了。
+    仅影响界面卡片，不删历史记录与缓存。
+ 6. 同时支持好多个用户。
++   — **已实现**（2026-09-13）。核验发现分发路径其实早就按账号过滤了
++   （`ListByAccount` / `BroadcastToAccount` / 信令转发与限额计数全部比对
++   AccountID，没有任何一处「广播给所有已连接客户端」），所以功能意义上的
++   多用户一直是成立的。本轮修的是「即使各方都守规矩也会互相误伤」的几处：
++   **① 身份格式校验**：`account_id` / `device_id` 限定 1–64 字节的 ASCII 子集，
++   排在验签**之前**（格式错不烧 nonce，否则重试会漂成「重放攻击」）。
++   此前空账号会形成一个所有「忘了填」的客户端共享的公共桶。
++   **② 注册表改复合键** `(account, device)`：此前以裸 DeviceID 为键，
++   另一个账号用同名 device_id 连上来会直接把你的设备踢下线。
++   同账号同设备重连顶号的正当行为保持不变。
++   **③ 会话归属保护**：此前 `RemovePipe` 对客户端自报的 session_id
++   不做任何校验，任何已鉴权客户端都能零凭据拆掉别人正在传输的管道；
++   授权覆盖同样无归属检查。
++   **④ 授权失败双向拒绝**：此前非限额类失败会转发一个没有 token 的 ANSWER，
++   客户端静默跳过，发送方永久挂起。
++   **⑤ 生命周期联动**：授权条目 TTL 5 分钟而管道靠 60 秒空闲存活，
++   两者原本互不相干，导致超过 5 分钟的长传输会丢掉授权记录 ——
++   结束时被判成未授权拆除，且账号在途计数归零使容量拒绝退化到数据面。
++   **凭据模型保持不变**：仍是单把全局 PSK，`account_id` 仍由客户端自报，
++   账号仍是便利分区而非安全边界。per-account 凭据与 JWT 未做。
++   遗留：本地历史与磁盘缓存四张表仍无 `account_id` 列，同一台机器上切换
++   账号会看到彼此的传输历史，留待下一轮。
+ 7. 全程加密。
++   — **部分实现**（2026-09-13）。本轮只做了传输层：客户端此前**无条件**跳过
++   TLS 服务器证书校验（`verify_server_cert` 直接返回成功，控制面与数据面
++   都走这条路），意味着即便连 `wss://` 也挡不住中间人。现默认走 webpki 根
++   证书校验，跳过校验改为设置项 `allow_insecure_tls`（默认关闭），
++   供自签证书 / IP 直连 / 非公共 CA 三类部署显式选择；证书失败会单独提示，
++   而不是让用户看着它反复重连。
++   **E2EE 仍未实现**，属 Phase 3：协议位（`FLAG_ENCRYPTED`、`encrypted`
++   字段）是占位，客户端所有构造点硬编码 `false`，仓库无任何密码学依赖。
++   本地 SQLite 与缓存文件也仍是明文。
+ 8. 磁盘缓存文件要定时删除。
+    — **已实现**（2026-09-13）。核验发现定时清理早已存在（每小时一次，24h TTL +
+    10GB LRU），本轮是把写死的策略参数开放为配置项，而非新建第二套清理：
+diff --git a/server/cmd/unidrop-server/main.go b/server/cmd/unidrop-server/main.go
+index 0ee4a3c..0612931 100644
+--- a/server/cmd/unidrop-server/main.go
++++ b/server/cmd/unidrop-server/main.go
+@@ -43,7 +43,12 @@ func main() {
+ 	limits.LogSummary(transferLimits)
+ 
+ 	devRegistry := registry.NewDeviceRegistry()
+-	relayManager := relay.NewRelayManager()
++	// The per-account pipe cap reuses MaxConcurrentTransfers rather than having
++	// an environment variable of its own: one authorized session corresponds to
++	// exactly one pipe, so both numbers bound the same resource and a second
++	// knob would only raise the question of what a disagreement between them
++	// means. See relay.ValidateAndGetOrCreatePipe.
++	relayManager := relay.NewRelayManager(transferLimits.MaxConcurrentTransfers)
+ 
+ 	// Optional STUN service with graceful shutdown support (P2-9)
+ 	var stunCloser io.Closer
+diff --git a/server/configs/.env.example b/server/configs/.env.example
+index 40ef977..c3628f3 100644
+--- a/server/configs/.env.example
++++ b/server/configs/.env.example
+@@ -17,6 +17,11 @@ UNIDROP_LISTEN_ADDR=:8080
+ # 客户端鉴权用的预共享密钥。**生产环境必须修改**，否则服务端会在启动日志里
+ # 持续告警。注意它是整个部署共用的一把钥匙：知道它的客户端可以声明任意
+ # account_id，账号隔离是便利分区而非安全边界。
++#
++# 这个取舍没有变。变的是「即使各方都守规矩也会互相误伤」的几处已经修掉：
++# 跨账号的同名 device_id 不再互相顶号下线、自报一个 session_id 不再能拆掉
++# 别人的传输管道、单个账号也不再能耗尽全实例的管道容量。
++# 换言之账号仍不是安全边界，但不再是一个会随机伤到邻居的分区。
+ UNIDROP_PSK_SECRET=YOUR_SHARED_SECRET_KEY_HERE
+ 
+ # 内建 STUN 服务监听地址（RFC 8489），留空则不启动
+@@ -75,4 +80,9 @@ UNIDROP_HEARTBEAT_TIMEOUT=45
+ #
+ # 「同时进行」= 已授权但尚未终结的会话。注意它按 account_id 计数，而
+ # account_id 由客户端自报，所以这是**容量保护**，不是安全边界。
++#
++# 这个数**同时**被用作每账号的在途中继管道数上限——没有第二个变量。
++# 一个已授权的会话恰好对应一条管道，两者约束的是同一种资源、单位也相同；
++# 再开一个旋钮只会在两者取值不一致时产生谁也说不清的行为。
++# 0 = 关闭（两项一起关闭）。
+ #UNIDROP_MAX_CONCURRENT_TRANSFERS=8
+diff --git a/server/internal/auth/verifier.go b/server/internal/auth/verifier.go
+index 469ec2d..bfc1156 100644
+--- a/server/internal/auth/verifier.go
++++ b/server/internal/auth/verifier.go
+@@ -45,6 +45,11 @@ func BuildCanonicalString(accountID, deviceID, nonce string, timestampMs int64)
+ }
+ 
+ // BuildCanonicalStringWithSalt generates canonical string incorporating challenge NonceSalt.
++//
++// The fields are joined with "\n", which is why identity.go forbids newlines in
++// account_id and device_id: without that rule a client could redraw the field
++// boundaries of the string it is about to sign. Relaxing the grammar there
++// reopens separator injection here.
+ func BuildCanonicalStringWithSalt(accountID, deviceID, nonce string, timestampMs int64, nonceSalt string) string {
+ 	if nonceSalt == "" {
+ 		return BuildCanonicalString(accountID, deviceID, nonce, timestampMs)
+diff --git a/server/internal/controller/control_ws.go b/server/internal/controller/control_ws.go
+index e3b6b16..0ffb72e 100644
+--- a/server/internal/controller/control_ws.go
++++ b/server/internal/controller/control_ws.go
+@@ -91,24 +91,42 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		return
+ 	}
+ 
+-	// Step 3: Verify HMAC Signature with challenge NonceSalt (P2-1)
++	// Step 3a: Validate identifier shape BEFORE verifying the signature.
++	//
++	// The order matters and is not interchangeable. VerifyWithSalt burns the
++	// nonce once the signature checks out (see auth.VerifyWithSalt), so a
++	// request whose signature is valid but whose account_id is malformed would,
++	// if validated afterwards, come back on retry as "replay detected" instead
++	// of "your account id is malformed". A client implemented straight from the
++	// canonical-string contract in DESIGN.md may reuse a nonce within the 60s
++	// window, and for those the diagnosis would be permanently wrong. (The
++	// shipped Tauri client mints a fresh nonce per handshake, so it is the
++	// third-party contract — not our own client — that this ordering protects.)
++	//
++	// The second reason is cheapness: this rejects malformed input without
++	// paying for an HMAC, and auth.validIdentifier is allocation-free and
++	// length-bounded precisely because it runs here, on unauthenticated input.
++	if err := auth.ValidateAccountID(authReq.AccountID); err != nil {
++		slog.Warn("auth rejected: malformed account id", "device", authReq.DeviceID)
++		Metrics.AuthRejectedInvalidAccount.Add(1)
++		writeAuthFailure(ctx, ws, authEnv.TraceID, protocol.AuthErrInvalidAccountID,
++			"账号标识不能为空，只能包含字母、数字与 . _ @ -，长度 1-64")
++		return
++	}
++	if err := auth.ValidateDeviceID(authReq.DeviceID); err != nil {
++		slog.Warn("auth rejected: malformed device id", "account", authReq.AccountID)
++		Metrics.AuthRejectedInvalidDevice.Add(1)
++		writeAuthFailure(ctx, ws, authEnv.TraceID, protocol.AuthErrInvalidDeviceID,
++			"设备标识不能为空，只能包含字母、数字与 _ -，长度 1-64")
++		return
++	}
++
++	// Step 3b: Verify HMAC Signature with challenge NonceSalt (P2-1)
+ 	now := time.Now()
+ 	if err := h.verifier.VerifyWithSalt(&authReq, now, challengePayloadObj.NonceSalt); err != nil {
+ 		slog.Warn("auth verification failed", "device", authReq.DeviceID, "error", err)
+-		respPayload, _ := json.Marshal(protocol.AuthResponsePayload{
+-			Success:      false,
+-			ErrorCode:    "UNAUTHORIZED",
+-			ErrorMessage: err.Error(),
+-		})
+-		respEnv, _ := json.Marshal(protocol.ControlEnvelope{
+-			Version:   1,
+-			TraceID:   authEnv.TraceID,
+-			Action:    protocol.ActionAuthResponse,
+-			Timestamp: time.Now().UnixMilli(),
+-			Payload:   respPayload,
+-		})
+-		_ = ws.Write(ctx, websocket.MessageText, respEnv)
+-		_ = ws.Close(websocket.StatusPolicyViolation, "authentication failed")
++		Metrics.AuthRejectedUnauthorized.Add(1)
++		writeAuthFailure(ctx, ws, authEnv.TraceID, protocol.AuthErrUnauthorized, err.Error())
+ 		return
+ 	}
+ 
+@@ -312,27 +330,51 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 					5*time.Minute,
+ 					h.limits.MaxConcurrentTransfers,
+ 				)
+-				if errors.Is(authErr, relay.ErrConcurrencyLimit) {
+-					v := limits.ConcurrencyViolation(h.limits, inFlight)
+-					slog.Info("transfer answer refused by concurrency limit",
+-						"account", session.AccountID, "session", answer.SessionID,
+-						"in_flight", inFlight, "code", v.Code)
++				// Every authorization failure — not just the concurrency one —
++				// refuses both peers and stops here. The previous code special
++				// cased ErrConcurrencyLimit and let everything else fall through
++				// to routeToPeer with a token-less answer, which is precisely
++				// the silent-hang shape described above; adding new error kinds
++				// without widening this branch would walk straight back into it.
++				if authErr != nil {
++					var v *limits.Violation
++					switch {
++					case errors.Is(authErr, relay.ErrConcurrencyLimit):
++						v = limits.ConcurrencyViolation(h.limits, inFlight)
++						slog.Info("transfer answer refused by concurrency limit",
++							"account", session.AccountID, "session", answer.SessionID,
++							"in_flight", inFlight, "code", v.Code)
++					case errors.Is(authErr, relay.ErrSessionIDConflict):
++						v = limits.SessionConflictViolation()
++						slog.Warn("transfer answer refused: session id conflict",
++							"account", session.AccountID, "session", answer.SessionID)
++					default:
++						v = limits.AuthorizeFailedViolation()
++						slog.Warn("failed to authorize transfer session",
++							"session", answer.SessionID, "error", authErr)
++					}
++					// ConcurrencyViolation returns nil when the limit is
++					// disabled or unreached. That should not be reachable from
++					// an ErrConcurrencyLimit, but buildFailure dereferences the
++					// violation, so a nil here would turn a refusal into a panic
++					// on the control connection. Fall back rather than trust the
++					// invariant.
++					if v == nil {
++						v = limits.AuthorizeFailedViolation()
++					}
+ 					h.rejectToSelf(session, answer.SessionID, v)               // 接收方 = 当前连接
+ 					h.rejectToPeer(session, env.ToDevice, answer.SessionID, v) // 发送方 = ToDevice
+ 					continue
+ 				}
+-				if authErr == nil {
+-					slog.Info("transfer session authorized", "session", answer.SessionID, "sender", env.ToDevice, "receiver", session.DeviceID)
+-					answer.Token = token
+-					env.Payload, _ = json.Marshal(answer)
+-					// Echo authorized token back to the receiver as well
+-					echoEnv := env
+-					echoEnv.ToDevice = session.DeviceID
+-					echoBytes, _ := json.Marshal(echoEnv)
+-					session.Send(echoBytes)
+-				} else {
+-					slog.Warn("failed to authorize transfer session", "session", answer.SessionID, "error", authErr)
+-				}
++
++				slog.Info("transfer session authorized", "session", answer.SessionID, "sender", env.ToDevice, "receiver", session.DeviceID)
++				answer.Token = token
++				env.Payload, _ = json.Marshal(answer)
++				// Echo authorized token back to the receiver as well
++				echoEnv := env
++				echoEnv.ToDevice = session.DeviceID
++				echoBytes, _ := json.Marshal(echoEnv)
++				session.Send(echoBytes)
+ 			}
+ 			h.routeToPeer(session, env)
+ 
+@@ -345,8 +387,23 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 					SessionID string `json:"session_id"`
+ 				}
+ 				if err := json.Unmarshal(env.Payload, &termPayload); err == nil && termPayload.SessionID != "" {
+-					slog.Info("relay pipe removed", "action", string(env.Action), "session", termPayload.SessionID, "from", session.DeviceID)
+-					h.relayManager.RemovePipe(termPayload.SessionID)
++					if h.relayManager.RemovePipeForSession(termPayload.SessionID, session.AccountID, session.DeviceID) {
++						slog.Info("relay pipe removed", "action", string(env.Action), "session", termPayload.SessionID, "from", session.DeviceID)
++					} else if owner, known := h.relayManager.OwnerOfSession(termPayload.SessionID); known {
++						// Someone asked to tear down a session that exists and is
++						// not theirs to end. This is the case the ownership check
++						// was added for, so it is worth a warning.
++						slog.Warn("cross-account pipe teardown blocked",
++							"session", termPayload.SessionID, "from_account", session.AccountID,
++							"owner_account", owner, "from_device", session.DeviceID)
++					} else {
++						// Nothing to tear down: a duplicate or late terminal
++						// signal after the idle sweep already reclaimed it. Normal
++						// traffic, so debug — warning here would drown the branch
++						// above in noise from honest long transfers.
++						slog.Debug("terminal signal for unknown session",
++							"action", string(env.Action), "session", termPayload.SessionID)
++					}
+ 				}
+ 			}
+ 			h.routeToPeer(session, env)
+@@ -432,13 +489,9 @@ func (h *ControlWSHandler) rejectToPeer(session *registry.DeviceSession, peerDev
+ 	if peerDevice == "" {
+ 		return
+ 	}
+-	target, ok := h.registry.Get(peerDevice)
++	target, ok := h.registry.Get(session.AccountID, peerDevice)
+ 	if !ok {
+-		slog.Debug("peer offline for limit rejection", "to_device", peerDevice)
+-		return
+-	}
+-	if target.AccountID != session.AccountID {
+-		slog.Warn("cross-account limit rejection blocked", "from", session.AccountID, "to_device", peerDevice)
++		slog.Debug("peer not found in account for limit rejection", "to_device", peerDevice)
+ 		return
+ 	}
+ 	envBytes, ok := buildFailure("server", peerDevice, sessionID, v)
+@@ -468,21 +521,53 @@ func salvageSessionID(payload []byte) string {
+ 	return minimal.SessionID
+ }
+ 
++// writeAuthFailure sends a failed AUTH_RESPONSE and closes the connection.
++//
++// Note that the two kinds of message flowing through here have different
++// audiences, and that is deliberate rather than an inconsistency waiting to be
++// tidied up. The identifier rejections carry Chinese text that states the rule
++// itself, because the user is the only one who can fix it and "invalid account
++// id" alone is not actionable. The UNAUTHORIZED path forwards err.Error() —
++// English, internal, occasionally carrying things like diff=1.2s — because it
++// is a diagnostic for whoever is debugging a signature or clock problem, and
++// the user-facing wording for it already lives in USER_GUIDE.md.
++func writeAuthFailure(ctx context.Context, ws *websocket.Conn, traceID, code, message string) {
++	respPayload, _ := json.Marshal(protocol.AuthResponsePayload{
++		Success:      false,
++		ErrorCode:    code,
++		ErrorMessage: message,
++	})
++	respEnv, _ := json.Marshal(protocol.ControlEnvelope{
++		Version:   1,
++		TraceID:   traceID,
++		Action:    protocol.ActionAuthResponse,
++		Timestamp: time.Now().UnixMilli(),
++		Payload:   respPayload,
++	})
++	_ = ws.Write(ctx, websocket.MessageText, respEnv)
++	_ = ws.Close(websocket.StatusPolicyViolation, "authentication failed")
++}
++
+ // routeToPeer routes a control message to target peer and logs drops (P1-1).
++//
++// The lookup is scoped to the sender's account, so cross-account delivery is
++// structurally impossible rather than prevented by a comparison that a later
++// edit could forget. One thing was given up in exchange, on purpose: this used
++// to log "cross-account transfer attempt blocked" separately from "target
++// device offline", and now both are one miss. Distinguishing them would mean
++// confirming to the caller that another account owns a device by that name —
++// and writing that into the log leaks it to operations as well.
+ func (h *ControlWSHandler) routeToPeer(session *registry.DeviceSession, env protocol.ControlEnvelope) {
+ 	if env.ToDevice == "" {
+ 		return
+ 	}
+-	if targetSession, ok := h.registry.Get(env.ToDevice); ok {
+-		if targetSession.AccountID == session.AccountID {
+-			repacked, _ := json.Marshal(env)
+-			if !targetSession.Send(repacked) {
+-				slog.Warn("failed to deliver control message to target peer (queue full)", "action", env.Action, "to_device", env.ToDevice)
+-			}
+-		} else {
+-			slog.Warn("cross-account transfer attempt blocked", "from", session.AccountID, "to_device", env.ToDevice)
+-		}
+-	} else {
+-		slog.Debug("target device offline for transfer message", "action", env.Action, "to_device", env.ToDevice)
++	targetSession, ok := h.registry.Get(session.AccountID, env.ToDevice)
++	if !ok {
++		slog.Debug("peer not found in account for transfer message", "action", env.Action, "to_device", env.ToDevice)
++		return
++	}
++	repacked, _ := json.Marshal(env)
++	if !targetSession.Send(repacked) {
++		slog.Warn("failed to deliver control message to target peer (queue full)", "action", env.Action, "to_device", env.ToDevice)
+ 	}
+ }
+diff --git a/server/internal/controller/control_ws_test.go b/server/internal/controller/control_ws_test.go
+index ef8f2fb..950f930 100644
+--- a/server/internal/controller/control_ws_test.go
++++ b/server/internal/controller/control_ws_test.go
+@@ -23,7 +23,7 @@ func TestDataWSUnauthorizedAccessRejected(t *testing.T) {
+ 	psk := "test-secret"
+ 	verifier, _ := auth.NewVerifier(psk)
+ 	reg := registry.NewDeviceRegistry()
+-	relayMgr := relay.NewRelayManager()
++	relayMgr := relay.NewRelayManager(0)
+ 
+ 	mux := http.NewServeMux()
+ 	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, reg, relayMgr, limits.FromEnv()))
+@@ -56,7 +56,7 @@ func TestDataWSInvalidMagicFrameDisconnected(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+ 	defer cancel()
+ 
+-	relayMgr := relay.NewRelayManager()
++	relayMgr := relay.NewRelayManager(0)
+ 
+ 	// Pre-authorize a session
+ 	token, _ := relayMgr.AuthorizeSession("valid-session", "devA", "devB", "user1", 1*time.Minute)
+diff --git a/server/internal/controller/data_ws.go b/server/internal/controller/data_ws.go
+index 8c713e7..1a0d53a 100644
+--- a/server/internal/controller/data_ws.go
++++ b/server/internal/controller/data_ws.go
+@@ -4,7 +4,6 @@ import (
+ 	"context"
+ 	"log/slog"
+ 	"net/http"
+-	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/coder/websocket"
+@@ -153,7 +152,7 @@ func (h *DataWSHandler) handleSender(ctx context.Context, ws *websocket.Conn, pi
+ 		*buf = (*buf)[:len(data)]
+ 		copy(*buf, data)
+ 
+-		atomic.AddUint64(&Metrics.TotalRelayedBytes, uint64(len(data)))
++		Metrics.TotalRelayedBytes.Add(uint64(len(data)))
+ 
+ 		if err := pipe.PushForward(buf, 5*time.Second); err != nil {
+ 			pool.Put(buf)
+diff --git a/server/internal/controller/health.go b/server/internal/controller/health.go
+index 44efd7e..73488b4 100644
+--- a/server/internal/controller/health.go
++++ b/server/internal/controller/health.go
+@@ -13,11 +13,27 @@ import (
+ )
+ 
+ // MetricsTracker records basic runtime statistics.
++//
++// Every field here must be read somewhere, for the same reason config.Config
++// carries that rule: TotalOffers and RetransmitsCount used to sit in this
++// struct, were assigned zero at startup and then never read or written by
++// anything, and an exported struct field is never reported as unused. They have
++// been removed rather than wired up — nothing wanted them.
++//
++// The counters use atomic.Uint64 rather than a bare uint64 plus package-level
++// atomic.AddUint64 calls, so that the only way to touch them is the safe one.
+ type MetricsTracker struct {
+ 	StartTime         time.Time
+-	TotalRelayedBytes uint64
+-	TotalOffers       uint64
+-	RetransmitsCount  uint64
++	TotalRelayedBytes atomic.Uint64
++
++	// Handshake rejections, split by the closed reason set exposed as a
++	// Prometheus label. These are the only automated signal for how much real
++	// traffic the identifier validation introduced in auth/identity.go is
++	// turning away, which matters because that validation is a breaking change
++	// for anyone who had blanked out their account field.
++	AuthRejectedInvalidAccount atomic.Uint64
++	AuthRejectedInvalidDevice  atomic.Uint64
++	AuthRejectedUnauthorized   atomic.Uint64
+ }
+ 
+ var Metrics = &MetricsTracker{
+@@ -25,21 +41,49 @@ var Metrics = &MetricsTracker{
+ }
+ 
+ // HealthHandler returns JSON health status.
++//
++// Note what is absent: the list of account IDs. Both this endpoint and
++// /metrics are served without authentication (see main.go), so emitting the
++// names would hand every account in the deployment to anyone who can issue a
++// GET. The aggregates below answer the operational question without naming
++// anyone.
+ func HealthHandler(reg *registry.DeviceRegistry, rm *relay.RelayManager) http.HandlerFunc {
+ 	return func(w http.ResponseWriter, r *http.Request) {
+ 		w.Header().Set("Content-Type", "application/json")
+ 		status := map[string]any{
+-			"status":            "ok",
+-			"uptime_seconds":    int64(time.Since(Metrics.StartTime).Seconds()),
+-			"connected_devices": reg.Count(),
+-			"active_pipes":      rm.Count(),
+-			"goroutines":        runtime.NumGoroutine(),
++			"status":                  "ok",
++			"uptime_seconds":          int64(time.Since(Metrics.StartTime).Seconds()),
++			"connected_devices":       reg.Count(),
++			"online_accounts":         reg.CountAccounts(),
++			"max_devices_per_account": reg.MaxDevicesPerAccount(),
++			"active_pipes":            rm.Count(),
++			"max_pipes_per_account":   rm.MaxPipesInUsePerAccount(),
++			"goroutines":              runtime.NumGoroutine(),
+ 		}
+ 		_ = json.NewEncoder(w).Encode(status)
+ 	}
+ }
+ 
+ // MetricsHandler returns Prometheus-formatted metrics.
++//
++// There is deliberately no account_id label anywhere in this output, and there
++// must never be one. account_id is an unauthenticated, client-reported string:
++// a single client can mint an unbounded number of distinct values just by
++// reconnecting, and every one of them would become a permanent time series in
++// whatever scrapes this. That turns /metrics into a memory amplification vector
++// against both this process and the scraper. DESIGN.md once specified
++// unidrop_connected_devices{account_id, os_type}; that specification was
++// harmful and has been revised.
++//
++// The two "max per account" gauges exist to answer the question an operator
++// actually has — "is one account eating the whole box?" — with a single number
++// instead of one series per account. If you are tempted to add the label
++// because the aggregate feels coarse, re-read the paragraph above.
++//
++// The {reason} label on the rejection counter is a different thing and is safe:
++// it is a closed enum defined in code (three values), so its cardinality is
++// bounded by construction rather than by what a client sends. It is not a
++// precedent for labelling anything by account.
+ func MetricsHandler(reg *registry.DeviceRegistry, rm *relay.RelayManager) http.HandlerFunc {
+ 	return func(w http.ResponseWriter, r *http.Request) {
+ 		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+@@ -47,12 +91,33 @@ func MetricsHandler(reg *registry.DeviceRegistry, rm *relay.RelayManager) http.H
+ 		fmt.Fprintf(w, "# TYPE unidrop_online_devices gauge\n")
+ 		fmt.Fprintf(w, "unidrop_online_devices %d\n\n", reg.Count())
+ 
++		fmt.Fprintf(w, "# HELP unidrop_online_accounts Currently connected distinct accounts\n")
++		fmt.Fprintf(w, "# TYPE unidrop_online_accounts gauge\n")
++		fmt.Fprintf(w, "unidrop_online_accounts %d\n\n", reg.CountAccounts())
++
++		fmt.Fprintf(w, "# HELP unidrop_max_devices_per_account Devices held by the single busiest account\n")
++		fmt.Fprintf(w, "# TYPE unidrop_max_devices_per_account gauge\n")
++		fmt.Fprintf(w, "unidrop_max_devices_per_account %d\n\n", reg.MaxDevicesPerAccount())
++
+ 		fmt.Fprintf(w, "# HELP unidrop_active_relay_pipes Currently active data relay pipes\n")
+ 		fmt.Fprintf(w, "# TYPE unidrop_active_relay_pipes gauge\n")
+ 		fmt.Fprintf(w, "unidrop_active_relay_pipes %d\n\n", rm.Count())
+ 
++		fmt.Fprintf(w, "# HELP unidrop_max_pipes_per_account Relay pipes held by the single busiest account\n")
++		fmt.Fprintf(w, "# TYPE unidrop_max_pipes_per_account gauge\n")
++		fmt.Fprintf(w, "unidrop_max_pipes_per_account %d\n\n", rm.MaxPipesInUsePerAccount())
++
+ 		fmt.Fprintf(w, "# HELP unidrop_relayed_bytes_total Total bytes relayed\n")
+ 		fmt.Fprintf(w, "# TYPE unidrop_relayed_bytes_total counter\n")
+-		fmt.Fprintf(w, "unidrop_relayed_bytes_total %d\n\n", atomic.LoadUint64(&Metrics.TotalRelayedBytes))
++		fmt.Fprintf(w, "unidrop_relayed_bytes_total %d\n\n", Metrics.TotalRelayedBytes.Load())
++
++		fmt.Fprintf(w, "# HELP unidrop_auth_rejected_total Handshakes refused, by reason\n")
++		fmt.Fprintf(w, "# TYPE unidrop_auth_rejected_total counter\n")
++		fmt.Fprintf(w, "unidrop_auth_rejected_total{reason=\"invalid_account_id\"} %d\n",
++			Metrics.AuthRejectedInvalidAccount.Load())
++		fmt.Fprintf(w, "unidrop_auth_rejected_total{reason=\"invalid_device_id\"} %d\n",
++			Metrics.AuthRejectedInvalidDevice.Load())
++		fmt.Fprintf(w, "unidrop_auth_rejected_total{reason=\"unauthorized\"} %d\n\n",
++			Metrics.AuthRejectedUnauthorized.Load())
+ 	}
+ }
+diff --git a/server/internal/controller/limits_ws_test.go b/server/internal/controller/limits_ws_test.go
+index c184e8e..fc822bb 100644
+--- a/server/internal/controller/limits_ws_test.go
++++ b/server/internal/controller/limits_ws_test.go
+@@ -30,6 +30,8 @@ const testPSK = "test-psk-for-limits"
+ type limitsHarness struct {
+ 	server   *httptest.Server
+ 	verifier *auth.Verifier
++	registry *registry.DeviceRegistry
++	relay    *relay.RelayManager
+ }
+ 
+ func newLimitsHarness(t *testing.T, lim limits.Limits) *limitsHarness {
+@@ -40,7 +42,7 @@ func newLimitsHarness(t *testing.T, lim limits.Limits) *limitsHarness {
+ 		t.Fatalf("初始化校验器失败: %v", err)
+ 	}
+ 	reg := registry.NewDeviceRegistry()
+-	relayMgr := relay.NewRelayManager()
++	relayMgr := relay.NewRelayManager(0)
+ 
+ 	mux := http.NewServeMux()
+ 	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, reg, relayMgr, lim))
+@@ -48,14 +50,32 @@ func newLimitsHarness(t *testing.T, lim limits.Limits) *limitsHarness {
+ 	srv := httptest.NewServer(mux)
+ 	t.Cleanup(srv.Close)
+ 
+-	return &limitsHarness{server: srv, verifier: verifier}
++	return &limitsHarness{server: srv, verifier: verifier, registry: reg, relay: relayMgr}
+ }
+ 
+-// connect 完成 AUTH_CHALLENGE → AUTH_REQUEST → AUTH_RESPONSE，返回已鉴权的连接
+-// 与服务端下发的 AUTH_RESPONSE。
++// connect 完成握手并**断言鉴权成功**，返回已鉴权的连接与 AUTH_RESPONSE。
++// 需要检验拒绝路径的用例请用 connectRaw。
+ func (h *limitsHarness) connect(t *testing.T, ctx context.Context, accountID, deviceID string) (*websocket.Conn, protocol.AuthResponsePayload) {
+ 	t.Helper()
+ 
++	ws, resp := h.connectRaw(t, ctx, accountID, deviceID)
++	if !resp.Success {
++		t.Fatalf("鉴权失败: %s", resp.ErrorMessage)
++	}
++
++	// 紧随其后的 DEVICE_LIST_SYNC 先读掉，免得污染后续断言
++	_, _, _ = ws.Read(ctx)
++
++	return ws, resp
++}
++
++// connectRaw 跑完握手就返回，**不判断 Success、也不消费后续报文**。
++//
++// 从 connect 里拆出来是因为原来那一份在鉴权失败时直接 t.Fatalf，
++// 于是拒绝路径根本无从断言 —— 而本轮新增的两类身份拒绝正需要它。
++func (h *limitsHarness) connectRaw(t *testing.T, ctx context.Context, accountID, deviceID string) (*websocket.Conn, protocol.AuthResponsePayload) {
++	t.Helper()
++
+ 	wsURL := "ws" + strings.TrimPrefix(h.server.URL, "http")
+ 	ws, _, err := websocket.Dial(ctx, wsURL+"/ws/control", nil)
+ 	if err != nil {
+@@ -108,14 +128,64 @@ func (h *limitsHarness) connect(t *testing.T, ctx context.Context, accountID, de
+ 	_ = json.Unmarshal(respBytes, &respEnv)
+ 	var resp protocol.AuthResponsePayload
+ 	_ = json.Unmarshal(respEnv.Payload, &resp)
+-	if !resp.Success {
+-		t.Fatalf("鉴权失败: %s", resp.ErrorMessage)
++
++	return ws, resp
++}
++
++// connectRawWithNonce 与 connectRaw 相同，但由调用方指定 nonce，
++// 用于验证「身份格式被拒时不烧 nonce」。
++func (h *limitsHarness) connectRawWithNonce(t *testing.T, ctx context.Context, accountID, deviceID, nonce string) protocol.AuthResponsePayload {
++	t.Helper()
++
++	wsURL := "ws" + strings.TrimPrefix(h.server.URL, "http")
++	ws, _, err := websocket.Dial(ctx, wsURL+"/ws/control", nil)
++	if err != nil {
++		t.Fatalf("连接控制面失败: %v", err)
+ 	}
++	t.Cleanup(func() { _ = ws.CloseNow() })
+ 
+-	// 紧随其后的 DEVICE_LIST_SYNC 先读掉，免得污染后续断言
+-	_, _, _ = ws.Read(ctx)
++	_, challengeBytes, err := ws.Read(ctx)
++	if err != nil {
++		t.Fatalf("读取 challenge 失败: %v", err)
++	}
++	var challengeEnv protocol.ControlEnvelope
++	_ = json.Unmarshal(challengeBytes, &challengeEnv)
++	var challenge protocol.AuthChallengePayload
++	_ = json.Unmarshal(challengeEnv.Payload, &challenge)
+ 
+-	return ws, resp
++	now := time.Now().UnixMilli()
++	sig := h.verifier.GenerateSignatureWithSalt(accountID, deviceID, nonce, now, challenge.NonceSalt)
++
++	reqPayload, _ := json.Marshal(protocol.AuthRequestPayload{
++		AccountID:  accountID,
++		DeviceID:   deviceID,
++		Hostname:   deviceID,
++		OSType:     "macos",
++		AppVersion: "test",
++		Signature:  sig,
++		Nonce:      nonce,
++		Timestamp:  now,
++	})
++	reqEnv, _ := json.Marshal(protocol.ControlEnvelope{
++		Version:   1,
++		TraceID:   uuid.NewString(),
++		Action:    protocol.ActionAuthRequest,
++		Timestamp: now,
++		Payload:   reqPayload,
++	})
++	if err := ws.Write(ctx, websocket.MessageText, reqEnv); err != nil {
++		t.Fatalf("发送 AUTH_REQUEST 失败: %v", err)
++	}
++
++	_, respBytes, err := ws.Read(ctx)
++	if err != nil {
++		t.Fatalf("读取 AUTH_RESPONSE 失败: %v", err)
++	}
++	var respEnv2 protocol.ControlEnvelope
++	_ = json.Unmarshal(respBytes, &respEnv2)
++	var resp2 protocol.AuthResponsePayload
++	_ = json.Unmarshal(respEnv2.Payload, &resp2)
++	return resp2
+ }
+ 
+ func sendOffer(t *testing.T, ctx context.Context, ws *websocket.Conn, from, to string, offer protocol.TransferOfferPayload) {
+diff --git a/server/internal/e2e_test.go b/server/internal/e2e_test.go
+index 5285a89..3923a6a 100644
+--- a/server/internal/e2e_test.go
++++ b/server/internal/e2e_test.go
+@@ -34,7 +34,7 @@ func TestEndToEndTransfer(t *testing.T) {
+ 	}
+ 
+ 	reg := registry.NewDeviceRegistry()
+-	relayMgr := relay.NewRelayManager()
++	relayMgr := relay.NewRelayManager(0)
+ 
+ 	mux := http.NewServeMux()
+ 	mux.HandleFunc("GET /healthz", controller.HealthHandler(reg, relayMgr))
+@@ -370,3 +370,211 @@ func connectAndAuthClient(t *testing.T, ctx context.Context, wsURL, accountID, d
+ 
+ 	return ws
+ }
++
++// TestCrossAccountIsolationEndToEnd 用两个账号、四台设备跑一次隔离验证，
++// 其中**跨账号的 device_id 完全相同**（都叫 devA / devB）——
++// 那正是改造前 registry 以裸 DeviceID 为键时会互相踢下线的形态。
++//
++// 断言三件事：A 账号内的完整传输照常走通、B 账号全程收不到任何信令、
++// B 账号的两条连接都没有被踢掉。
++func TestCrossAccountIsolationEndToEnd(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
++	defer cancel()
++
++	pskSecret := "test-super-secret-key-12345"
++	verifier, err := auth.NewVerifier(pskSecret)
++	if err != nil {
++		t.Fatalf("初始化校验器失败: %v", err)
++	}
++
++	reg := registry.NewDeviceRegistry()
++	relayMgr := relay.NewRelayManager(0)
++
++	mux := http.NewServeMux()
++	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, reg, relayMgr, limits.FromEnv()))
++	mux.Handle("GET /ws/data", controller.NewDataWSHandler(relayMgr))
++
++	server := httptest.NewServer(mux)
++	defer server.Close()
++	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
++
++	// 两个账号，各两台设备，device_id 刻意撞车
++	acctA1 := connectAndAuthClient(t, ctx, wsURL, "acctA", "devA", "A-1", "macos", pskSecret, verifier)
++	defer acctA1.Close(websocket.StatusNormalClosure, "done")
++	acctA2 := connectAndAuthClient(t, ctx, wsURL, "acctA", "devB", "A-2", "windows", pskSecret, verifier)
++	defer acctA2.Close(websocket.StatusNormalClosure, "done")
++	acctB1 := connectAndAuthClient(t, ctx, wsURL, "acctB", "devA", "B-1", "macos", pskSecret, verifier)
++	defer acctB1.Close(websocket.StatusNormalClosure, "done")
++	acctB2 := connectAndAuthClient(t, ctx, wsURL, "acctB", "devB", "B-2", "linux", pskSecret, verifier)
++	defer acctB2.Close(websocket.StatusNormalClosure, "done")
++
++	time.Sleep(150 * time.Millisecond)
++
++	if reg.Count() != 4 {
++		t.Fatalf("四台设备应当全部在线（同名 device_id 不得互踢），实得 %d", reg.Count())
++	}
++	if reg.CountAccounts() != 2 {
++		t.Fatalf("在线账号数应为 2，实得 %d", reg.CountAccounts())
++	}
++	if reg.MaxDevicesPerAccount() != 2 {
++		t.Fatalf("单账号设备峰值应为 2，实得 %d", reg.MaxDevicesPerAccount())
++	}
++
++	// ---- A 账号内跑一次完整传输 ----
++	payload := make([]byte, 64*1024)
++	_, _ = rand.Read(payload)
++	hasher := sha256.New()
++	hasher.Write(payload)
++	expectedSHA := hex.EncodeToString(hasher.Sum(nil))
++
++	sessionUUID := uuid.New()
++	offerPayload, _ := json.Marshal(protocol.TransferOfferPayload{
++		SessionID:      sessionUUID.String(),
++		DataType:       "FILES",
++		TotalSize:      int64(len(payload)),
++		TotalItems:     1,
++		PreviewSummary: "isolation.bin",
++		Items: []protocol.TransferItemPayload{{
++			ItemIndex:    0,
++			RelativePath: "isolation.bin",
++			Size:         int64(len(payload)),
++			SHA256:       expectedSHA,
++			TotalChunks:  1,
++		}},
++	})
++	offerEnv, _ := json.Marshal(protocol.ControlEnvelope{
++		Version: 1, TraceID: uuid.NewString(), Action: protocol.ActionTransferOffer,
++		FromDevice: "devA", ToDevice: "devB", Timestamp: time.Now().UnixMilli(),
++		Payload: offerPayload,
++	})
++	if err := acctA1.Write(ctx, websocket.MessageText, offerEnv); err != nil {
++		t.Fatalf("A 账号发送 OFFER 失败: %v", err)
++	}
++
++	// A 账号的 devB 收到 OFFER（跳过上下线广播）
++	var receivedOffer protocol.ControlEnvelope
++	for {
++		_, raw, err := acctA2.Read(ctx)
++		if err != nil {
++			t.Fatalf("A 账号的对端读取 OFFER 失败: %v", err)
++		}
++		_ = json.Unmarshal(raw, &receivedOffer)
++		if receivedOffer.Action == protocol.ActionTransferOffer {
++			break
++		}
++	}
++
++	answerPayload, _ := json.Marshal(protocol.TransferAnswerPayload{
++		SessionID: sessionUUID.String(), Accepted: true,
++	})
++	answerEnv, _ := json.Marshal(protocol.ControlEnvelope{
++		Version: 1, TraceID: receivedOffer.TraceID, Action: protocol.ActionTransferAnswer,
++		FromDevice: "devB", ToDevice: "devA", Timestamp: time.Now().UnixMilli(),
++		Payload: answerPayload,
++	})
++	if err := acctA2.Write(ctx, websocket.MessageText, answerEnv); err != nil {
++		t.Fatalf("A 账号发送 ANSWER 失败: %v", err)
++	}
++
++	var receivedAnswer protocol.ControlEnvelope
++	for {
++		_, raw, err := acctA1.Read(ctx)
++		if err != nil {
++			t.Fatalf("A 账号读取 ANSWER 失败: %v", err)
++		}
++		_ = json.Unmarshal(raw, &receivedAnswer)
++		if receivedAnswer.Action == protocol.ActionTransferAnswer {
++			break
++		}
++	}
++	var answerObj protocol.TransferAnswerPayload
++	_ = json.Unmarshal(receivedAnswer.Payload, &answerObj)
++	if answerObj.Token == "" {
++		t.Fatal("A 账号的 ANSWER 应当带回数据面 token")
++	}
++
++	// 数据面：A 账号的两台设备对传
++	sendURL := fmt.Sprintf("%s/ws/data?session_id=%s&role=sender&device_id=devA&target_device_id=devB&token=%s",
++		wsURL, sessionUUID.String(), answerObj.Token)
++	senderData, _, err := websocket.Dial(ctx, sendURL, nil)
++	if err != nil {
++		t.Fatalf("A 账号发送端接入数据面失败: %v", err)
++	}
++	defer senderData.Close(websocket.StatusNormalClosure, "done")
++
++	recvURL := fmt.Sprintf("%s/ws/data?session_id=%s&role=receiver&device_id=devB&target_device_id=devA&token=%s",
++		wsURL, sessionUUID.String(), answerObj.Token)
++	receiverData, _, err := websocket.Dial(ctx, recvURL, nil)
++	if err != nil {
++		t.Fatalf("A 账号接收端接入数据面失败: %v", err)
++	}
++	defer receiverData.Close(websocket.StatusNormalClosure, "done")
++	receiverData.SetReadLimit(int64(protocol.HeaderSize + protocol.MaxPayloadLength + 1024))
++
++	hdr := protocol.NewDataHeader(sessionUUID, 0, 0, 1, payload)
++	frame := make([]byte, protocol.HeaderSize+len(payload))
++	if err := hdr.Encode(frame); err != nil {
++		t.Fatalf("编码帧头失败: %v", err)
++	}
++	copy(frame[protocol.HeaderSize:], payload)
++
++	if err := senderData.Write(ctx, websocket.MessageBinary, frame); err != nil {
++		t.Fatalf("发送数据帧失败: %v", err)
++	}
++
++	_, got, err := receiverData.Read(ctx)
++	if err != nil {
++		t.Fatalf("接收数据帧失败: %v", err)
++	}
++	gotHdr, err := protocol.DecodeBinaryHeader(got)
++	if err != nil {
++		t.Fatalf("解码帧头失败: %v", err)
++	}
++	gotPayload := got[protocol.HeaderSize:]
++	if err := gotHdr.VerifyPayloadCRC32(gotPayload); err != nil {
++		t.Fatalf("数据帧 CRC32 校验失败: %v", err)
++	}
++	gotHasher := sha256.New()
++	gotHasher.Write(gotPayload)
++	if hex.EncodeToString(gotHasher.Sum(nil)) != expectedSHA {
++		t.Fatal("A 账号内传输的数据校验和不符")
++	}
++
++	// ---- B 账号全程必须静默，且两条连接都还活着 ----
++	// 顺序要紧：registry 断言必须排在下面的静默探测**之前**。
++	// coder/websocket 在 Read 的 context 超时时会把整条连接关掉，
++	// 所以探测完 B 的两条连接后它们就已经离线，再去数 Count 会少两台。
++	if reg.Count() != 4 {
++		t.Fatalf("传输结束后四台设备仍应在线（B 账号不得被踢），实得 %d", reg.Count())
++	}
++	if _, ok := reg.Get("acctB", "devA"); !ok {
++		t.Fatal("B 账号的 devA 不得被 A 账号的同名设备顶掉")
++	}
++	if _, ok := reg.Get("acctB", "devB"); !ok {
++		t.Fatal("B 账号的 devB 不得被 A 账号的同名设备顶掉")
++	}
++
++	// 注意断言的边界：B 账号**内部**的上下线广播是正常的（B-2 上线时 B-1 会收到
++	// DEVICE_ONLINE），不算泄漏。这里要证伪的是「A 账号的传输信令漏到了 B」。
++	for name, ws := range map[string]*websocket.Conn{"B-1": acctB1, "B-2": acctB2} {
++		quietCtx, quietCancel := context.WithTimeout(ctx, 400*time.Millisecond)
++		for {
++			_, raw, err := ws.Read(quietCtx)
++			if err != nil {
++				break // 读超时 = 再没有别的东西了，符合预期
++			}
++			var env protocol.ControlEnvelope
++			_ = json.Unmarshal(raw, &env)
++			switch env.Action {
++			case protocol.ActionDeviceOnline, protocol.ActionDeviceOffline,
++				protocol.ActionDeviceListSync:
++				continue // B 账号内部的设备拓扑广播，与 A 无关
++			}
++			quietCancel()
++			t.Fatalf("B 账号的 %s 不得收到 A 账号的传输信令，却收到了 %s: %s",
++				name, env.Action, raw)
++		}
++		quietCancel()
++	}
++
++}
+diff --git a/server/internal/limits/limits.go b/server/internal/limits/limits.go
+index 47f6574..bac5542 100644
+--- a/server/internal/limits/limits.go
++++ b/server/internal/limits/limits.go
+@@ -49,6 +49,15 @@ const (
+ 	CodeTooManyItems      = "LIMIT_TOO_MANY_ITEMS"
+ 	CodeTooManyConcurrent = "LIMIT_TOO_MANY_CONCURRENT"
+ 	CodeMalformedOffer    = "LIMIT_MALFORMED_OFFER"
++
++	// The next two are not limits in the sense the rest of this file uses the
++	// word — they report that authorizing a transfer failed. They live here
++	// because Violation is the only channel that can tell both peers at once and
++	// still have the failure land on the right transfer card: buildFailure keys
++	// off session_id, and a failure without one is a failure the user never
++	// sees.
++	CodeSessionConflict = "SESSION_ID_CONFLICT"
++	CodeAuthorizeFailed = "AUTHORIZE_FAILED"
+ )
+ 
+ // Violation describes a rejected offer. Message is user-facing Chinese text
+@@ -285,6 +294,27 @@ func ConcurrencyViolation(l Limits, inFlight int) *Violation {
+ 	}
+ }
+ 
++// SessionConflictViolation reports that the session ID on an answer is already
++// held by a different authorization. The user-facing advice is simply to retry,
++// because a fresh transfer mints a fresh UUID and the collision will not repeat.
++func SessionConflictViolation() *Violation {
++	return &Violation{
++		Code:    CodeSessionConflict,
++		Message: "传输会话标识冲突，请重试",
++	}
++}
++
++// AuthorizeFailedViolation is the catch-all for an authorization failure with no
++// more specific cause — today only a failure of the system RNG while minting a
++// token. It exists so that the ANSWER path has a Violation for *every* error
++// branch and can never fall through to forwarding a token-less answer.
++func AuthorizeFailedViolation() *Violation {
++	return &Violation{
++		Code:    CodeAuthorizeFailed,
++		Message: "服务端无法授权本次传输，请重试",
++	}
++}
++
+ func humanBytes(n int64) string {
+ 	const unit = 1024
+ 	if n < unit {
+diff --git a/server/internal/protocol/envelope.go b/server/internal/protocol/envelope.go
+index 30796d8..21875de 100644
+--- a/server/internal/protocol/envelope.go
++++ b/server/internal/protocol/envelope.go
+@@ -46,6 +46,15 @@ type AuthChallengePayload struct {
+ 	ServerTime int64  `json:"server_time"`
+ }
+ 
++// Error codes carried by AuthResponsePayload.ErrorCode when a handshake is
++// refused. They are a closed set defined here rather than written inline at the
++// rejection sites, so that the wire contract stays greppable from one place.
++const (
++	AuthErrUnauthorized     = "UNAUTHORIZED"
++	AuthErrInvalidAccountID = "INVALID_ACCOUNT_ID"
++	AuthErrInvalidDeviceID  = "INVALID_DEVICE_ID"
++)
++
+ // AuthRequestPayload is sent by client to authenticate.
+ type AuthRequestPayload struct {
+ 	AccountID  string `json:"account_id"`
+diff --git a/server/internal/registry/registry.go b/server/internal/registry/registry.go
+index 1296a70..64b3553 100644
+--- a/server/internal/registry/registry.go
++++ b/server/internal/registry/registry.go
+@@ -5,44 +5,82 @@ import (
+ 	"time"
+ )
+ 
++// sessionKey identifies a live connection by the pair that actually has to be
++// unique, rather than by DeviceID alone.
++//
++// The registry used to be keyed on the bare DeviceID, and Register would close
++// whatever it found under that key before storing the new session. Two accounts
++// that happened to pick the same device_id — two machines both called "MacBook",
++// or one config directory copied to a colleague — would therefore kick each
++// other offline, and a client could do it on purpose by claiming a device_id it
++// had seen. Putting AccountID in the key makes "taking over a device slot" an
++// account-internal affair, which is what it always should have been.
++//
++// The alternative considered was keeping the flat key and comparing AccountID at
++// each call site. That was rejected: the map would go on claiming that DeviceID
++// is globally unique when it is not, and every future method added to this type
++// would have to remember to compare again. This is the same reasoning
++// countAuthorizedForAccountLocked uses to refuse a hand-maintained counter —
++// more ways to be silently wrong than it is worth.
++//
++// This structure assumes AccountID is non-empty and already normalised. That is
++// guaranteed by auth.ValidateAccountID at the handshake; remove the validation
++// and every client that forgot to set an account lands back in one shared
++// bucket, which is exactly the defect the key change was made to close.
++type sessionKey struct {
++	AccountID string
++	DeviceID  string
++}
++
++func keyOf(s *DeviceSession) sessionKey {
++	return sessionKey{AccountID: s.AccountID, DeviceID: s.DeviceID}
++}
++
+ // DeviceRegistry provides a thread-safe in-memory store for active device sessions.
+ type DeviceRegistry struct {
+ 	mu       sync.RWMutex
+-	sessions map[string]*DeviceSession // key: DeviceID
++	sessions map[sessionKey]*DeviceSession
+ }
+ 
+ // NewDeviceRegistry creates a new DeviceRegistry.
+ func NewDeviceRegistry() *DeviceRegistry {
+ 	return &DeviceRegistry{
+-		sessions: make(map[string]*DeviceSession),
++		sessions: make(map[sessionKey]*DeviceSession),
+ 	}
+ }
+ 
+-// Register adds or updates a device session. If a previous session exists for the same DeviceID,
+-// it is gracefully closed and replaced.
++// Register adds or updates a device session. If a previous session exists for the
++// same (account, device) pair, it is gracefully closed and replaced.
++//
++// Replacing on reconnect is intentional and unchanged: a device that drops and
++// comes back should supersede its own stale connection. What changed is that the
++// match now requires the account to agree, so the takeover can no longer reach
++// across accounts.
+ func (r *DeviceRegistry) Register(s *DeviceSession) {
+ 	r.mu.Lock()
+ 	defer r.mu.Unlock()
+ 
+-	if old, exists := r.sessions[s.DeviceID]; exists {
++	k := keyOf(s)
++	if old, exists := r.sessions[k]; exists {
+ 		old.Close()
+ 	}
+-	r.sessions[s.DeviceID] = s
++	r.sessions[k] = s
+ }
+ 
+-// Unregister removes a device session by DeviceID and closes it.
+-func (r *DeviceRegistry) Unregister(deviceID string) {
++// Unregister removes a device session by (accountID, deviceID) and closes it.
++func (r *DeviceRegistry) Unregister(accountID, deviceID string) {
+ 	r.mu.Lock()
+ 	defer r.mu.Unlock()
+ 
+-	if s, exists := r.sessions[deviceID]; exists {
++	k := sessionKey{AccountID: accountID, DeviceID: deviceID}
++	if s, exists := r.sessions[k]; exists {
+ 		s.Close()
+-		delete(r.sessions, deviceID)
++		delete(r.sessions, k)
+ 	}
+ }
+ 
+ // UnregisterSession performs a compare-and-delete (P0-5): it only unregisters and closes
+-// the session if the session currently registered under s.DeviceID is precisely s.
++// the session if the session currently registered under s's key is precisely s.
+ // Returns true if the session was matched and unregistered.
+ func (r *DeviceRegistry) UnregisterSession(s *DeviceSession) bool {
+ 	if s == nil {
+@@ -51,31 +89,44 @@ func (r *DeviceRegistry) UnregisterSession(s *DeviceSession) bool {
+ 	r.mu.Lock()
+ 	defer r.mu.Unlock()
+ 
+-	if current, exists := r.sessions[s.DeviceID]; exists && current == s {
++	k := keyOf(s)
++	if current, exists := r.sessions[k]; exists && current == s {
+ 		s.Close()
+-		delete(r.sessions, s.DeviceID)
++		delete(r.sessions, k)
+ 		return true
+ 	}
+ 	return false
+ }
+ 
+-// Get retrieves a session by DeviceID.
+-func (r *DeviceRegistry) Get(deviceID string) (*DeviceSession, bool) {
++// Get retrieves a session by (accountID, deviceID).
++//
++// Callers no longer need to compare AccountID afterwards — a lookup scoped to
++// the wrong account simply misses. One consequence is deliberate and worth
++// stating: "this device belongs to another account" and "this device is not
++// connected" are now the same answer. Telling them apart would leak the
++// existence of another account's device into the caller (and into its logs),
++// which is not information this account is entitled to.
++func (r *DeviceRegistry) Get(accountID, deviceID string) (*DeviceSession, bool) {
+ 	r.mu.RLock()
+ 	defer r.mu.RUnlock()
+ 
+-	s, exists := r.sessions[deviceID]
++	s, exists := r.sessions[sessionKey{AccountID: accountID, DeviceID: deviceID}]
+ 	return s, exists
+ }
+ 
+ // ListByAccount returns all active sessions for a given account.
++//
++// The linear scan is deliberate. Session count is bounded by the heartbeat
++// sweep and sits in the tens-to-hundreds range, so a secondary index would buy
++// nothing and add an invariant to keep correct on every insert and delete. If
++// that ever changes, the index can be added without touching this signature.
+ func (r *DeviceRegistry) ListByAccount(accountID string) []*DeviceSession {
+ 	r.mu.RLock()
+ 	defer r.mu.RUnlock()
+ 
+ 	var result []*DeviceSession
+-	for _, s := range r.sessions {
+-		if s.AccountID == accountID {
++	for k, s := range r.sessions {
++		if k.AccountID == accountID {
+ 			result = append(result, s)
+ 		}
+ 	}
+@@ -87,8 +138,8 @@ func (r *DeviceRegistry) BroadcastToAccount(accountID, excludeDeviceID string, d
+ 	r.mu.RLock()
+ 	defer r.mu.RUnlock()
+ 
+-	for _, s := range r.sessions {
+-		if s.AccountID == accountID && s.DeviceID != excludeDeviceID {
++	for k, s := range r.sessions {
++		if k.AccountID == accountID && k.DeviceID != excludeDeviceID {
+ 			s.Send(data)
+ 		}
+ 	}
+@@ -101,6 +152,39 @@ func (r *DeviceRegistry) Count() int {
+ 	return len(r.sessions)
+ }
+ 
++// CountAccounts returns the number of distinct accounts with at least one
++// connected device.
++func (r *DeviceRegistry) CountAccounts() int {
++	r.mu.RLock()
++	defer r.mu.RUnlock()
++
++	seen := make(map[string]struct{}, len(r.sessions))
++	for k := range r.sessions {
++		seen[k.AccountID] = struct{}{}
++	}
++	return len(seen)
++}
++
++// MaxDevicesPerAccount returns the device count of the single busiest account.
++//
++// This exists so that /metrics can answer "is one account eating the box?" with
++// one number instead of one time series per account — see the comment on
++// MetricsHandler for why a per-account label is not an option.
++func (r *DeviceRegistry) MaxDevicesPerAccount() int {
++	r.mu.RLock()
++	defer r.mu.RUnlock()
++
++	perAccount := make(map[string]int, len(r.sessions))
++	max := 0
++	for k := range r.sessions {
++		perAccount[k.AccountID]++
++		if n := perAccount[k.AccountID]; n > max {
++			max = n
++		}
++	}
++	return max
++}
++
+ // SweepInactive checks for devices that have not sent a heartbeat within the timeout period.
+ // It unregisters them and returns their IDs along with their AccountIDs.
+ func (r *DeviceRegistry) SweepInactive(timeout time.Duration, now time.Time) []struct {
+@@ -115,17 +199,17 @@ func (r *DeviceRegistry) SweepInactive(timeout time.Duration, now time.Time) []s
+ 		DeviceID  string
+ 	}
+ 
+-	for id, s := range r.sessions {
++	for k, s := range r.sessions {
+ 		if now.Sub(s.GetLastPing()) > timeout {
+ 			timedOut = append(timedOut, struct {
+ 				AccountID string
+ 				DeviceID  string
+ 			}{
+-				AccountID: s.AccountID,
+-				DeviceID:  s.DeviceID,
++				AccountID: k.AccountID,
++				DeviceID:  k.DeviceID,
+ 			})
+ 			s.Close()
+-			delete(r.sessions, id)
++			delete(r.sessions, k)
+ 		}
+ 	}
+ 
+diff --git a/server/internal/registry/registry_test.go b/server/internal/registry/registry_test.go
+index 65a345a..179c692 100644
+--- a/server/internal/registry/registry_test.go
++++ b/server/internal/registry/registry_test.go
+@@ -19,7 +19,7 @@ func TestDeviceRegistryCRUD(t *testing.T) {
+ 		t.Fatalf("expected count 2, got %d", reg.Count())
+ 	}
+ 
+-	found, ok := reg.Get("dev1")
++	found, ok := reg.Get("user1", "dev1")
+ 	if !ok || found.Hostname != "MacBook" {
+ 		t.Fatalf("expected dev1 found with MacBook hostname")
+ 	}
+@@ -41,13 +41,13 @@ func TestDeviceRegistryCRUD(t *testing.T) {
+ 		t.Fatal("expected old session to be closed upon replacement")
+ 	}
+ 
+-	foundNew, _ := reg.Get("dev1")
++	foundNew, _ := reg.Get("user1", "dev1")
+ 	if foundNew.Hostname != "MacBook-Pro" {
+ 		t.Fatalf("expected new session hostname MacBook-Pro, got %s", foundNew.Hostname)
+ 	}
+ 
+-	reg.Unregister("dev1")
+-	if _, ok := reg.Get("dev1"); ok {
++	reg.Unregister("user1", "dev1")
++	if _, ok := reg.Get("user1", "dev1"); ok {
+ 		t.Fatal("expected dev1 unregistered")
+ 	}
+ }
+@@ -92,7 +92,7 @@ func TestDeviceRegistryUnregisterSessionCAS(t *testing.T) {
+ 	}
+ 
+ 	// sNew must still be present and alive
+-	current, exists := reg.Get("dev1")
++	current, exists := reg.Get("user1", "dev1")
+ 	if !exists || current != sNew {
+ 		t.Fatal("expected sNew to remain registered")
+ 	}
+@@ -101,7 +101,7 @@ func TestDeviceRegistryUnregisterSessionCAS(t *testing.T) {
+ 	if !reg.UnregisterSession(sNew) {
+ 		t.Fatal("expected sNew unregister to succeed")
+ 	}
+-	if _, exists := reg.Get("dev1"); exists {
++	if _, exists := reg.Get("user1", "dev1"); exists {
+ 		t.Fatal("expected dev1 to be deleted after sNew unregister")
+ 	}
+ }
+@@ -117,10 +117,150 @@ func TestDeviceRegistryConcurrentAccess(t *testing.T) {
+ 			devID := "dev_" + string(rune('A'+id%26))
+ 			s := NewDeviceSession("user1", devID, "host", "linux", "1.0.0", "127.0.0.1", nil)
+ 			reg.Register(s)
+-			reg.Get(devID)
++			reg.Get("user1", devID)
+ 			reg.ListByAccount("user1")
+ 		}(i)
+ 	}
+ 
+ 	wg.Wait()
+ }
++
++// 本组核心负例：两个账号用了相同的 device_id。
++// 改回扁平键（以 DeviceID 为唯一键）这条立刻红 ——
++// 那正是「B 账号连上来就把 A 的设备踢下线」的形态，也是用户最在意的一条。
++func TestRegisterSameDeviceIDDifferentAccountsCoexist(t *testing.T) {
++	reg := NewDeviceRegistry()
++
++	a := NewDeviceSession("acctA", "dev1", "A-Mac", "macos", "1.0.0", "127.0.0.1", nil)
++	b := NewDeviceSession("acctB", "dev1", "B-Mac", "macos", "1.0.0", "127.0.0.1", nil)
++
++	reg.Register(a)
++	reg.Register(b)
++
++	select {
++	case <-a.Closed:
++		t.Fatal("另一个账号注册同名 device_id 时，本账号的会话不得被关闭")
++	default:
++	}
++
++	if reg.Count() != 2 {
++		t.Fatalf("两个账号的同名设备应当共存，期望 2 个会话，实得 %d", reg.Count())
++	}
++}
++
++// 正例：确认没有把「同账号同设备重连顶掉旧连接」这个正当行为一起修掉。
++func TestRegisterSameAccountSameDeviceStillReplaces(t *testing.T) {
++	reg := NewDeviceRegistry()
++
++	old := NewDeviceSession("acctA", "dev1", "旧连接", "macos", "1.0.0", "127.0.0.1", nil)
++	fresh := NewDeviceSession("acctA", "dev1", "新连接", "macos", "1.0.1", "127.0.0.1", nil)
++
++	reg.Register(old)
++	reg.Register(fresh)
++
++	select {
++	case <-old.Closed:
++	default:
++		t.Fatal("同账号同设备重连必须顶掉旧连接")
++	}
++	if reg.Count() != 1 {
++		t.Fatalf("顶号后应只剩 1 个会话，实得 %d", reg.Count())
++	}
++}
++
++func TestGetIsScopedToAccount(t *testing.T) {
++	reg := NewDeviceRegistry()
++	reg.Register(NewDeviceSession("acctA", "dev1", "A-Mac", "macos", "1.0.0", "127.0.0.1", nil))
++
++	if _, ok := reg.Get("acctB", "dev1"); ok {
++		t.Fatal("查另一个账号下的同名 device_id 必须查不到")
++	}
++	if s, ok := reg.Get("acctA", "dev1"); !ok || s.Hostname != "A-Mac" {
++		t.Fatal("本账号下的设备必须查得到")
++	}
++}
++
++// CAS 不得误摘他账号的同名条目。
++func TestUnregisterSessionCASIgnoresOtherAccountSameDeviceID(t *testing.T) {
++	reg := NewDeviceRegistry()
++
++	a := NewDeviceSession("acctA", "dev1", "A-Mac", "macos", "1.0.0", "127.0.0.1", nil)
++	b := NewDeviceSession("acctB", "dev1", "B-Mac", "macos", "1.0.0", "127.0.0.1", nil)
++	reg.Register(a)
++	reg.Register(b)
++
++	if !reg.UnregisterSession(a) {
++		t.Fatal("摘除自己的会话应当成功")
++	}
++	if _, ok := reg.Get("acctB", "dev1"); !ok {
++		t.Fatal("摘除 A 账号的会话不得连带摘掉 B 账号的同名设备")
++	}
++}
++
++// 广播既不能漏发，也不能串发到同名 device_id 的另一个账号。
++func TestBroadcastToAccountSkipsOtherAccountSameDeviceID(t *testing.T) {
++	reg := NewDeviceRegistry()
++
++	a1 := NewDeviceSession("acctA", "dev1", "A1", "macos", "1.0.0", "127.0.0.1", nil)
++	a2 := NewDeviceSession("acctA", "dev2", "A2", "macos", "1.0.0", "127.0.0.1", nil)
++	b1 := NewDeviceSession("acctB", "dev1", "B1", "macos", "1.0.0", "127.0.0.1", nil)
++	reg.Register(a1)
++	reg.Register(a2)
++	reg.Register(b1)
++
++	reg.BroadcastToAccount("acctA", "dev1", []byte("hello"))
++
++	if len(a2.SendChan) != 1 {
++		t.Fatalf("同账号的其他设备必须收到广播，实得 %d 条", len(a2.SendChan))
++	}
++	if len(a1.SendChan) != 0 {
++		t.Fatal("被排除的设备不得收到广播")
++	}
++	if len(b1.SendChan) != 0 {
++		t.Fatal("另一个账号的同名设备不得收到广播")
++	}
++}
++
++func TestSweepInactiveRemovesOnlyTimedOutAcrossAccounts(t *testing.T) {
++	reg := NewDeviceRegistry()
++	now := time.Now()
++
++	stale := NewDeviceSession("acctA", "dev1", "A1", "macos", "1.0.0", "127.0.0.1", nil)
++	stale.TouchPing(now.Add(-50 * time.Second))
++	alive := NewDeviceSession("acctB", "dev1", "B1", "macos", "1.0.0", "127.0.0.1", nil)
++	alive.TouchPing(now.Add(-10 * time.Second))
++	reg.Register(stale)
++	reg.Register(alive)
++
++	timedOut := reg.SweepInactive(45*time.Second, now)
++	if len(timedOut) != 1 {
++		t.Fatalf("只应清掉 1 个超时会话，实得 %d", len(timedOut))
++	}
++	if timedOut[0].AccountID != "acctA" || timedOut[0].DeviceID != "dev1" {
++		t.Fatalf("清掉的应当是 acctA/dev1，实得 %+v", timedOut[0])
++	}
++	if _, ok := reg.Get("acctB", "dev1"); !ok {
++		t.Fatal("另一个账号的同名设备不得被连带清掉")
++	}
++}
++
++// 这两个聚合是 /metrics 能以有界基数回答「是否单账号吃满机器」的依据。
++func TestCountAccountsAndMaxDevicesPerAccount(t *testing.T) {
++	reg := NewDeviceRegistry()
++
++	if reg.CountAccounts() != 0 || reg.MaxDevicesPerAccount() != 0 {
++		t.Fatal("空注册表的两个聚合都应为 0")
++	}
++
++	reg.Register(NewDeviceSession("acctA", "dev1", "h", "macos", "1", "127.0.0.1", nil))
++	reg.Register(NewDeviceSession("acctA", "dev2", "h", "macos", "1", "127.0.0.1", nil))
++	reg.Register(NewDeviceSession("acctA", "dev3", "h", "macos", "1", "127.0.0.1", nil))
++	reg.Register(NewDeviceSession("acctB", "dev1", "h", "macos", "1", "127.0.0.1", nil))
++
++	if got := reg.CountAccounts(); got != 2 {
++		t.Fatalf("在线账号数应为 2，实得 %d", got)
++	}
++	if got := reg.MaxDevicesPerAccount(); got != 3 {
++		t.Fatalf("单账号设备数峰值应为 3，实得 %d", got)
++	}
++}
+diff --git a/server/internal/relay/pipe.go b/server/internal/relay/pipe.go
+index 6559e7d..c7af53d 100644
+--- a/server/internal/relay/pipe.go
++++ b/server/internal/relay/pipe.go
+@@ -15,9 +15,15 @@ var (
+ 
+ // RelayPipe provides bidirectional streaming channels between sender and receiver.
+ type RelayPipe struct {
+-	SessionID    string
+-	FromDevice   string
+-	ToDevice     string
++	SessionID string
++
++	// AccountID of the authorization this pipe was created from. It is carried
++	// here so that ownership can still be established when the auth entry is
++	// gone, and so that per-account pipe accounting does not need a second
++	// lookup.
++	AccountID  string
++	FromDevice string
++	ToDevice   string
+ 	ForwardChan  chan *[]byte // Sender -> Receiver (data frames)
+ 	BackwardChan chan *[]byte // Receiver -> Sender (ACK/NACK frames)
+ 	DoneChan     chan struct{}
+@@ -27,10 +33,11 @@ type RelayPipe struct {
+ }
+ 
+ // NewRelayPipe creates a new streaming relay pipe.
+-func NewRelayPipe(sessionID, fromDevice, toDevice string) *RelayPipe {
++func NewRelayPipe(sessionID, accountID, fromDevice, toDevice string) *RelayPipe {
+ 	now := time.Now()
+ 	return &RelayPipe{
+ 		SessionID:    sessionID,
++		AccountID:    accountID,
+ 		FromDevice:   fromDevice,
+ 		ToDevice:     toDevice,
+ 		ForwardChan:  make(chan *[]byte, 4),  // Buffered so a sender that dials before the receiver is not immediately congested
+diff --git a/server/internal/relay/relay_manager.go b/server/internal/relay/relay_manager.go
+index 59b5bb1..217e563 100644
+--- a/server/internal/relay/relay_manager.go
++++ b/server/internal/relay/relay_manager.go
+@@ -26,6 +26,15 @@ var (
+ 	// ErrConcurrencyLimit is returned when an account already has the maximum
+ 	// number of authorized-but-unfinished transfers.
+ 	ErrConcurrencyLimit = errors.New("account transfer concurrency limit reached")
++
++	// ErrSessionIDConflict is returned when a session ID is already held by a
++	// live authorization belonging to someone else, or to a different device
++	// pair within the same account.
++	ErrSessionIDConflict = errors.New("session id already in use by another authorization")
++
++	// ErrAccountPipeLimit is returned when an account already holds its maximum
++	// number of live relay pipes.
++	ErrAccountPipeLimit = errors.New("account relay pipe limit reached")
+ )
+ 
+ // SessionAuth represents authorization for an upcoming data plane session.
+@@ -39,21 +48,45 @@ type SessionAuth struct {
+ }
+ 
+ // RelayManager manages active streaming data pipes and the shared buffer pool.
++//
++// Both maps are keyed on the bare SessionID, and that is a deliberate contrast
++// with registry.DeviceRegistry, which was changed to a composite
++// (account, device) key. The two identifiers are not the same kind of thing.
++// A device_id is user-visible and collides across accounts as a matter of
++// course — two people really do both own a "MacBook" — so partitioning it is
++// right. A session_id is a UUIDv4 minted per transfer; a collision there is not
++// normal traffic but either ID reuse or someone probing, and partitioning would
++// silently swallow that signal instead of surfacing it. The data plane also has
++// no account in its URL (see controller.DataWSHandler), so a composite key here
++// would force adding a client-reported account_id whose only validation would be
++// the token we already check — strictly worse. What was missing was never the
++// key shape but authorization on writes and deletes, and those are handled
++// explicitly below.
+ type RelayManager struct {
+ 	mu            sync.RWMutex
+ 	pipes         map[string]*RelayPipe   // key: SessionID
+ 	authSessions  map[string]*SessionAuth // key: SessionID
+ 	bufferPool    *BufferPool
+ 	ackBufferPool *AckBufferPool
++
++	// maxPipesPerAccount bounds live pipes per account; <= 0 disables it.
++	maxPipesPerAccount int
+ }
+ 
+ // NewRelayManager initializes a new RelayManager.
+-func NewRelayManager() *RelayManager {
++//
++// maxPipesPerAccount is required rather than optional: leaving a zero-argument
++// constructor in place would leave a way to build an unbounded manager, and the
++// default path has to be the safe one. Callers pass the same value they use for
++// transfer concurrency — see ValidateAndGetOrCreatePipe for why one number
++// governs both.
++func NewRelayManager(maxPipesPerAccount int) *RelayManager {
+ 	return &RelayManager{
+-		pipes:         make(map[string]*RelayPipe),
+-		authSessions:  make(map[string]*SessionAuth),
+-		bufferPool:    NewBufferPool(),
+-		ackBufferPool: NewAckBufferPool(),
++		pipes:              make(map[string]*RelayPipe),
++		authSessions:       make(map[string]*SessionAuth),
++		bufferPool:         NewBufferPool(),
++		ackBufferPool:      NewAckBufferPool(),
++		maxPipesPerAccount: maxPipesPerAccount,
+ 	}
+ }
+ 
+@@ -99,7 +132,35 @@ func (m *RelayManager) AuthorizeSessionIfUnderLimit(
+ 	m.mu.Lock()
+ 	defer m.mu.Unlock()
+ 
+-	inFlight := m.countAuthorizedForAccountLocked(accountID, sessionID, time.Now())
++	now := time.Now()
++
++	// Ownership check first, before counting. The order is not cosmetic:
++	// countAuthorizedForAccountLocked excludes "this session" by ID alone,
++	// without looking at whose it is. Establishing that any entry under this ID
++	// belongs to this account is what makes that exclusion sound. Reverse the
++	// two and an account that reuses someone else's session ID gets a free pass
++	// on its own quota, because the entry it is colliding with is the one being
++	// excluded from the count.
++	//
++	// Expired entries are overwritten freely. They are dead capacity —
++	// countAuthorizedForAccountLocked already ignores them — and reporting a
++	// conflict against one would let a stale ID poison a key for the rest of
++	// its five minute TTL for no benefit.
++	//
++	// The device pair is compared even within one account because the only
++	// legitimate re-authorization is the receiver re-sending its ANSWER, and
++	// that keeps both endpoints identical. A changed pair means either session
++	// ID reuse or one device inside the account trying to attach itself to
++	// another's transfer.
++	if existing, ok := m.authSessions[sessionID]; ok && now.Before(existing.ExpiresAt) {
++		if existing.AccountID != accountID ||
++			existing.SenderDevice != senderDevice ||
++			existing.ReceiverDevice != receiverDevice {
++			return "", 0, ErrSessionIDConflict
++		}
++	}
++
++	inFlight := m.countAuthorizedForAccountLocked(accountID, sessionID, now)
+ 	if maxConcurrent > 0 && inFlight >= maxConcurrent {
+ 		return "", inFlight, ErrConcurrencyLimit
+ 	}
+@@ -116,7 +177,7 @@ func (m *RelayManager) AuthorizeSessionIfUnderLimit(
+ 		ReceiverDevice: receiverDevice,
+ 		AccountID:      accountID,
+ 		Token:          token,
+-		ExpiresAt:      time.Now().Add(ttl),
++		ExpiresAt:      now.Add(ttl),
+ 	}
+ 
+ 	return token, inFlight, nil
+@@ -228,7 +289,13 @@ func (m *RelayManager) ValidateAndGetOrCreatePipe(sessionID, role, deviceID, tar
+ 		return nil, ErrUnauthorized
+ 	}
+ 
+-	// Pipe lookup or creation
++	// Pipe lookup or creation.
++	//
++	// The existing-pipe hit MUST come before the capacity checks below. A pipe
++	// that is already streaming has to remain reachable when its account is at
++	// the cap, or a data-plane reconnect mid-transfer would be rejected by the
++	// account's own limit — which the user experiences as a large transfer
++	// dying partway through for no stated reason.
+ 	if p, pipeExists := m.pipes[sessionID]; pipeExists {
+ 		// Verify pipe ownership matches authorization
+ 		if p.FromDevice != auth.SenderDevice || p.ToDevice != auth.ReceiverDevice {
+@@ -238,11 +305,31 @@ func (m *RelayManager) ValidateAndGetOrCreatePipe(sessionID, role, deviceID, tar
+ 		return p, nil
+ 	}
+ 
++	// Per-account capacity. This is a backstop rather than the main gate: the
++	// primary refusal happens in AuthorizeSessionIfUnderLimit, at TRANSFER_ANSWER
++	// time, where it can be reported to both peers through TRANSFER_FAILURE with
++	// text a user can act on. Refusing here instead means closing the data-plane
++	// socket, which the client can only render as a generic connection failure.
++	//
++	// It is kept anyway because the data plane is separately reachable: nothing
++	// forces a client to have gone through control-plane authorization in this
++	// process, and capacity must not depend on that assumption.
++	//
++	// The bound is deliberately the same number as the transfer concurrency
++	// limit rather than a new environment variable. One authorized session
++	// corresponds to exactly one pipe, so the two govern the same resource in
++	// the same units; a second knob would only ever create the question of what
++	// happens when they disagree.
++	if m.maxPipesPerAccount > 0 && m.countPipesForAccountLocked(auth.AccountID) >= m.maxPipesPerAccount {
++		return nil, ErrAccountPipeLimit
++	}
++
++	// Global cap, now the second line rather than the first.
+ 	if len(m.pipes) >= MaxConcurrentPipes {
+ 		return nil, ErrServerBusy
+ 	}
+ 
+-	p := NewRelayPipe(sessionID, auth.SenderDevice, auth.ReceiverDevice)
++	p := NewRelayPipe(sessionID, auth.AccountID, auth.SenderDevice, auth.ReceiverDevice)
+ 	m.pipes[sessionID] = p
+ 	return p, nil
+ }
+@@ -261,7 +348,7 @@ func (m *RelayManager) GetOrCreatePipe(sessionID, fromDevice, toDevice string) (
+ 		return nil, ErrServerBusy
+ 	}
+ 
+-	p := NewRelayPipe(sessionID, fromDevice, toDevice)
++	p := NewRelayPipe(sessionID, "", fromDevice, toDevice)
+ 	m.pipes[sessionID] = p
+ 	return p, nil
+ }
+@@ -275,16 +362,120 @@ func (m *RelayManager) GetPipe(sessionID string) (*RelayPipe, bool) {
+ 	return p, exists
+ }
+ 
+-// RemovePipe removes a pipe by sessionID and closes it (P2-12).
+-func (m *RelayManager) RemovePipe(sessionID string) {
++// RemovePipeForSession tears down a pipe on behalf of a participant, and
++// reports whether the teardown was authorized.
++//
++// This replaced a RemovePipe(sessionID) that performed both deletes with no
++// check of any kind. Because the session_id on a TRANSFER_COMPLETE / FAILURE /
++// CANCEL is simply whatever the client typed into the payload, any
++// authenticated client could tear down any transfer in the deployment — other
++// accounts included — without holding a token or any other credential. That was
++// strictly worse than the overwrite path guarded in
++// AuthorizeSessionIfUnderLimit, which at least required minting a token.
++//
++// There are four cases and they are not collapsible:
++//
++//  1. Auth entry present, account and device both match -> tear down. The
++//     ordinary path.
++//  2. Auth entry present, ownership does not match -> refuse and warn. This is
++//     the abuse this function exists to stop. The device is checked as well as
++//     the account because the data plane has always pinned itself to exactly
++//     these two roles (see ValidateAndGetOrCreatePipe); leaving the metadata
++//     plane looser than the data plane has no justification, and both values
++//     are already sitting in SessionAuth, so the check is free.
++//  3. No auth entry and no pipe -> nothing to do, report false, log at debug.
++//     Deliberately NOT a warning: a late or duplicate terminal signal arriving
++//     after the idle sweep already reclaimed the pipe is completely normal, and
++//     warning on it would bury the case 2 warnings under noise from honest
++//     transfers. This is also why the refusal must not be read as "attack
++//     detected" by anything downstream.
++//  4. No auth entry but the pipe is alive -> fall back to the ownership data
++//     carried on the pipe itself. With auth entries now held open for as long
++//     as their pipe lives (see SweepIdlePipes) this should be unreachable, but
++//     it is kept as a backstop so that ownership enforcement does not depend on
++//     that coupling never regressing.
++//
++// Note what is deliberately not done: treating an expired entry as absent and
++// letting the teardown through. That would reopen the very hole this closes,
++// just on a five minute delay.
++func (m *RelayManager) RemovePipeForSession(sessionID, accountID, deviceID string) bool {
+ 	m.mu.Lock()
+ 	defer m.mu.Unlock()
+ 
+-	if p, exists := m.pipes[sessionID]; exists {
++	p, pipeExists := m.pipes[sessionID]
++
++	auth, authExists := m.authSessions[sessionID]
++	if !authExists {
++		if !pipeExists {
++			return false // case 3
++		}
++		// case 4
++		if p.AccountID != accountID || (deviceID != p.FromDevice && deviceID != p.ToDevice) {
++			return false
++		}
++		p.Close()
++		delete(m.pipes, sessionID)
++		return true
++	}
++
++	// cases 1 and 2
++	if auth.AccountID != accountID {
++		return false
++	}
++	if deviceID != auth.SenderDevice && deviceID != auth.ReceiverDevice {
++		return false
++	}
++
++	if pipeExists {
+ 		p.Close()
+ 		delete(m.pipes, sessionID)
+ 	}
+ 	delete(m.authSessions, sessionID)
++	return true
++}
++
++// OwnerOfSession reports the account a session ID is currently held by, for
++// logging purposes at the call site. It exists so that the caller can tell a
++// refused-because-someone-else's teardown apart from a refused-because-gone one
++// without RemovePipeForSession needing to return a reason enum.
++func (m *RelayManager) OwnerOfSession(sessionID string) (string, bool) {
++	m.mu.RLock()
++	defer m.mu.RUnlock()
++
++	if auth, ok := m.authSessions[sessionID]; ok {
++		return auth.AccountID, true
++	}
++	if p, ok := m.pipes[sessionID]; ok {
++		return p.AccountID, true
++	}
++	return "", false
++}
++
++// MaxPipesInUsePerAccount returns the live pipe count of the busiest account.
++func (m *RelayManager) MaxPipesInUsePerAccount() int {
++	m.mu.RLock()
++	defer m.mu.RUnlock()
++
++	perAccount := make(map[string]int, len(m.pipes))
++	max := 0
++	for _, p := range m.pipes {
++		perAccount[p.AccountID]++
++		if n := perAccount[p.AccountID]; n > max {
++			max = n
++		}
++	}
++	return max
++}
++
++// countPipesForAccountLocked counts an account's live pipes. Caller holds m.mu.
++func (m *RelayManager) countPipesForAccountLocked(accountID string) int {
++	count := 0
++	for _, p := range m.pipes {
++		if p.AccountID == accountID {
++			count++
++		}
++	}
++	return count
+ }
+ 
+ // Count returns the number of active pipes.
+@@ -309,8 +500,24 @@ func (m *RelayManager) SweepIdlePipes(timeout time.Duration, now time.Time) []st
+ 		}
+ 	}
+ 
+-	// Also purge expired auth sessions
++	// Also purge expired auth sessions — but never one whose pipe is still
++	// alive.
++	//
++	// ExpiresAt answers "how much longer may this ticket be used to open a new
++	// pipe", not "how much longer may that pipe live". Those were conflated
++	// before, and because the auth TTL is five minutes while a pipe survives on
++	// sixty seconds of activity, any honest transfer running longer than five
++	// minutes would lose its authorization record while still streaming. Two
++	// things broke as a result: the terminal signal at the end of that transfer
++	// found no entry and was refused as an unauthorized teardown, and
++	// countAuthorizedForAccountLocked stopped counting the transfer as in
++	// flight, so the account appeared to have free quota it did not have and the
++	// refusal moved from TRANSFER_ANSWER down to the data plane where it cannot
++	// be explained to the user.
+ 	for id, auth := range m.authSessions {
++		if _, pipeAlive := m.pipes[id]; pipeAlive {
++			continue
++		}
+ 		if now.After(auth.ExpiresAt) {
+ 			delete(m.authSessions, id)
+ 		}
+diff --git a/server/internal/relay/relay_test.go b/server/internal/relay/relay_test.go
+index 2b39f4f..2952997 100644
+--- a/server/internal/relay/relay_test.go
++++ b/server/internal/relay/relay_test.go
+@@ -27,7 +27,7 @@ func TestBufferPool(t *testing.T) {
+ }
+ 
+ func TestRelayPipeForwardBackward(t *testing.T) {
+-	pipe := NewRelayPipe("sess1", "devA", "devB")
++	pipe := NewRelayPipe("sess1", "acctA", "devA", "devB")
+ 	pool := NewBufferPool()
+ 
+ 	buf := pool.Get()
+@@ -67,7 +67,7 @@ func TestRelayPipeForwardBackward(t *testing.T) {
+ }
+ 
+ func TestRelayPipeCongestionTimeout(t *testing.T) {
+-	pipe := NewRelayPipe("sess2", "devA", "devB")
++	pipe := NewRelayPipe("sess2", "acctA", "devA", "devB")
+ 	pool := NewBufferPool()
+ 
+ 	// Fill the ForwardChan buffer (cap = 4)
+@@ -89,7 +89,7 @@ func TestRelayPipeCongestionTimeout(t *testing.T) {
+ }
+ 
+ func TestRelayManagerSweepIdle(t *testing.T) {
+-	mgr := NewRelayManager()
++	mgr := NewRelayManager(0)
+ 	now := time.Now()
+ 
+ 	p1, _ := mgr.GetOrCreatePipe("sess1", "devA", "devB")
+@@ -112,7 +112,7 @@ func TestRelayManagerSweepIdle(t *testing.T) {
+ 
+ // 计数只看本账号。跨账号互不影响，否则一个账号忙起来会拖垮所有人。
+ func TestAuthorizeSessionIfUnderLimitCountsOnlyOwnAccount(t *testing.T) {
+-	m := NewRelayManager()
++	m := NewRelayManager(0)
+ 
+ 	for i := 0; i < 5; i++ {
+ 		if _, _, err := m.AuthorizeSessionIfUnderLimit(
+@@ -136,7 +136,7 @@ func TestAuthorizeSessionIfUnderLimitCountsOnlyOwnAccount(t *testing.T) {
+ 
+ // 重新授权同一个 session 不该把自己算进去——否则它会拒掉自己的重试。
+ func TestAuthorizeSessionIfUnderLimitExcludesItself(t *testing.T) {
+-	m := NewRelayManager()
++	m := NewRelayManager(0)
+ 
+ 	if _, _, err := m.AuthorizeSessionIfUnderLimit("s1", "a", "b", "acct", time.Minute, 1); err != nil {
+ 		t.Fatalf("首次授权失败: %v", err)
+@@ -153,7 +153,7 @@ func TestAuthorizeSessionIfUnderLimitExcludesItself(t *testing.T) {
+ 
+ // 已过期的授权不计入在途——否则额度会被僵尸会话永久占住。
+ func TestAuthorizeSessionIfUnderLimitIgnoresExpired(t *testing.T) {
+-	m := NewRelayManager()
++	m := NewRelayManager(0)
+ 
+ 	// 负 TTL：落库即过期
+ 	if _, _, err := m.AuthorizeSessionIfUnderLimit("stale", "a", "b", "acct", -time.Minute, 0); err != nil {
+@@ -170,7 +170,7 @@ func TestAuthorizeSessionIfUnderLimitIgnoresExpired(t *testing.T) {
+ }
+ 
+ func TestAuthorizeSessionIfUnderLimitZeroDisablesCheck(t *testing.T) {
+-	m := NewRelayManager()
++	m := NewRelayManager(0)
+ 
+ 	for i := 0; i < 50; i++ {
+ 		if _, _, err := m.AuthorizeSessionIfUnderLimit(
+@@ -190,7 +190,7 @@ func TestAuthorizeSessionIfUnderLimitIsAtomicUnderConcurrency(t *testing.T) {
+ 	const limit = 8
+ 	const goroutines = 64
+ 
+-	m := NewRelayManager()
++	m := NewRelayManager(0)
+ 
+ 	var wg sync.WaitGroup
+ 	var granted int64
+@@ -219,3 +219,268 @@ func TestAuthorizeSessionIfUnderLimitIsAtomicUnderConcurrency(t *testing.T) {
+ 			"大于说明计数与铸 token 不在同一把锁下，小于说明有会话被误拒", limit, got)
+ 	}
+ }
++
++// ---- 会话归属保护（A3）与每账号管道上限（A4）----
++
++// B 账号拿 A 的 sessionID 去授权：必须被拒，且 **A 的旧 token 仍然有效**。
++// 只断言返回了 error 是不够的 —— 那样即使条目已被改写也会「通过」。
++func TestAuthorizeSessionRejectsCrossAccountOverwrite(t *testing.T) {
++	m := NewRelayManager(0)
++
++	tokenA, _, err := m.AuthorizeSessionIfUnderLimit("sess-x", "devA1", "devA2", "acctA", time.Minute, 0)
++	if err != nil {
++		t.Fatalf("A 账号首次授权应当成功：%v", err)
++	}
++
++	if _, _, err := m.AuthorizeSessionIfUnderLimit("sess-x", "devB1", "devB2", "acctB", time.Minute, 0); !errors.Is(err, ErrSessionIDConflict) {
++		t.Fatalf("跨账号复用会话标识必须报 ErrSessionIDConflict，实得 %v", err)
++	}
++
++	if err := m.CheckAuthorization("sess-x", "sender", "devA1", "devA2", tokenA); err != nil {
++		t.Fatalf("A 账号的原授权不得被覆写，实得 %v", err)
++	}
++}
++
++// 同账号但设备对变了：合法的重复授权只有「接收方重发 ANSWER」一种，设备对必然不变。
++func TestAuthorizeSessionRejectsSameAccountDeviceMismatch(t *testing.T) {
++	m := NewRelayManager(0)
++
++	if _, _, err := m.AuthorizeSessionIfUnderLimit("sess-y", "dev1", "dev2", "acctA", time.Minute, 0); err != nil {
++		t.Fatalf("首次授权应当成功：%v", err)
++	}
++	if _, _, err := m.AuthorizeSessionIfUnderLimit("sess-y", "dev1", "dev3", "acctA", time.Minute, 0); !errors.Is(err, ErrSessionIDConflict) {
++		t.Fatalf("同账号内设备对变化必须报冲突，实得 %v", err)
++	}
++}
++
++// 正例：防止把「接收方重发 ANSWER」这条正常路径一并打死。
++func TestAuthorizeSessionAllowsSameAccountReauthorization(t *testing.T) {
++	m := NewRelayManager(0)
++
++	if _, _, err := m.AuthorizeSessionIfUnderLimit("sess-z", "dev1", "dev2", "acctA", time.Minute, 0); err != nil {
++		t.Fatalf("首次授权应当成功：%v", err)
++	}
++	if _, _, err := m.AuthorizeSessionIfUnderLimit("sess-z", "dev1", "dev2", "acctA", time.Minute, 0); err != nil {
++		t.Fatalf("同账号同设备对的重复授权必须放行，实得 %v", err)
++	}
++}
++
++// 过期条目是死容量，报冲突只会让一个陈旧 ID 白白把键位毒上整个 TTL。
++func TestAuthorizeSessionAllowsOverwriteOfExpiredEntry(t *testing.T) {
++	m := NewRelayManager(0)
++
++	if _, _, err := m.AuthorizeSessionIfUnderLimit("sess-e", "dev1", "dev2", "acctA", time.Nanosecond, 0); err != nil {
++		t.Fatalf("首次授权应当成功：%v", err)
++	}
++	time.Sleep(2 * time.Millisecond)
++
++	if _, _, err := m.AuthorizeSessionIfUnderLimit("sess-e", "devX", "devY", "acctB", time.Minute, 0); err != nil {
++		t.Fatalf("已过期的条目必须允许被覆写，实得 %v", err)
++	}
++}
++
++// 钉死顺序决策：冲突检查必须排在 countAuthorizedForAccountLocked 之前。
++// 顺序颠倒的话，B 复用 A 的 sessionID 会因为「按 ID 排除自己」而白得一个额度豁免。
++func TestConflictCheckPrecedesConcurrencyCount(t *testing.T) {
++	m := NewRelayManager(0)
++
++	// acctB 已占满 1 个额度
++	if _, _, err := m.AuthorizeSessionIfUnderLimit("b-own", "devB1", "devB2", "acctB", time.Minute, 1); err != nil {
++		t.Fatalf("B 账号首次授权应当成功：%v", err)
++	}
++	// acctA 持有 sess-shared
++	if _, _, err := m.AuthorizeSessionIfUnderLimit("sess-shared", "devA1", "devA2", "acctA", time.Minute, 0); err != nil {
++		t.Fatalf("A 账号授权应当成功：%v", err)
++	}
++
++	// B 复用 A 的 sessionID，且自己已达上限 1。
++	// 必须报冲突（而不是因为「排除了 sess-shared」导致计数为 0 而放行）。
++	_, _, err := m.AuthorizeSessionIfUnderLimit("sess-shared", "devB1", "devB2", "acctB", time.Minute, 1)
++	if !errors.Is(err, ErrSessionIDConflict) {
++		t.Fatalf("冲突检查必须先于并发计数，期望 ErrSessionIDConflict，实得 %v", err)
++	}
++}
++
++// 拆除归属：改造前任何已鉴权客户端自报一个 session_id 就能拆掉别人的管道。
++func TestRemovePipeForSessionRejectsOtherAccount(t *testing.T) {
++	m := NewRelayManager(0)
++
++	token, _, err := m.AuthorizeSessionIfUnderLimit("sess-t", "dev1", "dev2", "acctA", time.Minute, 0)
++	if err != nil {
++		t.Fatalf("授权应当成功：%v", err)
++	}
++	if _, err := m.ValidateAndGetOrCreatePipe("sess-t", "sender", "dev1", "dev2", token); err != nil {
++		t.Fatalf("建立管道应当成功：%v", err)
++	}
++
++	if m.RemovePipeForSession("sess-t", "acctB", "dev1") {
++		t.Fatal("另一个账号不得拆除本账号的管道")
++	}
++	if _, ok := m.GetPipe("sess-t"); !ok {
++		t.Fatal("被拒的拆除不得真的把管道删掉")
++	}
++}
++
++// 账号内的非参与设备同样拆不掉：数据面早就钉死在 sender/receiver 两个角色上，
++// 元数据面比数据面松是没有理由的。
++func TestRemovePipeForSessionRejectsNonParticipantDevice(t *testing.T) {
++	m := NewRelayManager(0)
++
++	token, _, _ := m.AuthorizeSessionIfUnderLimit("sess-n", "dev1", "dev2", "acctA", time.Minute, 0)
++	if _, err := m.ValidateAndGetOrCreatePipe("sess-n", "sender", "dev1", "dev2", token); err != nil {
++		t.Fatalf("建立管道应当成功：%v", err)
++	}
++
++	if m.RemovePipeForSession("sess-n", "acctA", "dev9") {
++		t.Fatal("同账号内的非参与设备不得拆除该管道")
++	}
++	if _, ok := m.GetPipe("sess-n"); !ok {
++		t.Fatal("被拒的拆除不得真的把管道删掉")
++	}
++}
++
++// 正例：发送方与接收方都必须能合法拆除。
++func TestRemovePipeForSessionSucceedsForBothParticipants(t *testing.T) {
++	for _, actor := range []string{"dev1", "dev2"} {
++		m := NewRelayManager(0)
++		token, _, _ := m.AuthorizeSessionIfUnderLimit("sess-p", "dev1", "dev2", "acctA", time.Minute, 0)
++		if _, err := m.ValidateAndGetOrCreatePipe("sess-p", "sender", "dev1", "dev2", token); err != nil {
++			t.Fatalf("建立管道应当成功：%v", err)
++		}
++
++		if !m.RemovePipeForSession("sess-p", "acctA", actor) {
++			t.Fatalf("参与方 %s 必须能拆除自己的管道", actor)
++		}
++		if _, ok := m.GetPipe("sess-p"); ok {
++			t.Fatalf("参与方 %s 拆除后管道应当消失", actor)
++		}
++	}
++}
++
++// 迟到/重复的终结信令：既不成功也不该被当成越权。
++func TestRemovePipeForSessionOnUnknownSessionIsNotAnError(t *testing.T) {
++	m := NewRelayManager(0)
++
++	if m.RemovePipeForSession("never-existed", "acctA", "dev1") {
++		t.Fatal("不存在的会话不应报告拆除成功")
++	}
++	if _, known := m.OwnerOfSession("never-existed"); known {
++		t.Fatal("不存在的会话不应有归属账号 —— 调用方据此区分「越权」与「已回收」")
++	}
++}
++
++// 单账号打满每账号上限后，**其他账号仍然必须能建管道**。
++// 否则一个账号就能饿死全实例，等于没修。
++func TestPipeCapIsPerAccountNotGlobal(t *testing.T) {
++	m := NewRelayManager(1)
++
++	tokA, _, _ := m.AuthorizeSessionIfUnderLimit("a1", "devA1", "devA2", "acctA", time.Minute, 0)
++	if _, err := m.ValidateAndGetOrCreatePipe("a1", "sender", "devA1", "devA2", tokA); err != nil {
++		t.Fatalf("A 账号第一条管道应当建立成功：%v", err)
++	}
++
++	tokA2, _, _ := m.AuthorizeSessionIfUnderLimit("a2", "devA1", "devA2", "acctA", time.Minute, 0)
++	if _, err := m.ValidateAndGetOrCreatePipe("a2", "sender", "devA1", "devA2", tokA2); !errors.Is(err, ErrAccountPipeLimit) {
++		t.Fatalf("A 账号超过每账号上限应当被拒，实得 %v", err)
++	}
++
++	tokB, _, _ := m.AuthorizeSessionIfUnderLimit("b1", "devB1", "devB2", "acctB", time.Minute, 0)
++	if _, err := m.ValidateAndGetOrCreatePipe("b1", "sender", "devB1", "devB2", tokB); err != nil {
++		t.Fatalf("A 账号打满不得影响 B 账号建管道，实得 %v", err)
++	}
++}
++
++// 正例，钉死检查顺序：到达上限后，**已存在管道的再次查找仍须成功**。
++// 顺序写反的话，传输中的数据面重连会被自己账号的上限打断，
++// 用户看到的是「传到一半莫名中断」。
++func TestExistingPipeLookupSucceedsAtCap(t *testing.T) {
++	m := NewRelayManager(1)
++
++	tok, _, _ := m.AuthorizeSessionIfUnderLimit("s1", "dev1", "dev2", "acctA", time.Minute, 0)
++	if _, err := m.ValidateAndGetOrCreatePipe("s1", "sender", "dev1", "dev2", tok); err != nil {
++		t.Fatalf("首次建立管道应当成功：%v", err)
++	}
++
++	// 账号已达上限，但这是对**同一条**管道的再次查找（接收方接入 / 断线重连）
++	if _, err := m.ValidateAndGetOrCreatePipe("s1", "receiver", "dev2", "dev1", tok); err != nil {
++		t.Fatalf("到达上限后已存在管道的查找必须成功，实得 %v", err)
++	}
++}
++
++// 全局上限作为第二道线没有被架空。
++func TestGlobalPipeCapStillApplies(t *testing.T) {
++	m := NewRelayManager(0) // 关闭每账号上限，只看全局
++
++	for i := 0; i < MaxConcurrentPipes; i++ {
++		sid := "g" + strconv.Itoa(i)
++		tok, _, _ := m.AuthorizeSessionIfUnderLimit(sid, "dev1", "dev2", "acct"+strconv.Itoa(i), time.Minute, 0)
++		if _, err := m.ValidateAndGetOrCreatePipe(sid, "sender", "dev1", "dev2", tok); err != nil {
++			t.Fatalf("第 %d 条管道应当建立成功：%v", i, err)
++		}
++	}
++
++	tok, _, _ := m.AuthorizeSessionIfUnderLimit("overflow", "dev1", "dev2", "acctZ", time.Minute, 0)
++	if _, err := m.ValidateAndGetOrCreatePipe("overflow", "sender", "dev1", "dev2", tok); !errors.Is(err, ErrServerBusy) {
++		t.Fatalf("超出全局上限应当报 ErrServerBusy，实得 %v", err)
++	}
++}
++
++// 生命周期联动：pipe 还活着时，它的 auth 条目不得被清扫掉。
++// 这条红了就意味着超过 5 分钟的诚实长传输会在结束时被判成「未授权的拆除」，
++// 同时账号在途计数归零、容量拒绝退化到数据面。
++func TestSweepDoesNotPurgeAuthOfLivePipe(t *testing.T) {
++	m := NewRelayManager(0)
++
++	// TTL 取一个够建完管道、又能在本用例内过期的短值
++	tok, _, _ := m.AuthorizeSessionIfUnderLimit("live", "dev1", "dev2", "acctA", 50*time.Millisecond, 0)
++	if _, err := m.ValidateAndGetOrCreatePipe("live", "sender", "dev1", "dev2", tok); err != nil {
++		t.Fatalf("建立管道应当成功：%v", err)
++	}
++
++	// 授权已过期，但管道仍然活跃（远未达空闲阈值）
++	time.Sleep(80 * time.Millisecond)
++	m.SweepIdlePipes(time.Hour, time.Now())
++
++	// 必须直接断言 authSessions 本身。
++	// 不能用 OwnerOfSession 或 RemovePipeForSession 来判断：两者都会在
++	// 条目缺失时回落到 pipe 上携带的 AccountID（RemovePipeForSession 的 case 4），
++	// 于是即便联动被撤掉它们也照样成功 —— 断言会失去全部鉴别力。
++	m.mu.RLock()
++	_, authAlive := m.authSessions["live"]
++	m.mu.RUnlock()
++	if !authAlive {
++		t.Fatal("活跃管道的授权条目不得被清扫：一旦被清，账号在途计数会归零，" +
++			"容量拒绝就从 TRANSFER_ANSWER 退化到数据面，用户只能看到笼统的连接失败")
++	}
++
++	// 附带确认拆除本身可用（此处走的是正常分支，不是 case 4 兜底）
++	if !m.RemovePipeForSession("live", "acctA", "dev1") {
++		t.Fatal("长传输结束时的拆除必须被认可，而不是当成未授权")
++	}
++}
++
++// case 4 兜底本身也要有守卫：auth 条目确实不在时，
++// 归属仍须由 pipe 上携带的 AccountID 把住，不能一律放行。
++func TestRemovePipeFallsBackToPipeOwnershipWhenAuthGone(t *testing.T) {
++	m := NewRelayManager(0)
++
++	tok, _, _ := m.AuthorizeSessionIfUnderLimit("orphan", "dev1", "dev2", "acctA", time.Minute, 0)
++	if _, err := m.ValidateAndGetOrCreatePipe("orphan", "sender", "dev1", "dev2", tok); err != nil {
++		t.Fatalf("建立管道应当成功：%v", err)
++	}
++
++	// 人为制造「条目没了但管道还在」的中间态
++	m.mu.Lock()
++	delete(m.authSessions, "orphan")
++	m.mu.Unlock()
++
++	if m.RemovePipeForSession("orphan", "acctB", "dev1") {
++		t.Fatal("授权条目缺失时也不得放行跨账号拆除")
++	}
++	if m.RemovePipeForSession("orphan", "acctA", "dev9") {
++		t.Fatal("授权条目缺失时也不得放行非参与设备的拆除")
++	}
++	if !m.RemovePipeForSession("orphan", "acctA", "dev2") {
++		t.Fatal("授权条目缺失时，真正的参与方仍应能拆除")
++	}
++}
+diff --git a/server/internal/auth/identity.go b/server/internal/auth/identity.go
+new file mode 100644
+index 0000000..6d7f2c0
+--- /dev/null
++++ b/server/internal/auth/identity.go
+@@ -0,0 +1,111 @@
++package auth
++
++import "errors"
++
++// Identifier validation for the three client-reported strings that the server
++// uses as map keys or as fields of the signed canonical string: account_id,
++// device_id and session_id.
++//
++// These live in the auth package rather than in one of their own because they
++// constrain the very same bytes that BuildCanonicalStringWithSalt formats. The
++// most important rule below — no newlines — only makes sense next to the
++// function whose field separator is "\n"; split across packages, the reason
++// drifts away from the thing it protects and gets "simplified" out.
++//
++// Why newlines are forbidden: BuildCanonicalStringWithSalt joins six fields
++// with "\n". An account_id containing a newline would let a client redraw the
++// field boundaries of the string being signed — separator injection. With the
++// current field set it is not exploitable (the timestamp must parse as a
++// decimal integer and the nonce goes through the replay cache), but that is an
++// argument about today's values, not about the shape of the construction. This
++// is a whole class of bug and it should not survive on "happens not to be
++// reachable".
++//
++// Why ASCII-only, i.e. why there are no Chinese account names: account_id is a
++// matching key. "团队" in NFC and in NFD is the same string to a human eye and
++// two different byte sequences to a map, so allowing it would silently split
++// one workspace into two — the same defect as the empty-account bucket this
++// validation exists to close, only mirrored. The identifiers also end up in
++// logs and (as an aggregate) on an unauthenticated metrics endpoint.
++//
++// Why this is not configurable: a configurable identifier grammar is a knob
++// nobody sets, a test matrix that doubles, and — since the only direction
++// anyone would ever turn it is "looser" — a way to undo exactly what this file
++// is for.
++const MaxIdentifierLen = 64
++
++var (
++	ErrInvalidAccountID = errors.New("invalid account_id")
++	ErrInvalidDeviceID  = errors.New("invalid device_id")
++	ErrInvalidSessionID = errors.New("invalid session_id")
++)
++
++// ValidateAccountID checks that s is a well-formed account identifier.
++//
++// Allowed: 1..MaxIdentifierLen bytes of [A-Za-z0-9._@-]. The extra three
++// characters over the device/session grammar are there because this one is
++// typed by a human and mail-like or dotted names are the obvious things to
++// reach for.
++func ValidateAccountID(s string) error {
++	if !validIdentifier(s, true) {
++		return ErrInvalidAccountID
++	}
++	return nil
++}
++
++// ValidateDeviceID checks that s is a well-formed device identifier.
++//
++// Allowed: 1..MaxIdentifierLen bytes of [A-Za-z0-9_-]. Deliberately not
++// restricted to UUIDs even though the shipped client generates one: the test
++// suites use short names like devA, and pinning the format here would lock out
++// any non-Tauri client for no security gain — the value is opaque to the
++// server either way.
++func ValidateDeviceID(s string) error {
++	if !validIdentifier(s, false) {
++		return ErrInvalidDeviceID
++	}
++	return nil
++}
++
++// ValidateSessionID checks that s is a well-formed transfer session identifier.
++//
++// Same grammar as device_id, which a UUIDv4 satisfies as-is. This one is not
++// about partitioning — session IDs are minted per transfer and collisions are
++// an anomaly, not a normal occurrence (see relay.RelayManager) — it only keeps
++// a half-megabyte string from being used as a map key and keeps control
++// characters out of the logs.
++func ValidateSessionID(s string) error {
++	if !validIdentifier(s, false) {
++		return ErrInvalidSessionID
++	}
++	return nil
++}
++
++// validIdentifier reports whether s is non-empty, within the length cap, and
++// built only from the permitted byte set.
++//
++// The length check runs before the character scan, and the whole thing is a
++// hand-written byte loop with no allocation and no regexp. That is not
++// micro-optimisation: callers run this on unauthenticated, attacker-controlled
++// input — the control-plane read limit is 512 KiB and validation happens
++// before signature verification — so the cost of rejecting garbage has to stay
++// proportional to how quickly the garbage can be recognised. A regexp, or a
++// strings.TrimSpace first, would allocate once per hostile frame.
++func validIdentifier(s string, accountGrammar bool) bool {
++	if len(s) == 0 || len(s) > MaxIdentifierLen {
++		return false
++	}
++	for i := 0; i < len(s); i++ {
++		c := s[i]
++		switch {
++		case c >= 'A' && c <= 'Z':
++		case c >= 'a' && c <= 'z':
++		case c >= '0' && c <= '9':
++		case c == '_' || c == '-':
++		case accountGrammar && (c == '.' || c == '@'):
++		default:
++			return false
++		}
++	}
++	return true
++}
+diff --git a/server/internal/auth/identity_test.go b/server/internal/auth/identity_test.go
+new file mode 100644
+index 0000000..770be16
+--- /dev/null
++++ b/server/internal/auth/identity_test.go
+@@ -0,0 +1,113 @@
++package auth
++
++import (
++	"strings"
++	"testing"
++)
++
++// 删掉这条断言，「忘了填账号」的客户端会重新汇集到同一个空账号公共桶里，
++// 而 registry 的复合键会把它们当成一个真实账号来分区。
++func TestValidateAccountIDRejectsEmpty(t *testing.T) {
++	if err := ValidateAccountID(""); err == nil {
++		t.Fatal("空账号标识必须被拒绝")
++	}
++}
++
++// 纯空格必须挂：客户端保存时会 trim，但服务端不得信任客户端 trim 过。
++// 设置面板的原生 required 恰恰放行这种输入（见 SettingsModal 的注释）。
++func TestValidateAccountIDRejectsWhitespaceOnly(t *testing.T) {
++	for _, s := range []string{" ", "   ", "\t", "\n"} {
++		if err := ValidateAccountID(s); err == nil {
++			t.Fatalf("纯空白账号标识必须被拒绝：%q", s)
++		}
++	}
++}
++
++// 删掉这条，canonical string 的字段分隔符就能被客户端重排 —— 分隔符注入。
++func TestValidateAccountIDRejectsNewlineInjection(t *testing.T) {
++	for _, s := range []string{"a\nb", "a\rb", "acct\nUNIDROP_V1"} {
++		if err := ValidateAccountID(s); err == nil {
++			t.Fatalf("含换行的账号标识必须被拒绝：%q", s)
++		}
++	}
++}
++
++func TestValidateAccountIDRejectsOverLength(t *testing.T) {
++	if err := ValidateAccountID(strings.Repeat("a", MaxIdentifierLen)); err != nil {
++		t.Fatalf("恰好 %d 字节应当通过", MaxIdentifierLen)
++	}
++	if err := ValidateAccountID(strings.Repeat("a", MaxIdentifierLen+1)); err == nil {
++		t.Fatalf("超过 %d 字节必须被拒绝", MaxIdentifierLen)
++	}
++}
++
++// 非 ASCII 会因 NFC/NFD 两种字节形式肉眼相同而静默分成两个桶 ——
++// 与空账号公共桶是同一个缺陷的镜像。
++func TestValidateAccountIDRejectsNonASCII(t *testing.T) {
++	for _, s := range []string{"团队", "café", "acct/other", "acct:1", "a b"} {
++		if err := ValidateAccountID(s); err == nil {
++			t.Fatalf("非法字符的账号标识必须被拒绝：%q", s)
++		}
++	}
++}
++
++// 这条钉死「新规则没有把已发布的默认值和文档示例打死」。
++// 它红了就说明这次收紧会让现有安装在升级后连不上。
++func TestValidateAccountIDAcceptsShippedValues(t *testing.T) {
++	for _, s := range []string{
++		"default_user",   // client 的 default_config
++		"my_team_sync",   // USER_GUIDE 示例
++		"user1", "alice", "acct", // 既有测试用值
++		"a.b", "user@example.com", "A-1_2",
++	} {
++		if err := ValidateAccountID(s); err != nil {
++			t.Fatalf("已发布或文档中的账号标识必须通过：%q (%v)", s, err)
++		}
++	}
++}
++
++// device_id 刻意不强制 UUID：测试套件用 devA 这类短名，
++// 强制格式会锁死非 Tauri 客户端而毫无安全收益。
++func TestValidateDeviceIDAcceptsUUIDAndShortNames(t *testing.T) {
++	for _, s := range []string{
++		"550e8400-e29b-41d4-a716-446655440000",
++		"devA", "dev-1", "dev_1", "MacBookPro",
++	} {
++		if err := ValidateDeviceID(s); err != nil {
++			t.Fatalf("合法设备标识被误拒：%q (%v)", s, err)
++		}
++	}
++}
++
++func TestValidateDeviceIDRejectsEmptyAndControlChars(t *testing.T) {
++	for _, s := range []string{"", " ", "dev\n1", "dev\x00", "dev.1", "dev@1"} {
++		if err := ValidateDeviceID(s); err == nil {
++			t.Fatalf("非法设备标识必须被拒绝：%q", s)
++		}
++	}
++}
++
++// session_id 走与 device_id 相同的文法，UUIDv4 天然通过。
++func TestValidateSessionIDAcceptsUUID(t *testing.T) {
++	if err := ValidateSessionID("550e8400-e29b-41d4-a716-446655440000"); err != nil {
++		t.Fatalf("UUID 形态的会话标识必须通过：%v", err)
++	}
++	if err := ValidateSessionID(strings.Repeat("x", MaxIdentifierLen+1)); err == nil {
++		t.Fatal("超长会话标识必须被拒绝：它会被当成 map 键")
++	}
++}
++
++// 校验跑在**未鉴权**的攻击者可控输入上（控制面读上限 512 KiB），
++// 所以必须先查长度再扫字符集，且全程零分配。
++// 有人把实现改成 regexp 或先 TrimSpace，这条会红。
++func TestValidateIsAllocationFreeOnOversizedInput(t *testing.T) {
++	huge := strings.Repeat("a", 512*1024)
++	allocs := testing.AllocsPerRun(100, func() {
++		_ = ValidateAccountID(huge)
++		_ = ValidateDeviceID(huge)
++		_ = ValidateSessionID(huge)
++	})
++	if allocs != 0 {
++		t.Fatalf("校验必须零分配，实测每次 %v 次分配", allocs)
++	}
++}
+diff --git a/server/internal/controller/cross_account_ws_test.go b/server/internal/controller/cross_account_ws_test.go
+new file mode 100644
+index 0000000..718fdc8
+--- /dev/null
++++ b/server/internal/controller/cross_account_ws_test.go
+@@ -0,0 +1,235 @@
++package controller_test
++
++import (
++	"context"
++	"encoding/json"
++	"testing"
++	"time"
++
++	"github.com/coder/websocket"
++	"github.com/google/uuid"
++	"github.com/unidrop/unidrop-server/internal/limits"
++	"github.com/unidrop/unidrop-server/internal/protocol"
++)
++
++// 跨账号隔离的端到端守卫。
++//
++// 这一组刻意让两个账号使用**完全相同的 device_id** —— 那正是改造前
++// registry 以裸 DeviceID 为键时会互相踢下线的形态。
++
++
++// readSignal 读到第一条**传输类**信令为止，跳过设备上下线广播。
++//
++// 同账号内每有一台新设备接入，既有连接都会收到一条 DEVICE_ONLINE；
++// 逐个数着消费会让用例与握手顺序耦合，改一行连接次序就全线红。
++func readSignal(t *testing.T, ctx context.Context, ws *websocket.Conn) protocol.ControlEnvelope {
++	t.Helper()
++	for {
++		_, raw, err := ws.Read(ctx)
++		if err != nil {
++			t.Fatalf("读取信令失败：%v", err)
++		}
++		var env protocol.ControlEnvelope
++		_ = json.Unmarshal(raw, &env)
++		switch env.Action {
++		case protocol.ActionDeviceOnline, protocol.ActionDeviceOffline,
++			protocol.ActionDeviceListSync, protocol.ActionHeartbeatPong:
++			continue
++		}
++		return env
++	}
++}
++
++// 用户最在意的那条：另一个账号用同名 device_id 连上来，
++// 本账号的设备不得掉线，也不得看见对方。
++func TestCrossAccountSameDeviceIDDoesNotKickExistingPeer(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	h := newLimitsHarness(t, limits.Limits{})
++
++	wsA, _ := h.connect(t, ctx, "acctA", "devX")
++	wsB, _ := h.connect(t, ctx, "acctB", "devX")
++
++	if got := h.registry.Count(); got != 2 {
++		t.Fatalf("两个账号的同名设备应当共存，期望 2 个会话，实得 %d", got)
++	}
++	if got := h.registry.CountAccounts(); got != 2 {
++		t.Fatalf("在线账号数应为 2，实得 %d", got)
++	}
++
++	// A 的连接必须仍然可用：发一次 PING 并读回 PONG。
++	pingEnv, _ := json.Marshal(protocol.ControlEnvelope{
++		Version:   1,
++		TraceID:   uuid.NewString(),
++		Action:    protocol.ActionHeartbeatPing,
++		Timestamp: time.Now().UnixMilli(),
++	})
++	if err := wsA.Write(ctx, websocket.MessageText, pingEnv); err != nil {
++		t.Fatalf("B 账号接入后，A 的连接不得失效：%v", err)
++	}
++	readCtx, readCancel := context.WithTimeout(ctx, 2*time.Second)
++	defer readCancel()
++	_, pongBytes, err := wsA.Read(readCtx)
++	if err != nil {
++		t.Fatalf("A 的连接必须仍能收到 PONG：%v", err)
++	}
++	var pongEnv protocol.ControlEnvelope
++	_ = json.Unmarshal(pongBytes, &pongEnv)
++	if pongEnv.Action != protocol.ActionHeartbeatPong {
++		t.Fatalf("期望 PONG，实得 %s", pongEnv.Action)
++	}
++
++	_ = wsB
++}
++
++// A 账号内发给 devX 的信令只能到 A 的那台，B 的同名设备必须读超时。
++func TestRoutingNeverCrossesAccountWithIdenticalDeviceID(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	h := newLimitsHarness(t, limits.Limits{})
++
++	wsA1, _ := h.connect(t, ctx, "acctA", "devX")
++	wsA2, _ := h.connect(t, ctx, "acctA", "devPeer")
++	wsB, _ := h.connect(t, ctx, "acctB", "devX")
++
++	// A2 → devX（同账号内）
++	offer, _ := json.Marshal(protocol.TransferOfferPayload{
++		SessionID:      uuid.NewString(),
++		DataType:       "TEXT",
++		TotalSize:      4,
++		TotalItems:     1,
++		PreviewSummary: "hi",
++	})
++	env, _ := json.Marshal(protocol.ControlEnvelope{
++		Version:   1,
++		TraceID:   uuid.NewString(),
++		Action:    protocol.ActionTransferOffer,
++		ToDevice:  "devX",
++		Timestamp: time.Now().UnixMilli(),
++		Payload:   offer,
++	})
++	if err := wsA2.Write(ctx, websocket.MessageText, env); err != nil {
++		t.Fatalf("发送 OFFER 失败：%v", err)
++	}
++
++	// A 账号的 devX 必须收到
++	recvCtx, recvCancel := context.WithTimeout(ctx, 3*time.Second)
++	defer recvCancel()
++	gotEnv := readSignal(t, recvCtx, wsA1)
++	if gotEnv.Action != protocol.ActionTransferOffer {
++		t.Fatalf("期望 TRANSFER_OFFER，实得 %s", gotEnv.Action)
++	}
++
++	// B 账号的同名 devX 必须什么都收不到
++	quietCtx, quietCancel := context.WithTimeout(ctx, 500*time.Millisecond)
++	defer quietCancel()
++	if _, leaked, err := wsB.Read(quietCtx); err == nil {
++		t.Fatalf("另一个账号的同名设备不得收到任何信令，却收到了：%s", leaked)
++	}
++}
++
++// A3 改动 B 的端到端守卫，也是本轮杀伤力最大的一条。
++// B 拿着 A 的 session_id 发 CANCEL，A 的管道与授权条目必须纹丝不动。
++func TestCrossAccountPipeTeardownBlocked(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	h := newLimitsHarness(t, limits.Limits{})
++
++	_, _ = h.connect(t, ctx, "acctA", "devA1")
++	wsB, _ := h.connect(t, ctx, "acctB", "devB1")
++
++	// 直接在 relay 上铺好 A 账号的授权与管道
++	sessionID := uuid.NewString()
++	token, _, err := h.relay.AuthorizeSessionIfUnderLimit(
++		sessionID, "devA1", "devA2", "acctA", 5*time.Minute, 0)
++	if err != nil {
++		t.Fatalf("铺设 A 账号的授权失败：%v", err)
++	}
++	if _, err := h.relay.ValidateAndGetOrCreatePipe(sessionID, "sender", "devA1", "devA2", token); err != nil {
++		t.Fatalf("铺设 A 账号的管道失败：%v", err)
++	}
++
++	// B 自报 A 的 session_id 发 CANCEL
++	cancelPayload, _ := json.Marshal(map[string]string{"session_id": sessionID})
++	cancelEnv, _ := json.Marshal(protocol.ControlEnvelope{
++		Version:   1,
++		TraceID:   uuid.NewString(),
++		Action:    protocol.ActionTransferCancel,
++		ToDevice:  "devB2",
++		Timestamp: time.Now().UnixMilli(),
++		Payload:   cancelPayload,
++	})
++	if err := wsB.Write(ctx, websocket.MessageText, cancelEnv); err != nil {
++		t.Fatalf("发送 CANCEL 失败：%v", err)
++	}
++
++	// 给服务端一点处理时间
++	time.Sleep(200 * time.Millisecond)
++
++	// A 的管道必须还在，且 token 仍然有效
++	if _, ok := h.relay.GetPipe(sessionID); !ok {
++		t.Fatal("另一个账号自报 session_id 不得拆掉本账号的管道")
++	}
++	if err := h.relay.CheckAuthorization(sessionID, "sender", "devA1", "devA2", token); err != nil {
++		t.Fatalf("A 账号的授权条目不得被连带删除，实得 %v", err)
++	}
++}
++
++// A3 改动 C：授权失败必须双向拒绝，而不是转发一个没有 token 的 ANSWER。
++// 转发会让发送方永久挂起（客户端 `if let Some(token)` 静默跳过）。
++func TestAnswerAuthorizationFailureRejectsBothPeersInsteadOfForwarding(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
++	defer cancel()
++	h := newLimitsHarness(t, limits.Limits{})
++
++	wsSender, _ := h.connect(t, ctx, "acctA", "devSender")
++	wsReceiver, _ := h.connect(t, ctx, "acctA", "devReceiver")
++
++	// 先让另一组设备占住这个 session_id，制造 ErrSessionIDConflict
++	sessionID := uuid.NewString()
++	if _, _, err := h.relay.AuthorizeSessionIfUnderLimit(
++		sessionID, "otherSender", "otherReceiver", "acctA", 5*time.Minute, 0); err != nil {
++		t.Fatalf("铺设占位授权失败：%v", err)
++	}
++
++	answer, _ := json.Marshal(protocol.TransferAnswerPayload{
++		SessionID: sessionID,
++		Accepted:  true,
++	})
++	answerEnv, _ := json.Marshal(protocol.ControlEnvelope{
++		Version:   1,
++		TraceID:   uuid.NewString(),
++		Action:    protocol.ActionTransferAnswer,
++		ToDevice:  "devSender",
++		Timestamp: time.Now().UnixMilli(),
++		Payload:   answer,
++	})
++	if err := wsReceiver.Write(ctx, websocket.MessageText, answerEnv); err != nil {
++		t.Fatalf("发送 ANSWER 失败：%v", err)
++	}
++
++	// 接收方（当前连接）必须收到 TRANSFER_FAILURE
++	recvCtx, recvCancel := context.WithTimeout(ctx, 3*time.Second)
++	defer recvCancel()
++	selfEnv := readSignal(t, recvCtx, wsReceiver)
++	if selfEnv.Action != protocol.ActionTransferFailure {
++		t.Fatalf("接收方期望 TRANSFER_FAILURE，实得 %s", selfEnv.Action)
++	}
++
++	// 发送方必须收到 TRANSFER_FAILURE，且**不是**一个没有 token 的 ANSWER
++	sendCtx, sendCancel := context.WithTimeout(ctx, 3*time.Second)
++	defer sendCancel()
++	peerEnv := readSignal(t, sendCtx, wsSender)
++	if peerEnv.Action == protocol.ActionTransferAnswer {
++		t.Fatal("授权失败时不得把没有 token 的 ANSWER 转发给发送方：客户端会静默跳过并永久等待")
++	}
++	if peerEnv.Action != protocol.ActionTransferFailure {
++		t.Fatalf("发送方期望 TRANSFER_FAILURE，实得 %s", peerEnv.Action)
++	}
++
++	var failure protocol.TransferFailurePayload
++	_ = json.Unmarshal(peerEnv.Payload, &failure)
++	if failure.ErrorCode != limits.CodeSessionConflict {
++		t.Fatalf("期望错误码 %s，实得 %s", limits.CodeSessionConflict, failure.ErrorCode)
++	}
++}
+diff --git a/server/internal/controller/health_test.go b/server/internal/controller/health_test.go
+new file mode 100644
+index 0000000..10b1dcb
+--- /dev/null
++++ b/server/internal/controller/health_test.go
+@@ -0,0 +1,110 @@
++package controller_test
++
++import (
++	"encoding/json"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/unidrop/unidrop-server/internal/controller"
++	"github.com/unidrop/unidrop-server/internal/registry"
++	"github.com/unidrop/unidrop-server/internal/relay"
++)
++
++func newMetricsFixture() (*registry.DeviceRegistry, *relay.RelayManager) {
++	reg := registry.NewDeviceRegistry()
++	reg.Register(registry.NewDeviceSession("acctA", "dev1", "h", "macos", "1", "127.0.0.1", nil))
++	reg.Register(registry.NewDeviceSession("acctA", "dev2", "h", "macos", "1", "127.0.0.1", nil))
++	reg.Register(registry.NewDeviceSession("acctB", "dev1", "h", "macos", "1", "127.0.0.1", nil))
++	return reg, relay.NewRelayManager(0)
++}
++
++func scrape(t *testing.T, reg *registry.DeviceRegistry, rm *relay.RelayManager) string {
++	t.Helper()
++	rec := httptest.NewRecorder()
++	controller.MetricsHandler(reg, rm)(rec, httptest.NewRequest("GET", "/metrics", nil))
++	return rec.Body.String()
++}
++
++// 基数闸门的唯一自动化守卫。
++//
++// 它防的是「有人照 DESIGN.md 原稿去加 account_id label」——
++// 那份原稿曾规定 unidrop_connected_devices{account_id, os_type}，
++// 而 account_id 是未鉴权、客户端自报的任意字符串：
++// 一个客户端循环握手就能铸出无限多个值，每个都在 exporter 里留一条常驻时序。
++func TestMetricsHasNoAccountIDLabel(t *testing.T) {
++	reg, rm := newMetricsFixture()
++	body := scrape(t, reg, rm)
++
++	if strings.Contains(body, "account_id=") {
++		t.Fatalf("/metrics 不得出现 account_id label：它的基数无界。实际输出：\n%s", body)
++	}
++	// 账号名本身也不得出现在任何位置
++	for _, acct := range []string{"acctA", "acctB"} {
++		if strings.Contains(body, acct) {
++			t.Fatalf("/metrics 不得泄露账号名 %q", acct)
++		}
++	}
++}
++
++func TestMetricsExposesAccountAggregates(t *testing.T) {
++	reg, rm := newMetricsFixture()
++	body := scrape(t, reg, rm)
++
++	for _, want := range []string{
++		"unidrop_online_devices 3",
++		"unidrop_online_accounts 2",
++		"unidrop_max_devices_per_account 2",
++		"unidrop_max_pipes_per_account 0",
++	} {
++		if !strings.Contains(body, want) {
++			t.Fatalf("/metrics 缺少或数值不符：%q\n实际输出：\n%s", want, body)
++		}
++	}
++}
++
++// reason 是代码里定义的闭集枚举，基数由构造保证有界 ——
++// 这与 account_id 有本质区别，不能被当成「既然能加 label 那 account_id 也行」的先例。
++func TestAuthRejectedCounterHasBoundedReasonSet(t *testing.T) {
++	reg, rm := newMetricsFixture()
++	body := scrape(t, reg, rm)
++
++	for _, reason := range []string{"invalid_account_id", "invalid_device_id", "unauthorized"} {
++		if !strings.Contains(body, `unidrop_auth_rejected_total{reason="`+reason+`"}`) {
++			t.Fatalf("缺少拒绝计数分项 %q", reason)
++		}
++	}
++
++	// 只应出现这三个 reason，不多不少
++	if got := strings.Count(body, "unidrop_auth_rejected_total{"); got != 3 {
++		t.Fatalf("拒绝计数应恰好三个分项，实得 %d", got)
++	}
++}
++
++// /healthz 是未鉴权端点，列出账号名等于把全部账号交给任何能 GET 的人。
++func TestHealthzDoesNotLeakAccountIDs(t *testing.T) {
++	reg, rm := newMetricsFixture()
++
++	rec := httptest.NewRecorder()
++	controller.HealthHandler(reg, rm)(rec, httptest.NewRequest("GET", "/healthz", nil))
++	body := rec.Body.String()
++
++	for _, acct := range []string{"acctA", "acctB"} {
++		if strings.Contains(body, acct) {
++			t.Fatalf("/healthz 不得泄露账号名 %q：它没有鉴权", acct)
++		}
++	}
++
++	var status map[string]any
++	if err := json.Unmarshal([]byte(body), &status); err != nil {
++		t.Fatalf("/healthz 应返回合法 JSON：%v", err)
++	}
++	for _, key := range []string{"online_accounts", "max_devices_per_account", "max_pipes_per_account"} {
++		if _, ok := status[key]; !ok {
++			t.Fatalf("/healthz 缺少聚合字段 %q", key)
++		}
++	}
++	if got := status["online_accounts"]; got != float64(2) {
++		t.Fatalf("online_accounts 应为 2，实得 %v", got)
++	}
++}
+diff --git a/server/internal/controller/identity_ws_test.go b/server/internal/controller/identity_ws_test.go
+new file mode 100644
+index 0000000..847febf
+--- /dev/null
++++ b/server/internal/controller/identity_ws_test.go
+@@ -0,0 +1,129 @@
++package controller_test
++
++import (
++	"context"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/google/uuid"
++	"github.com/unidrop/unidrop-server/internal/auth"
++	"github.com/unidrop/unidrop-server/internal/limits"
++	"github.com/unidrop/unidrop-server/internal/protocol"
++)
++
++// 握手层的身份校验。单元测试（auth/identity_test.go）盯的是文法本身，
++// 这一组盯的是它确实接在握手里、走既有的 AUTH_RESPONSE 拒绝通道，
++// 且错误码是客户端能分辨的那三个。
++
++func TestEmptyAccountIDRejectedAtHandshake(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	h := newLimitsHarness(t, limits.Limits{})
++
++	_, resp := h.connectRaw(t, ctx, "", "dev1")
++	if resp.Success {
++		t.Fatal("空账号标识必须被握手拒绝")
++	}
++	if resp.ErrorCode != protocol.AuthErrInvalidAccountID {
++		t.Fatalf("期望错误码 %s，实得 %s", protocol.AuthErrInvalidAccountID, resp.ErrorCode)
++	}
++	// 文案必须把规则本身告诉用户：只说「账号非法」他改不对。
++	if !strings.Contains(resp.ErrorMessage, "1-64") {
++		t.Fatalf("拒绝文案应当写明格式规则，实得：%s", resp.ErrorMessage)
++	}
++}
++
++func TestWhitespaceAccountIDRejectedAtHandshake(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	h := newLimitsHarness(t, limits.Limits{})
++
++	_, resp := h.connectRaw(t, ctx, "   ", "dev1")
++	if resp.Success {
++		t.Fatal("纯空格账号标识必须被拒绝：设置面板的原生 required 放行它")
++	}
++	if resp.ErrorCode != protocol.AuthErrInvalidAccountID {
++		t.Fatalf("期望错误码 %s，实得 %s", protocol.AuthErrInvalidAccountID, resp.ErrorCode)
++	}
++}
++
++func TestNewlineAccountIDRejectedAtHandshake(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	h := newLimitsHarness(t, limits.Limits{})
++
++	_, resp := h.connectRaw(t, ctx, "acct\nUNIDROP_V1", "dev1")
++	if resp.Success {
++		t.Fatal("含换行的账号标识必须被拒绝：canonical string 以换行分隔字段")
++	}
++	if resp.ErrorCode != protocol.AuthErrInvalidAccountID {
++		t.Fatalf("期望错误码 %s，实得 %s", protocol.AuthErrInvalidAccountID, resp.ErrorCode)
++	}
++}
++
++func TestEmptyDeviceIDRejectedAtHandshake(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	h := newLimitsHarness(t, limits.Limits{})
++
++	_, resp := h.connectRaw(t, ctx, "acctA", "")
++	if resp.Success {
++		t.Fatal("空设备标识必须被握手拒绝")
++	}
++	if resp.ErrorCode != protocol.AuthErrInvalidDeviceID {
++		t.Fatalf("期望错误码 %s，实得 %s", protocol.AuthErrInvalidDeviceID, resp.ErrorCode)
++	}
++}
++
++func TestOverlongAccountIDRejectedAtHandshake(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	h := newLimitsHarness(t, limits.Limits{})
++
++	_, resp := h.connectRaw(t, ctx, strings.Repeat("a", auth.MaxIdentifierLen+1), "dev1")
++	if resp.Success {
++		t.Fatal("超长账号标识必须被握手拒绝")
++	}
++	if resp.ErrorCode != protocol.AuthErrInvalidAccountID {
++		t.Fatalf("期望错误码 %s，实得 %s", protocol.AuthErrInvalidAccountID, resp.ErrorCode)
++	}
++}
++
++// 正例：防止规则被收紧成拒绝一切。
++func TestValidIdentifiersStillAuthenticate(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	h := newLimitsHarness(t, limits.Limits{})
++
++	for _, acct := range []string{"default_user", "my_team_sync", "user@example.com"} {
++		_, resp := h.connectRaw(t, ctx, acct, "550e8400-e29b-41d4-a716-446655440000")
++		if !resp.Success {
++			t.Fatalf("合法账号标识 %q 必须通过握手，实得：%s", acct, resp.ErrorMessage)
++		}
++	}
++}
++
++// 钉死「格式校验排在验签之前」这个顺序决策。
++//
++// VerifyWithSalt 会在签名通过后烧掉 nonce。若格式校验排在它之后，
++// 用同一个 nonce 改正账号再试就会撞上重放判定，错误从「账号格式非法」
++// 漂成「replay detected」，第三方客户端据协议契约复用 nonce 时永远改不对。
++func TestRejectedIdentityDoesNotBurnNonce(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++	defer cancel()
++	h := newLimitsHarness(t, limits.Limits{})
++
++	nonce := uuid.NewString()
++
++	bad := h.connectRawWithNonce(t, ctx, "", "dev1", nonce)
++	if bad.Success || bad.ErrorCode != protocol.AuthErrInvalidAccountID {
++		t.Fatalf("第一次应当因账号格式被拒，实得 success=%v code=%s", bad.Success, bad.ErrorCode)
++	}
++
++	good := h.connectRawWithNonce(t, ctx, "acctA", "dev1", nonce)
++	if !good.Success {
++		t.Fatalf("改正账号后用同一个 nonce 重试必须成功（格式拒绝不得烧 nonce），实得：%s",
++			good.ErrorMessage)
++	}
++}

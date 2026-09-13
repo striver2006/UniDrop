@@ -1,0 +1,74 @@
+{
+  "schema": "trivium.review.v1",
+  "verdict": "request-changes",
+  "summary": "最危险的一条是 GLM-01：connection_actor 发出的 tls-cert-failed 事件在前端零监听，默认开启证书校验后自签/IP/内部 CA 部署升级即进入无提示的重连循环，USER_GUIDE 承诺的「界面提示」不存在。指定三焦点本身核不出问题：SweepIdlePipes 联动不会让 auth 条目永久滞留（泄漏 pipe 由 main.go 每 10s 的 sweep 在 ≤70s 内回收并连带删条目）；RemovePipeForSession 四分支的归属全部基于服务端侧数据，case 4 兜底 fail-closed；「任何 authErr 双向拒绝」配合客户端 TRANSFER_FAILURE 无条件双删 pending 两表，不引入新挂起形态。次要问题：ValidateSessionID 是零生产调用方的死代码但其注释声称的 map 键卫生保护并未生效（GLM-02）；终态日志分支存在无害的 TOCTOU 误归因（GLM-03）。",
+  "findings": [
+    {
+      "id": "GLM-01",
+      "severity": "major",
+      "layer": "code",
+      "kind": "correctness",
+      "location": "client/src-tauri/src/core/connection_actor.rs:352-362（emit）；client/src/App.tsx:127-195（监听注册）",
+      "problem": "连接 actor 在证书校验失败时 emit 的 tls-cert-failed 事件没有任何消费者。App.tsx 的 useEffect 注册的监听集合是 devices-updated / auth-failed / auth-success / transfer-progress / transfer-offer-received / open-settings / server-limits-updated，不含 tls-cert-failed；全 client/src 范围 grep listen( 亦无其他命中。结果是本轮 TLS 默认开校验之后，自签证书、IP 直连、内部 CA 三类部署升级即断连，用户界面上没有任何提示，只见静默重连——这正是 connection_actor.rs 该处注释与 docs/USER_GUIDE.md「若升级后突然连不上，且界面提示『无法验证服务器证书』」明确声称要消除的形态。功能承诺与实现脱节，且文档已向用户许诺了一个不存在的提示。",
+      "evidence": "读 client/src-tauri/src/core/connection_actor.rs:240-396 确认 Err 分支 emit(\"tls-cert-failed\", ...)（且每次退避重试都会重复发射）；读 client/src/App.tsx:95-210 逐一核对 useEffect 内全部 listen 注册与 cleanup 列表；grep client/src 中 listen( 仅命中 App.tsx/HistoryPanel/SendModal，无 tls-cert-failed；docs/USER_GUIDE.md 的 diff hunk（changes.diff 748-775 行段）写有该界面提示。",
+      "suggestion": "在 App.tsx 增加 listen(\"tls-cert-failed\")，将 payload 并入既有 authError 横幅或等价的常驻提示（注意事件会随退避每 ≤30s 重发一次，横幅应幂等而非堆叠 toast）；或者后端改走既有 auth-failed 通道时需按注释所述避免污染 AUTH_RESPONSE 处理逻辑。补一条前端测试钉死该监听存在。",
+      "confidence": "high"
+    },
+    {
+      "id": "GLM-02",
+      "severity": "minor",
+      "layer": "code",
+      "kind": "security",
+      "location": "server/internal/auth/identity.go:70-82；server/internal/controller/control_ws.go:325-332",
+      "problem": "ValidateSessionID 在整个 server 内没有任何生产调用方（仅 identity_test.go 引用），而它注释里承诺的保护——「keeps a half-megabyte string from being used as a map key」——并未实际生效：TRANSFER_ANSWER 分支把 answer.SessionID（只受控制面 512KiB 读上限约束）原样传入 AuthorizeSessionIfUnderLimit，成为 authSessions（及后续 pipes）的 map 键。任何持 PSK 的客户端循环用新自报账号 + 超长 session_id 即可植入大键条目；TTL 5 分钟 + 每 10s sweep 使内存有界，放大率≈1，实害有限，但「注释宣称的防线」与「代码实际做的事」出现了漂移，后来者会以为该路径已被覆盖。",
+      "evidence": "grep server/ 中 ValidateSessionID 仅命中 identity.go 定义与 identity_test.go 调用；读 control_ws.go:300-379 确认 ANSWER 分支未对 answer.SessionID 做任何校验即入 AuthorizeSessionIfUnderLimit；读 relay_manager.go:174-181 确认 sessionID 直接作为 authSessions 键落库。",
+      "suggestion": "二选一：在 ANSWER 分支（拒绝时走既有 AuthorizeFailedViolation 通道即可，无需新增错误码）对 answer.SessionID 调用 ValidateSessionID；或删掉 ValidateSessionID 及其测试，并修正 identity.go 注释不再声称 map 键卫生。不要保留一个声称有防线而未接线的函数。",
+      "confidence": "high"
+    },
+    {
+      "id": "GLM-03",
+      "severity": "nit",
+      "layer": "code",
+      "kind": "concurrency",
+      "location": "server/internal/controller/control_ws.go:390-406",
+      "problem": "终态信令的日志分支存在 TOCTOU：RemovePipeForSession 返回 false 与 OwnerOfSession 两次独立加锁，之间无原子性。若一次良性的迟到/重复终态信令（case 3，本应 debug）恰逢同一 session_id 被新授权占用，OwnerOfSession 会查到新持有者，将其误报为 warn 级「cross-account pipe teardown blocked」——与该分支注释刻意压制告警噪音的目标相悖，且 OwnerOfSession 回答的是『现在谁持有』而非『拒绝瞬间谁持有』。仅日志误归因，无状态被改动。",
+      "evidence": "读 control_ws.go:389-406（RemovePipeForSession 与 OwnerOfSession 顺序调用）；读 relay_manager.go:401-452 确认两函数各自持锁、中间可插入 AuthorizeSessionIfUnderLimit。",
+      "suggestion": "可接受现状；若要消除，方向是让 RemovePipeForSession 在持锁期间一并返回拒绝原因（枚举而非布尔），调用方据此分流日志，OwnerOfSession 仅留给真正需要的路径。",
+      "confidence": "medium"
+    }
+  ],
+  "agreed": [
+    "焦点1成立：SweepIdlePipes 的联动不会让 auth 条目永久滞留。pipe.Touch 只能由 PushForward/PushBackward/ValidateAndGetOrCreatePipe 触发，三者都要求通过 token 校验；无人喂流量的泄漏 pipe 在 ≤60s 空闲后被 main.go:64-80 每 10s 的 sweep 回收，且第一轮循环同时删除 pipes[id] 与 authSessions[id]（relay_manager.go:494-501）。维持条目存活的唯一方式是持续传数据——那正是在途传输的定义，且只消耗自报账号自身的并发额度，跨账号无法借道（token 不匹配）。",
+    "焦点2成立：四分支的归属判定不信任任何客户端自报字段。case 1/2 用服务端铸造的 SessionAuth，case 4 用 pipe 创建时从 auth 条目拷贝的 AccountID/设备对（ValidateAndGetOrCreatePipe 是生产唯一造 pipe 入口，GetOrCreatePipe 仅测试使用）；调用方传入的 accountID/deviceID 均来自握手时校验过的 session。case 4 对 GetOrCreatePipe 产出的空 AccountID pipe 恒不匹配（账号已验证非空），fail-closed。",
+    "焦点3成立：任何 authErr 双向拒绝不引入新挂起形态。服务端拒绝后 continue 不转发 ANSWER，rejectToSelf/rejectToPeer 分别命中接收方与发送方（control_ws.go:339-367，方向区分有 cross_account_ws_test.go 端到端钉死）；客户端 connection_actor 对 text 信封无过滤全部转发进 internal_tx，lib.rs:258-324 的 TRANSFER_FAILURE 处理器无条件双删 pending_outbound/pending_inbound 并把历史行与卡片置 FAILED。残余的尽力送达角落（对端离线或 SendChan 满时拒绝丢失）是既有形态且代码注释已自认，本轮严格收窄而非扩大。",
+    "格式校验排在验签之前的顺序决策正确，且与 VerifyWithSalt『签名通过才记 nonce』（verifier.go:87-98）的语义自洽；TestRejectedIdentityDoesNotBurnNonce 有判别力——若顺序颠倒，同 nonce 重试会撞 replay 而非成功，测试必红。",
+    "registry 复合键改造配套完整：Register 顶号收敛到账号内、UnregisterSession 的 CAS 按新键比对、SweepInactive 返回值改用键数据，正反例测试均到位；AuthorizeSessionIfUnderLimit 先冲突检查后计数（防止借他人条目豁免自身额度）同样有专门测试钉死顺序。",
+    "metrics/healthz 去账号 label 的基数闸门正确：聚合指标 + 闭集 reason 枚举，且有 TestMetricsHasNoAccountIDLabel 与恰好三分项计数守卫，防住了 DESIGN.md 原稿那类有害规范回潮。",
+    "客户端账号校验三层（SettingsModal 正则、Rust validate_account_id 字节校验、服务端 identity.go）文法一致；JS 侧 UTF-16 length 与字节长度的差异被先行的 ASCII 白名单消解，不存在客户端放行而服务端拒绝的裂缝。裸 serde(default) 对 bool 恰好落在安全侧（false=校验），有测试钉死老库升级默认值。",
+    "cmd_save_settings 无条件 notify_waiters（settings_cmd.rs:209），勾选 allow_insecure_tls 后立即以新连接器重连，无最长 30s 的生效延迟。"
+  ],
+  "not_covered": [
+    "未运行任何测试（go test / cargo test / vitest 均未执行），全部结论基于静态阅读；尤其 TestGlobalPipeCapStillApplies 建 200 条管道的耗时与稳定性未验证。",
+    "client/src-tauri/src/core/transfer_engine.rs 只读了 diff hunks 与两处调用点签名，ARQ 重传/缓存写盘逻辑未逐行审查。",
+    "is_cert_error 对 tokio-tungstenite 0.23 实际错误文案的命中率未实测（作者注释已自认脆弱、漏判后果轻，未深究）。",
+    "必读清单中的 CLAUDE.md、README.md 未读；docs/USER_GUIDE.md、docs/design/DESIGN.md、docs/需求.md 仅核对了 diff 涉及的 hunk，未逐字审全文。",
+    "client/src-tauri/src/storage/db.rs 的 DROP TABLE paired_devices 迁移仅在代码层面确认零读写引用，未在真实老库上验证执行。",
+    "SettingsModal.tsx 完整渲染行为（含无障碍属性）与 App.test.tsx 全部用例未逐条审查；settings_cmd.rs 的 cmd_set_autostart 等与本轮无关部分略读。"
+  ],
+  "consulted": [
+    ".reviews/multi-account-hardening/code/_meta/changes-20260913T093116Z.diff",
+    "server/internal/relay/relay_manager.go",
+    "server/internal/relay/pipe.go",
+    "server/internal/registry/registry.go",
+    "server/internal/auth/identity.go",
+    "server/internal/auth/verifier.go",
+    "server/internal/controller/control_ws.go",
+    "server/internal/controller/data_ws.go",
+    "server/cmd/unidrop-server/main.go",
+    "client/src-tauri/src/lib.rs",
+    "client/src-tauri/src/core/connection_actor.rs",
+    "client/src-tauri/src/commands/settings_cmd.rs",
+    "client/src-tauri/src/app_state.rs",
+    "client/src/App.tsx"
+  ]
+}
