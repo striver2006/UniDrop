@@ -5031,7 +5031,7 @@ checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "unidrop-client"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "crc32fast",
  "env_logger",
