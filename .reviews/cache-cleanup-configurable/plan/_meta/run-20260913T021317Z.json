@@ -1,0 +1,144 @@
+{
+  "schema": "trivium.run.v1",
+  "run_id": "20260913T021317Z",
+  "topic": "cache-cleanup-configurable",
+  "stage": "plan",
+  "rerun_index": 1,
+  "command": "trivium review --start --stage plan",
+  "prompt_hint": "重点核实配置项的默认值与 0 值语义、间隔为 0 导致 panic 的防护、常量收敛是否彻底",
+  "task_goal": null,
+  "entry": "B",
+  "snapshot": {
+    "git_head": "75c6568452255df9409a1cb6fa1ac7e2e3529def",
+    "tree_hash": "a9ef97cd6814a261f2d8120cca66e198a293b891",
+    "dirty": true,
+    "subject_sha256": "4ae560d94fcad5dd27ff52748e4e16fdd0bc8dcfda3d95c5baaa52f27582e364",
+    "drift": {
+      "changed": false,
+      "files": [],
+      "policy": "warn"
+    }
+  },
+  "started_at": "2026-09-13T02:13:18.197Z",
+  "finished_at": "2026-09-13T02:26:09.806Z",
+  "review_mode": "dual",
+  "degraded_reason": null,
+  "critics": {
+    "gemini": {
+      "vendor": "antigravity",
+      "cli_version": "1.2.2",
+      "model_requested": "gemini-3.8-flash-high",
+      "model_effective": "gemini-3.8-flash-high",
+      "model_effective_source": "envelope",
+      "effort": "high",
+      "status": "ok",
+      "exit_code": 0,
+      "duration_s": 170.851,
+      "tool_calls": {
+        "read": 25,
+        "grep": 7,
+        "glob": 0,
+        "run_command": 0,
+        "project_reads": 16
+      },
+      "evidence_ok": true,
+      "usage": {
+        "input_tokens": 182203,
+        "output_tokens": 37104,
+        "thinking_tokens": 32383,
+        "cache_read_tokens": 1586430,
+        "total_tokens": 219307
+      },
+      "heterogeneous": true,
+      "fail_reason": null,
+      "empty_review": false,
+      "parse_fallback": false,
+      "session_id": "5c07b89d-c5e9-4b3c-aa52-1adf37139a37",
+      "peer_deny_applied": false
+    },
+    "glm": {
+      "vendor": "zcode",
+      "cli_version": "0.16.5",
+      "model_requested": "GLM-5.3-Flash",
+      "model_effective": "bigmodel-coding-plan/GLM-5.3-Flash",
+      "model_effective_source": "trace",
+      "model_route": "config_copy",
+      "status": "ok",
+      "exit_code": 0,
+      "duration_s": 771.464,
+      "tool_calls": {
+        "read": 15,
+        "grep": 3,
+        "glob": 1,
+        "run_command": 0,
+        "project_reads": 16
+      },
+      "evidence_ok": true,
+      "usage": {
+        "source": "provider",
+        "modelRequestCount": 13,
+        "inputTokens": 897735,
+        "outputTokens": 28665,
+        "totalTokens": 926400,
+        "cacheReadTokens": 808064,
+        "cacheWriteTokens": 0,
+        "reasoningTokens": 0,
+        "webFetchRequests": 0,
+        "webSearchRequests": 0
+      },
+      "heterogeneous": true,
+      "fail_reason": null,
+      "empty_review": false,
+      "parse_fallback": false,
+      "session_id": "sess_29c53dea-fd8f-4a36-918d-56a796ce046b",
+      "peer_deny_applied": false
+    }
+  },
+  "deny_paths": [
+    ".reviews/autostart-single-instance/code/2026-09-13-autostart-single-instance-glm.md",
+    ".reviews/autostart-single-instance/plan/2026-09-13-autostart-single-instance-glm.md",
+    ".reviews/history-retention-autodismiss/code/2026-09-13-history-retention-autodismiss-glm.md",
+    ".reviews/history-retention-autodismiss/plan/2026-09-13-history-retention-autodismiss-glm.md"
+  ],
+  "guard": {
+    "readonly_breach": false,
+    "peer_artifact_read": false,
+    "peer_deny_applied": {
+      "gemini": false,
+      "glm": false
+    },
+    "forged_role_file": false,
+    "breached_files": []
+  },
+  "artifacts": [
+    {
+      "path": "cache-cleanup-configurable/plan/_meta/brief-gemini-20260913T021317Z.md",
+      "sha256": "e8f5187df1091d9b264032c4f0114e807da039cb4235b1c23bba1d852194930b"
+    },
+    {
+      "path": "cache-cleanup-configurable/plan/_meta/brief-glm-20260913T021317Z.md",
+      "sha256": "2f0e578870bfee1451cc2eaa6e5b7978611bc479eefb2f6d4aba88090ef0c01d"
+    },
+    {
+      "path": "cache-cleanup-configurable/plan/_meta/review-gemini-20260913T021317Z.json",
+      "sha256": "1eb2a91112017e9d9b9395e4030b60737302276f310c2dc1608d06eddd6aa2f9"
+    },
+    {
+      "path": "cache-cleanup-configurable/plan/_meta/review-glm-20260913T021317Z.json",
+      "sha256": "fbe1f4aa3361592167b0eefc56792df94d183c0b293713b519870831c8f4a5b6"
+    },
+    {
+      "path": "cache-cleanup-configurable/plan/2026-09-13-cache-cleanup-configurable-gemini.md",
+      "sha256": "4233bfba8e2f440282280166812758507047dbd2adff422eb161795a99b15422"
+    },
+    {
+      "path": "cache-cleanup-configurable/plan/2026-09-13-cache-cleanup-configurable-glm.md",
+      "sha256": "3e31bca60bd45ee6ea9e22c1c38c12020939a0c21e9ae515e335ea1e75f437a6"
+    }
+  ],
+  "gate": {
+    "adjudication_complete": false,
+    "state": "review_done_awaiting_disposition"
+  },
+  "status": "success"
+}
