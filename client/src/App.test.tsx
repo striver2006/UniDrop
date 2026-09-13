@@ -231,3 +231,24 @@ describe("TLS 证书失败提示", () => {
     expect(screen.queryByText(/无法验证服务器证书/)).not.toBeInTheDocument();
   });
 });
+
+describe("切账号清空传输卡片", () => {
+  // 历史面板靠重拉，传输卡片没有「重拉」可言——它是推送累积的本地状态，
+  // 只能清空。不清的话上一个账号的完成卡片会继续挂在界面中央，
+  // 上面的「装载到剪贴板」按钮点下去必然撞上后端闸门报错，
+  // 而卡片本身就带着上一个账号的文件名与摘要。
+  it("收到 account-changed 后清空卡片", async () => {
+    await renderApp();
+
+    await act(async () => {
+      emitEvent("transfer-progress", transfer({ session_id: "s1", status: "COMPLETED" }));
+    });
+    expect(screen.getByText("demo.txt")).toBeInTheDocument();
+
+    await act(async () => {
+      emitEvent("account-changed", undefined);
+    });
+
+    expect(screen.queryByText("demo.txt")).not.toBeInTheDocument();
+  });
+});

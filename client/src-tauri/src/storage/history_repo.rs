@@ -49,6 +49,7 @@ impl HistoryRepo {
     /// transfer is first observed (outgoing send / incoming offer).
     pub fn record_task(
         conn: &Connection,
+        account_id: &str,
         session_id: &str,
         remote_device_id: &str,
         direction: &str,
@@ -57,11 +58,12 @@ impl HistoryRepo {
     ) -> Result<(), rusqlite::Error> {
         conn.execute(
             "INSERT OR REPLACE INTO transfer_tasks
-                (session_id, remote_device_id, direction, data_type, preview_summary,
+                (session_id, account_id, remote_device_id, direction, data_type, preview_summary,
                  total_size, total_items, status, error_message, created_at, completed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, CURRENT_TIMESTAMP, NULL)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, CURRENT_TIMESTAMP, NULL)",
             (
                 session_id,
+                account_id,
                 remote_device_id,
                 direction,
                 offer.data_type.clone(),
@@ -88,6 +90,25 @@ impl HistoryRepo {
             )?;
         }
         Ok(())
+    }
+
+    /// 核验某个会话是否归属指定账号。
+    ///
+    /// 供三个直接操作文件的 IPC 命令（装载剪贴板 / 另存为 / 在文件管理器中显示）
+    /// 在动文件之前调用。这不是冗余的纵深防御：`list_history` 的过滤只保证
+    /// 「看不见」，而界面残留、事件丢失、用户在刷新落地前抢先点击，任何一种
+    /// 都会让「按钮只作用于可见行」这个前提失效——失效的后果是把另一个账号的
+    /// 文件写进剪贴板。前端状态的正确性不该是文件访问控制的唯一依据。
+    ///
+    /// 归属未知（account_id 为 NULL，即尚未认领的老库行）时返回 false：
+    /// 宁可让用户重启一次应用完成认领，也不要放行一条来历不明的记录。
+    pub fn session_belongs_to(conn: &Connection, session_id: &str, account_id: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM transfer_tasks WHERE session_id = ?1 AND account_id = ?2",
+            rusqlite::params![session_id, account_id],
+            |_| Ok(()),
+        )
+        .is_ok()
     }
 
     /// Updates task status; stamps completed_at on terminal states.
@@ -126,17 +147,22 @@ impl HistoryRepo {
     }
 
     /// Lists the most recent tasks, oldest first is reversed — newest first.
-    pub fn list_history(conn: &Connection, limit: u32) -> Result<Vec<TransferHistoryEntry>, rusqlite::Error> {
+    /// 列出**当前账号**的历史。
+    ///
+    /// 账号作为显式首参而不从全局读：显式参数让「忘了过滤」成为编译错误，
+    /// 读全局只会让它成为运行期的静默串台。与服务端 registry 改复合键同理。
+    pub fn list_history(conn: &Connection, account_id: &str, limit: u32) -> Result<Vec<TransferHistoryEntry>, rusqlite::Error> {
         let mut stmt = conn.prepare(
             "SELECT t.session_id, t.direction, t.data_type, t.preview_summary, t.total_size,
                     t.total_items, t.status, t.error_message, t.created_at, t.completed_at,
                     (SELECT COUNT(*) FROM cache_entries c WHERE c.session_id = t.session_id) AS cached_count
              FROM transfer_tasks t
+             WHERE t.account_id = ?1
              ORDER BY t.created_at DESC, t.rowid DESC
-             LIMIT ?1",
+             LIMIT ?2",
         )?;
 
-        let rows = stmt.query_map([limit], |row| {
+        let rows = stmt.query_map(rusqlite::params![account_id, limit], |row| {
             Ok(TransferHistoryEntry {
                 session_id: row.get(0)?,
                 direction: row.get(1)?,
@@ -194,8 +220,24 @@ impl HistoryRepo {
     /// - 约束 B：会话中只要还有一个文件处在 2 小时剪贴板免疫窗口内就整体跳过——
     ///   用户刚把它装载进系统剪贴板，随时可能粘贴。条数超限是攒出来的慢问题，
     ///   剪贴板失效是下一秒就撞上的快问题，本轮跳过，下一轮再收。
+    /// 选出**当前账号**可修剪的会话。
+    ///
+    /// 账号条件要加在**两处**，漏掉第二处的后果反直觉，所以单独说明：
+    ///
+    /// 1. 外层 `WHERE` —— 圈定本账号的可删候选；
+    /// 2. `NOT IN` 保留窗口子查询 —— 「最新 N 条」的窗口本身。
+    ///
+    /// 只加第一处的话，保留窗口仍是全局的：另一个账号的新行占满窗口名额后，
+    /// 本账号的修剪会把**自己**最新 N 条之内的行判成超限删掉。注意失败形态
+    /// 不是「删到别人的行」，而是「删掉自己该留的行」——它违反的是本文件
+    /// 既有测试守护的「候选集与可见前 N 条不得相交」不变量，且只在两个账号
+    /// 的行在时间上交错时才显现（一方全新或全旧时两种写法结果相同）。
+    ///
+    /// 中间那段 `NOT EXISTS` 剪贴板免疫子查询**不需要**账号条件：它已由
+    /// `c.session_id = t.session_id` 与外层关联，外层收窄即自动收窄。
     pub fn select_prune_candidates(
         conn: &Connection,
+        account_id: &str,
         limit: u32,
     ) -> Result<Vec<PruneCandidate>, rusqlite::Error> {
         if limit == 0 {
@@ -205,7 +247,8 @@ impl HistoryRepo {
         let mut stmt = conn.prepare(
             "SELECT t.session_id
              FROM transfer_tasks t
-             WHERE t.status IN ('COMPLETED', 'FAILED', 'CANCELLED')
+             WHERE t.account_id = ?3
+               AND t.status IN ('COMPLETED', 'FAILED', 'CANCELLED')
                AND NOT EXISTS (
                    SELECT 1 FROM cache_entries c
                    WHERE c.session_id = t.session_id
@@ -214,13 +257,14 @@ impl HistoryRepo {
                )
                AND t.session_id NOT IN (
                    SELECT session_id FROM transfer_tasks
+                   WHERE account_id = ?3
                    ORDER BY created_at DESC, rowid DESC
                    LIMIT ?1
                )",
         )?;
 
         let session_ids: Vec<String> = stmt
-            .query_map(rusqlite::params![limit, CLIPBOARD_LOCK_SECS], |row| row.get(0))?
+            .query_map(rusqlite::params![limit, CLIPBOARD_LOCK_SECS, account_id], |row| row.get(0))?
             .filter_map(Result::ok)
             .collect();
         drop(stmt);
@@ -353,13 +397,13 @@ mod tests {
     fn test_history_crud() {
         let conn = test_conn();
 
-        HistoryRepo::record_task(&conn, "s1", "peer-1", "RECEIVE", &sample_offer("s1", "FILES"), "TRANSFERRING").unwrap();
-        HistoryRepo::record_task(&conn, "s2", "peer-2", "SEND", &sample_offer("s2", "TEXT"), "TRANSFERRING").unwrap();
+        HistoryRepo::record_task(&conn, "acct", "s1", "peer-1", "RECEIVE", &sample_offer("s1", "FILES"), "TRANSFERRING").unwrap();
+        HistoryRepo::record_task(&conn, "acct", "s2", "peer-2", "SEND", &sample_offer("s2", "TEXT"), "TRANSFERRING").unwrap();
 
         HistoryRepo::update_task_status(&conn, "s1", "COMPLETED", None).unwrap();
         HistoryRepo::update_task_status(&conn, "s2", "FAILED", Some("data connect failed")).unwrap();
 
-        let entries = HistoryRepo::list_history(&conn, 10).unwrap();
+        let entries = HistoryRepo::list_history(&conn, "acct", 10).unwrap();
         assert_eq!(entries.len(), 2);
         // newest first: s2 recorded after s1 within the same second, so rely on rowid tiebreak
         assert_eq!(entries[0].session_id, "s2");
@@ -377,13 +421,189 @@ mod tests {
         assert!(HistoryRepo::get_task_brief(&conn, "missing").is_none());
     }
 
+    // ---------- 按账号分区 ----------
+
+    /// 按指定账号与创建时间种一条已完成的行。
+    /// `age_secs` 越大越旧，用来构造两个账号在时间上**交错**的分布。
+    fn seed_for(conn: &Connection, account: &str, sid: &str, age_secs: i64) {
+        HistoryRepo::record_task(conn, account, sid, "peer", "RECEIVE", &sample_offer(sid, "FILES"), "TRANSFERRING")
+            .unwrap();
+        HistoryRepo::update_task_status(conn, sid, "COMPLETED", None).unwrap();
+        conn.execute(
+            "UPDATE transfer_tasks SET created_at = datetime('now', ?2) WHERE session_id = ?1",
+            rusqlite::params![sid, format!("-{} seconds", age_secs)],
+        )
+        .unwrap();
+    }
+
+    /// 删掉 list_history 的账号过滤，这条立刻红 —— 那正是「切账号后
+    /// 历史面板列出上一个账号的文件名」的形态。
+    #[test]
+    fn list_history_only_returns_current_account() {
+        let conn = test_conn();
+        seed_for(&conn, "alice", "a1", 10);
+        seed_for(&conn, "alice", "a2", 20);
+        seed_for(&conn, "bob", "b1", 15);
+
+        let alice = HistoryRepo::list_history(&conn, "alice", 100).unwrap();
+        assert_eq!(alice.len(), 2, "alice 只应看到自己的两条");
+        assert!(alice.iter().all(|e| e.session_id.starts_with('a')));
+
+        let bob = HistoryRepo::list_history(&conn, "bob", 100).unwrap();
+        assert_eq!(bob.len(), 1, "bob 只应看到自己的一条");
+        assert_eq!(bob[0].session_id, "b1");
+    }
+
+    /// 泄露的具体内容是文件名与预览摘要，单断条数不够。
+    #[test]
+    fn list_history_does_not_leak_other_account_previews() {
+        let conn = test_conn();
+        seed_for(&conn, "alice", "secret-session", 10);
+
+        let bob = HistoryRepo::list_history(&conn, "bob", 100).unwrap();
+        assert!(bob.is_empty(), "bob 不得看到 alice 的任何一条记录");
+    }
+
+    /// **本组最关键的一条。**
+    ///
+    /// 守的是 select_prune_candidates 的**第二处**过滤（NOT IN 保留窗口子查询）。
+    /// 只在外层加账号条件的话，保留窗口仍是全局的：bob 的新行占满窗口名额后，
+    /// alice 的修剪会把 alice **自己**最新 N 条之内的行判成超限删掉。
+    ///
+    /// 注意失败形态不是「删到别人的行」，而是「删掉自己该留的行」——
+    /// 所以下面那条 prune_never_touches_other_account_rows 抓不住它。
+    /// 也必须刻意让两个账号的行在时间上**交错**：bob 的行全新或全旧时，
+    /// 两种写法结果相同，用例就没有鉴别力了。
+    #[test]
+    fn prune_window_is_per_account_when_rows_interleave() {
+        let conn = test_conn();
+        // 时间交错：bob 的两条夹在 alice 的三条中间
+        seed_for(&conn, "alice", "a_new", 10);
+        seed_for(&conn, "bob", "b_1", 20);
+        seed_for(&conn, "alice", "a_mid", 30);
+        seed_for(&conn, "bob", "b_2", 40);
+        seed_for(&conn, "alice", "a_old", 50);
+
+        // alice 保留最新 2 条 => 只有 a_old 该被修剪
+        let candidates = HistoryRepo::select_prune_candidates(&conn, "alice", 2).unwrap();
+        let ids = session_ids(&candidates);
+
+        assert_eq!(
+            ids,
+            vec!["a_old".to_string()],
+            "alice 保留窗口内的 a_new / a_mid 一条都不能进候选；\
+             实得 {:?} —— 多半是 NOT IN 子查询漏了 account_id 过滤，\
+             bob 的新行占掉了 alice 的窗口名额",
+            ids
+        );
+    }
+
+    /// 修剪不得越界删到别人的行。与上一条守的是不同的失败形态。
+    #[test]
+    fn prune_never_touches_other_account_rows() {
+        let conn = test_conn();
+        seed_for(&conn, "alice", "a1", 10);
+        seed_for(&conn, "bob", "b1", 20);
+        seed_for(&conn, "bob", "b2", 30);
+        seed_for(&conn, "bob", "b3", 40);
+
+        // alice 一条都不保留，也只能删到自己那条
+        let candidates = HistoryRepo::select_prune_candidates(&conn, "alice", 0).unwrap();
+        assert!(candidates.is_empty(), "limit=0 表示不限制，不应有候选");
+
+        let candidates = HistoryRepo::select_prune_candidates(&conn, "alice", 1).unwrap();
+        assert!(
+            session_ids(&candidates).iter().all(|id| id.starts_with('a')),
+            "alice 的修剪不得把 bob 的行选进候选：{:?}",
+            session_ids(&candidates)
+        );
+    }
+
+    /// 老库的 NULL 行归给当前账号。
+    #[test]
+    fn claim_assigns_legacy_rows_to_current_account() {
+        let conn = test_conn();
+        HistoryRepo::record_task(&conn, "alice", "legacy", "peer", "RECEIVE", &sample_offer("legacy", "FILES"), "TRANSFERRING").unwrap();
+        // 人为制造老库形态
+        conn.execute("UPDATE transfer_tasks SET account_id = NULL", []).unwrap();
+        assert!(HistoryRepo::list_history(&conn, "alice", 10).unwrap().is_empty());
+
+        let claimed = crate::storage::db::claim_unowned_history(&conn, "alice").unwrap();
+        assert_eq!(claimed, 1);
+        assert_eq!(HistoryRepo::list_history(&conn, "alice", 10).unwrap().len(), 1);
+    }
+
+    /// 认领必须幂等，且**不得改走已有归属的行**。
+    /// 否则每次切账号都会把上一个账号的历史搬过来——认领的全部安全性
+    /// 都建立在「只触 NULL 行」上。
+    #[test]
+    fn claim_is_idempotent_and_does_not_resteal() {
+        let conn = test_conn();
+        seed_for(&conn, "alice", "a1", 10);
+
+        let claimed = crate::storage::db::claim_unowned_history(&conn, "bob").unwrap();
+        assert_eq!(claimed, 0, "已有归属的行不得被 bob 认领走");
+        assert_eq!(HistoryRepo::list_history(&conn, "alice", 10).unwrap().len(), 1);
+        assert!(HistoryRepo::list_history(&conn, "bob", 10).unwrap().is_empty());
+    }
+
+    /// 切账号是「看不见」而不是「被删掉」，切回来必须原样在。
+    #[test]
+    fn switching_account_hides_but_keeps_history() {
+        let conn = test_conn();
+        seed_for(&conn, "alice", "a1", 10);
+
+        assert!(HistoryRepo::list_history(&conn, "bob", 10).unwrap().is_empty());
+        let back = HistoryRepo::list_history(&conn, "alice", 10).unwrap();
+        assert_eq!(back.len(), 1, "切回 alice 后历史必须原样回来");
+        assert_eq!(back[0].session_id, "a1");
+    }
+
+    /// 归属闸门：三个直接读文件的 IPC 命令据此判断。
+    #[test]
+    fn session_ownership_gate_rejects_other_account_and_unclaimed() {
+        let conn = test_conn();
+        seed_for(&conn, "alice", "a1", 10);
+
+        assert!(HistoryRepo::session_belongs_to(&conn, "a1", "alice"));
+        assert!(!HistoryRepo::session_belongs_to(&conn, "a1", "bob"), "跨账号必须拒绝");
+        assert!(!HistoryRepo::session_belongs_to(&conn, "missing", "alice"));
+
+        // 未认领的老库行归属未知，宁可拒绝
+        conn.execute("UPDATE transfer_tasks SET account_id = NULL", []).unwrap();
+        assert!(
+            !HistoryRepo::session_belongs_to(&conn, "a1", "alice"),
+            "归属未知的行不得放行——宁可让用户重启一次完成认领"
+        );
+    }
+
+    /// `reset_stale_in_flight` **刻意保持全局**，这条把那个决策钉成会红的断言。
+    ///
+    /// 按账号过滤的话，上个账号崩溃留下的死行永远不会被复位，
+    /// 会永久占住它的保留额度并在它的历史里显示成「传输中」。
+    #[test]
+    fn reset_stale_in_flight_covers_all_accounts() {
+        let conn = test_conn();
+        HistoryRepo::record_task(&conn, "alice", "a_dead", "peer", "RECEIVE", &sample_offer("a_dead", "FILES"), "TRANSFERRING").unwrap();
+        HistoryRepo::record_task(&conn, "bob", "b_dead", "peer", "RECEIVE", &sample_offer("b_dead", "FILES"), "TRANSFERRING").unwrap();
+
+        let reset = HistoryRepo::reset_stale_in_flight(&conn).unwrap();
+        assert_eq!(reset, 2, "两个账号的死行都必须被复位，不论当前账号是谁");
+
+        for (acct, sid) in [("alice", "a_dead"), ("bob", "b_dead")] {
+            let entries = HistoryRepo::list_history(&conn, acct, 10).unwrap();
+            assert_eq!(entries[0].session_id, sid);
+            assert_eq!(entries[0].status, "FAILED", "{} 的死行应被复位为 FAILED", acct);
+        }
+    }
+
     // ---------- 修剪（需求 4） ----------
 
     /// 按插入顺序建 n 条已完成的任务：s1 最旧，sN 最新（同秒内靠 rowid 分先后）。
     fn seed_completed(conn: &Connection, n: usize) {
         for i in 1..=n {
             let sid = format!("s{}", i);
-            HistoryRepo::record_task(conn, &sid, "peer", "RECEIVE", &sample_offer(&sid, "FILES"), "TRANSFERRING")
+            HistoryRepo::record_task(conn, "acct", &sid, "peer", "RECEIVE", &sample_offer(&sid, "FILES"), "TRANSFERRING")
                 .unwrap();
             HistoryRepo::update_task_status(conn, &sid, "COMPLETED", None).unwrap();
         }
@@ -413,13 +633,13 @@ mod tests {
         let mut conn = test_conn();
         seed_completed(&conn, 5);
 
-        let candidates = HistoryRepo::select_prune_candidates(&conn, 3).unwrap();
+        let candidates = HistoryRepo::select_prune_candidates(&conn, "acct", 3).unwrap();
         assert_eq!(session_ids(&candidates), vec!["s1", "s2"], "应只删最旧的两条");
 
         let ids: Vec<String> = candidates.into_iter().map(|c| c.session_id).collect();
         assert_eq!(HistoryRepo::delete_sessions(&mut conn, &ids).unwrap(), 2);
 
-        let left = HistoryRepo::list_history(&conn, 10).unwrap();
+        let left = HistoryRepo::list_history(&conn, "acct", 10).unwrap();
         assert_eq!(left.len(), 3);
         assert_eq!(left[0].session_id, "s5", "最新的必须还在");
     }
@@ -429,7 +649,7 @@ mod tests {
         let conn = test_conn();
         seed_completed(&conn, 5);
         assert!(
-            HistoryRepo::select_prune_candidates(&conn, 0).unwrap().is_empty(),
+            HistoryRepo::select_prune_candidates(&conn, "acct", 0).unwrap().is_empty(),
             "0 表示不限制，一条都不该选中"
         );
     }
@@ -439,11 +659,11 @@ mod tests {
     #[test]
     fn prune_never_touches_in_flight_tasks() {
         let conn = test_conn();
-        HistoryRepo::record_task(&conn, "old-running", "peer", "RECEIVE", &sample_offer("old-running", "FILES"), "TRANSFERRING")
+        HistoryRepo::record_task(&conn, "acct", "old-running", "peer", "RECEIVE", &sample_offer("old-running", "FILES"), "TRANSFERRING")
             .unwrap();
         seed_completed(&conn, 4);
 
-        let candidates = HistoryRepo::select_prune_candidates(&conn, 2).unwrap();
+        let candidates = HistoryRepo::select_prune_candidates(&conn, "acct", 2).unwrap();
         let ids = session_ids(&candidates);
         assert!(!ids.contains(&"old-running".to_string()), "进行中的任务不得被选为删除候选");
         assert_eq!(ids, vec!["s1", "s2"]);
@@ -458,7 +678,7 @@ mod tests {
         add_cache_entry(&conn, "s1", "/tmp/locked.bin", true);
         add_cache_entry(&conn, "s2", "/tmp/free.bin", false);
 
-        let ids = session_ids(&HistoryRepo::select_prune_candidates(&conn, 3).unwrap());
+        let ids = session_ids(&HistoryRepo::select_prune_candidates(&conn, "acct", 3).unwrap());
         assert_eq!(ids, vec!["s2"], "s1 处于免疫窗口内，本轮应跳过");
     }
 
@@ -467,7 +687,7 @@ mod tests {
     #[test]
     fn delete_sessions_clears_all_four_tables() {
         let mut conn = test_conn();
-        HistoryRepo::record_task(&conn, "s1", "peer", "RECEIVE", &sample_offer("s1", "FILES"), "TRANSFERRING").unwrap();
+        HistoryRepo::record_task(&conn, "acct", "s1", "peer", "RECEIVE", &sample_offer("s1", "FILES"), "TRANSFERRING").unwrap();
         HistoryRepo::update_task_status(&conn, "s1", "COMPLETED", None).unwrap();
         add_cache_entry(&conn, "s1", "/tmp/a.bin", false);
         conn.execute(
@@ -493,7 +713,7 @@ mod tests {
         add_cache_entry(&conn, "s1", "/tmp/one.bin", false);
         add_cache_entry(&conn, "s1", "/tmp/two.bin", false);
 
-        let candidates = HistoryRepo::select_prune_candidates(&conn, 2).unwrap();
+        let candidates = HistoryRepo::select_prune_candidates(&conn, "acct", 2).unwrap();
         assert_eq!(candidates.len(), 1);
         let mut paths = candidates[0].file_paths.clone();
         paths.sort();
@@ -507,12 +727,12 @@ mod tests {
         let conn = test_conn();
         seed_completed(&conn, 6);
 
-        let visible: Vec<String> = HistoryRepo::list_history(&conn, 4)
+        let visible: Vec<String> = HistoryRepo::list_history(&conn, "acct", 4)
             .unwrap()
             .into_iter()
             .map(|e| e.session_id)
             .collect();
-        let candidates = session_ids(&HistoryRepo::select_prune_candidates(&conn, 4).unwrap());
+        let candidates = session_ids(&HistoryRepo::select_prune_candidates(&conn, "acct", 4).unwrap());
 
         for id in &candidates {
             assert!(!visible.contains(id), "{} 同时出现在保留窗口与删除候选中", id);
@@ -546,10 +766,10 @@ mod tests {
     #[test]
     fn reset_stale_in_flight_converts_only_unfinished_rows() {
         let conn = test_conn();
-        HistoryRepo::record_task(&conn, "running", "peer", "RECEIVE", &sample_offer("running", "FILES"), "TRANSFERRING")
+        HistoryRepo::record_task(&conn, "acct", "running", "peer", "RECEIVE", &sample_offer("running", "FILES"), "TRANSFERRING")
             .unwrap();
-        HistoryRepo::record_task(&conn, "pending", "peer", "SEND", &sample_offer("pending", "TEXT"), "PENDING").unwrap();
-        HistoryRepo::record_task(&conn, "done", "peer", "SEND", &sample_offer("done", "TEXT"), "TRANSFERRING").unwrap();
+        HistoryRepo::record_task(&conn, "acct", "pending", "peer", "SEND", &sample_offer("pending", "TEXT"), "PENDING").unwrap();
+        HistoryRepo::record_task(&conn, "acct", "done", "peer", "SEND", &sample_offer("done", "TEXT"), "TRANSFERRING").unwrap();
         HistoryRepo::update_task_status(&conn, "done", "COMPLETED", None).unwrap();
 
         assert_eq!(HistoryRepo::reset_stale_in_flight(&conn).unwrap(), 2);
@@ -567,17 +787,17 @@ mod tests {
     #[test]
     fn reset_then_prune_reclaims_dead_rows() {
         let mut conn = test_conn();
-        HistoryRepo::record_task(&conn, "dead", "peer", "RECEIVE", &sample_offer("dead", "FILES"), "TRANSFERRING")
+        HistoryRepo::record_task(&conn, "acct", "dead", "peer", "RECEIVE", &sample_offer("dead", "FILES"), "TRANSFERRING")
             .unwrap();
         seed_completed(&conn, 3);
 
         assert!(
-            HistoryRepo::select_prune_candidates(&conn, 2).unwrap().iter().all(|c| c.session_id != "dead"),
+            HistoryRepo::select_prune_candidates(&conn, "acct", 2).unwrap().iter().all(|c| c.session_id != "dead"),
             "复位前，死行受约束 A 保护"
         );
 
         HistoryRepo::reset_stale_in_flight(&conn).unwrap();
-        let ids: Vec<String> = HistoryRepo::select_prune_candidates(&conn, 2)
+        let ids: Vec<String> = HistoryRepo::select_prune_candidates(&conn, "acct", 2)
             .unwrap()
             .into_iter()
             .map(|c| c.session_id)
@@ -585,6 +805,6 @@ mod tests {
         assert!(ids.contains(&"dead".to_string()), "复位后死行应可被回收");
 
         HistoryRepo::delete_sessions(&mut conn, &ids).unwrap();
-        assert_eq!(HistoryRepo::list_history(&conn, 10).unwrap().len(), 2);
+        assert_eq!(HistoryRepo::list_history(&conn, "acct", 10).unwrap().len(), 2);
     }
 }

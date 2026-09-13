@@ -35,6 +35,11 @@ pub fn init_database(db_path: Option<PathBuf>) -> Result<Connection, rusqlite::E
     // 任何有数据的表上——那需要真正的迁移，而不是一句 DROP。
     let _ = conn.execute_batch("DROP TABLE IF EXISTS paired_devices;");
 
+    // 历史按账号分区。老库的行没有归属，列留 NULL——
+    // 此刻还读不到 settings（init_database 跑在它之前），不知道当前账号是谁。
+    // 回填由 claim_unowned_history 在读到 settings 之后完成。
+    let _ = conn.execute_batch("ALTER TABLE transfer_tasks ADD COLUMN account_id TEXT;");
+
     Ok(conn)
 }
 
@@ -45,6 +50,10 @@ pub fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
         -- 1. Transfer Tasks
         CREATE TABLE IF NOT EXISTS transfer_tasks (
             session_id TEXT PRIMARY KEY,
+            -- 归属账号。只有本表带这一列：transfer_items / chunk_bitmaps /
+            -- cache_entries 都以 session_id 为外键，归属由父表唯一决定，
+            -- 各存一份只会产生四份可能互相矛盾的记录。
+            account_id TEXT,
             remote_device_id TEXT NOT NULL,
             direction TEXT CHECK(direction IN ('SEND', 'RECEIVE')) NOT NULL,
             data_type TEXT NOT NULL,
@@ -102,6 +111,23 @@ pub fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     )?;
 
     Ok(())
+}
+
+/// 把没有归属的历史行认领给 `account_id`，返回认领的行数。
+///
+/// 只触 NULL 行，因此天然幂等，也因此**绝不能用一个非法账号调用它**：
+/// 行一旦被认领就不再是 NULL、永远不会被重新认领，而空串之类的非法账号
+/// 又永远无法通过 `validate_account_id` 成为当前账号——那些历史就此在应用内
+/// 永久不可见，只能手工改库恢复。调用方必须先校验（见 lib.rs 的调用点）。
+///
+/// 跳过一次是安全的：NULL 行原样留着，推迟到某个合法账号启动时再认领。
+/// 这个「宁可推迟也不要错认领」的不对称性，正是校验放在调用方而不是
+/// 在这里兜底的理由。
+pub fn claim_unowned_history(conn: &Connection, account_id: &str) -> Result<usize, rusqlite::Error> {
+    conn.execute(
+        "UPDATE transfer_tasks SET account_id = ?1 WHERE account_id IS NULL",
+        [account_id],
+    )
 }
 
 /// Retrieves the existing device_id from SQLite or generates and persists a new one (P1-4).

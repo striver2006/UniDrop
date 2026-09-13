@@ -48,9 +48,20 @@ export const HistoryPanel: React.FC<HistoryPanelProps> = ({ onNotify }) => {
     const unlistenPrunedPromise = listen<number>("history-pruned", () => {
       refresh(true);
     });
+    // 切账号后必须重拉：列表是按账号过滤的，不重拉就会继续显示上一个账号的
+    // 卡片——而卡片上的装载 / 另存为 / 定位三个按钮都会真的去读文件。
+    // 后端有归属闸门兜底（ensure_session_owned），但让用户点到一个必然报错的
+    // 按钮本身就是缺陷。
+    //
+    // 不复用 history-pruned：那是「修剪删掉了东西」的语义，而切账号时通常
+    // 一条都不用删，`prune_and_notify` 在 Ok(0) 时根本不广播。
+    const unlistenAccountPromise = listen("account-changed", () => {
+      refresh(true);
+    });
     return () => {
       unlistenPromise.then((unlisten) => unlisten());
       unlistenPrunedPromise.then((unlisten) => unlisten());
+      unlistenAccountPromise.then((unlisten) => unlisten());
     };
   }, [refresh]);
 

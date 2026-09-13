@@ -153,6 +153,22 @@ export const App: React.FC = () => {
       showNotification("安全鉴权成功，已连接中继服务器", "success");
     });
 
+    // 切账号：清空主界面的传输卡片。
+    //
+    // 历史面板那边靠重拉（HistoryPanel 自己监听同一事件），但传输卡片是
+    // 推送累积出来的本地状态，没有「重拉」可言，只能清空。
+    // 不清的话，上一个账号刚完成的接收卡片会继续挂在界面中央，上面的
+    // 「装载到剪贴板」按钮点下去必然撞上后端闸门报错——而且卡片本身就带着
+    // 上一个账号的文件名与摘要。`transfer_card_retain_secs` 设为 0 时它永不消失。
+    //
+    // 同时要清掉自动消失的定时器：卡片没了还留着 timer，等它触发时会对着
+    // 一个已经不存在的 session 调 setState。
+    const unlistenAccountPromise = listen("account-changed", () => {
+      dismissTimersRef.current.forEach((timer) => clearTimeout(timer));
+      dismissTimersRef.current.clear();
+      setTransfers([]);
+    });
+
     // TLS 证书校验失败。
     //
     // 刻意**不弹 toast**：连接 actor 每次退避重试（≤30s）都会重新 emit，
@@ -212,6 +228,7 @@ export const App: React.FC = () => {
       unlistenAuthPromise.then((unlisten) => unlisten());
       unlistenAuthSuccessPromise.then((unlisten) => unlisten());
       unlistenTlsPromise.then((unlisten) => unlisten());
+      unlistenAccountPromise.then((unlisten) => unlisten());
       unlistenProgressPromise.then((unlisten) => unlisten());
       unlistenOfferPromise.then((unlisten) => unlisten());
       unlistenSettingsPromise.then((unlisten) => unlisten());

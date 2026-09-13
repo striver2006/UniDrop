@@ -65,6 +65,31 @@ pub fn run() {
         commands::settings_cmd::AppSettings::default_config()
     };
 
+    // 存量历史认领：把老库里没有归属的行归给当前账号。
+    //
+    // 必须在这里而不是 init_database 里——那时还没读到 settings。
+    // 也必须先校验账号合法性：认领只触 NULL 行，一旦用空串之类的非法账号
+    // 认领过，那些行既不会被重新认领、又永远不可能被看见（非法账号无法
+    // 通过 validate_account_id 成为当前账号）。跳过则是安全的：NULL 行原样
+    // 留着，推迟到某个合法账号启动时再认领。
+    //
+    // cmd_save_settings 里也有一次同样的认领（见那边的注释）。两处都做是因为
+    // 这里可能因账号非法而跳过，而用户修正账号的地方正是设置面板——只在启动
+    // 认领的话，他改对之后还得重启一次才能看见老历史。
+    //
+    // 早先这里写着「不在保存路径认领，那会把上一个账号的历史搬过来」——
+    // 那个理由不成立：认领只触 NULL 行，已有归属的行根本搬不动，
+    // claim_is_idempotent_and_does_not_resteal 就是钉这一点的。
+    if commands::settings_cmd::validate_account_id(&initial_settings.account_id).is_ok() {
+        match storage::db::claim_unowned_history(&db, &initial_settings.account_id) {
+            Ok(0) => {}
+            Ok(n) => log::info!("Claimed {} legacy history rows for account {}", n, initial_settings.account_id),
+            Err(e) => log::warn!("Failed to claim legacy history rows: {}", e),
+        }
+    } else {
+        log::warn!("Skipped claiming legacy history: current account id is invalid");
+    }
+
     let config = ConnectionConfig {
         server_url: initial_settings.server_url.clone(),
         account_id: initial_settings.account_id.clone(),
@@ -189,9 +214,13 @@ pub fn run() {
 
                                 // Persist incoming transfer in history
                                 {
+                                    // settings 锁先取先放，不与 db_conn 锁交叠
+                                    let record_account_id = {
+                                        settings_ref.lock().await.account_id.clone()
+                                    };
                                     let state = app_handle.state::<AppState>();
                                     let conn = state.db_conn.lock().await;
-                                    let _ = HistoryRepo::record_task(&conn, &offer.session_id, &env.from_device, "RECEIVE", &offer, "TRANSFERRING");
+                                    let _ = HistoryRepo::record_task(&conn, &record_account_id, &offer.session_id, &env.from_device, "RECEIVE", &offer, "TRANSFERRING");
                                 }
                             }
                         }

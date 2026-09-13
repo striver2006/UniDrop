@@ -82,16 +82,42 @@ describe("历史面板的刷新链路", () => {
     expect(countInvokes("cmd_list_history")).toBe(1);
   });
 
-  it("卸载时两个监听都解绑", async () => {
+  it("卸载时三个监听都解绑", async () => {
     const { unmount } = await renderPanel([]);
     expect(listenerCount("history-pruned")).toBe(1);
     expect(listenerCount("transfer-progress")).toBe(1);
+    expect(listenerCount("account-changed")).toBe(1);
 
     unmount();
 
     await waitFor(() => {
       expect(listenerCount("history-pruned")).toBe(0);
       expect(listenerCount("transfer-progress")).toBe(0);
+      expect(listenerCount("account-changed")).toBe(0);
+    });
+  });
+
+  // 上一轮的 tls-cert-failed 就是「事件发了没人接」，这条防同类问题。
+  // 监听必须落在 HistoryPanel——它才是真正拉 cmd_list_history 的地方；
+  // 放在 App 里看着也通，但 fetchInitialData 根本不拉历史。
+  it("注册了 account-changed 监听", async () => {
+    await renderPanel([]);
+    expect(listenerCount("account-changed")).toBe(1);
+  });
+
+  // 切账号后不重拉，列表会继续显示上一个账号的卡片，
+  // 而卡片上的装载 / 另存为 / 定位三个按钮都会真的去读文件。
+  // 不能指望 history-pruned 代劳：切账号时通常一条都不用修剪，那个事件不会来。
+  it("收到 account-changed 后重新拉取历史", async () => {
+    await renderPanel([entry("s1")]);
+    const before = countInvokes("cmd_list_history");
+
+    await act(async () => {
+      emitEvent("account-changed", undefined);
+    });
+
+    await waitFor(() => {
+      expect(countInvokes("cmd_list_history")).toBeGreaterThan(before);
     });
   });
 });

@@ -38,6 +38,15 @@ pub async fn cmd_inject_files(
     session_id: String,
     paths: Option<Vec<String>>,
 ) -> Result<(), String> {
+    // 第四条会话文件路径，同样要过闸门。
+    //
+    // 它当前没有任何前端调用点，但注册在 invoke_handler 上就等于对外开放：
+    // `paths` 缺省时它回退到 get_session_files(&session_id) 读会话缓存并写剪贴板，
+    // 与 cmd_inject_session 是同一条事故链，只是处于休眠状态。
+    // `paths` 显式给出时也要拦——它仍然用 session_id 打免疫标记，那是在
+    // 改另一个账号的缓存状态。
+    crate::commands::history_cmd::ensure_session_owned(&state, &session_id).await?;
+
     let path_bufs: Vec<PathBuf> = match paths {
         Some(p) if !p.is_empty() => p.into_iter().map(PathBuf::from).collect(),
         _ => state.cache_manager.get_session_files(&session_id).await?,
@@ -250,8 +259,10 @@ async fn dispatch_offer(
     state.outgoing_tx.send(offer_env).await.map_err(|e| e.to_string())?;
 
     {
+        // 账号在这里取而不是更早：settings 锁与 db_conn 锁不要交叠持有。
+        let account_id = { state.settings.lock().await.account_id.clone() };
         let conn = state.db_conn.lock().await;
-        let _ = HistoryRepo::record_task(&conn, &session_id, target_device, "SEND", &offer, "TRANSFERRING");
+        let _ = HistoryRepo::record_task(&conn, &account_id, &session_id, target_device, "SEND", &offer, "TRANSFERRING");
     }
 
     Ok(session_id)
@@ -351,6 +362,10 @@ pub async fn cmd_send_clipboard(state: State<'_, AppState>, target_device: Strin
 /// FILES -> file references, TEXT -> text, IMAGE -> PNG image.
 #[tauri::command]
 pub async fn cmd_inject_session(state: State<'_, AppState>, session_id: String) -> Result<String, String> {
+    // 归属闸门。这条路径直接把文件写进系统剪贴板，是「切账号后误装载上一个
+    // 账号的文件」这条事故链的终点，必须挡在读文件之前。
+    crate::commands::history_cmd::ensure_session_owned(&state, &session_id).await?;
+
     let data_type = {
         let conn = state.db_conn.lock().await;
         HistoryRepo::get_task_brief(&conn, &session_id)

@@ -790,8 +790,33 @@ impl TransferEngine {
                         data_type: offer.data_type.clone(),
                     });
 
+                    // 自动写剪贴板前核一次归属。
+                    //
+                    // 这是第四条会剪贴板的路径，而且是唯一一条**无法**靠
+                    // ensure_session_owned 兜住的：它不是用户点出来的，而是接收
+                    // 任务跑完自己触发的。接收任务在 spawn 时把 settings 快照了
+                    // 下来，保存设置只重连控制面 actor，已在飞的任务会继续跑完——
+                    // 于是用户若在传输途中切了账号，这次传输的内容会落进**新**账号
+                    // 的剪贴板，而历史行归属的是旧账号。
+                    //
+                    // 场景窄（同一个人、恰在传输窗口内切账号），但代价只是一次
+                    // 按主键的查询，而收益是「所有写剪贴板的路径都受账号约束」
+                    // 这句话可以成立。不一致时只发通知、不写剪贴板。
+                    let still_owned = {
+                        let state = app_handle.state::<AppState>();
+                        let current = { state.settings.lock().await.account_id.clone() };
+                        let conn = state.db_conn.lock().await;
+                        crate::storage::HistoryRepo::session_belongs_to(&conn, &session_id, &current)
+                    };
+                    if !still_owned {
+                        log::warn!(
+                            "Skipped auto clipboard injection for session {}: account changed mid-transfer",
+                            session_id
+                        );
+                    }
+
                     match offer.data_type.as_str() {
-                        "TEXT" => {
+                        "TEXT" if still_owned => {
                             // Clipboard text: write directly into the system clipboard
                             if let Some(path) = completed_paths.first() {
                                 if let Ok(bytes) = fs::read(path) {
@@ -809,7 +834,7 @@ impl TransferEngine {
                             let _ = show_transfer_notification(&app_handle, "UniDrop 文本已同步", "已写入系统剪贴板，可直接粘贴");
                             let _ = cache_manager.mark_clipboard_injected(&session_id).await;
                         }
-                        "IMAGE" => {
+                        "IMAGE" if still_owned => {
                             // Clipboard image: write PNG directly into the system clipboard
                             if let Some(path) = completed_paths.first() {
                                 if let Ok(bytes) = fs::read(path) {
@@ -836,7 +861,7 @@ impl TransferEngine {
                             let _ = show_transfer_notification(&app_handle, "UniDrop 文件接收完成", &notification_body);
 
                             // P1-9: Auto inject into clipboard if configured
-                            if auto_inject && !completed_paths.is_empty() {
+                            if auto_inject && still_owned && !completed_paths.is_empty() {
                                 let paths_clone = completed_paths.clone();
                                 tokio::task::spawn_blocking(move || {
                                     crate::platform::inject_files_to_clipboard(&paths_clone)

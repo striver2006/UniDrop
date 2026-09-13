@@ -26,15 +26,20 @@ pub async fn prune_and_notify(app: &AppHandle) {
     let state = app.state::<AppState>();
 
     // 单独取一次 settings 锁并立刻释放，避免与下面的 db_conn 锁交叠持有
-    let limit = {
+    let (limit, account_id) = {
         let settings = state.settings.lock().await;
-        settings.history_max_entries
+        (settings.history_max_entries, settings.account_id.clone())
     };
     if limit == 0 {
         return; // 0 = 不限制
     }
+    // 账号非法时不修剪：带着空账号去查只会命中零行（认领同样会跳过它），
+    // 白跑一趟还不如不跑。
+    if crate::commands::settings_cmd::validate_account_id(&account_id).is_err() {
+        return;
+    }
 
-    match state.cache_manager.prune_history(limit).await {
+    match state.cache_manager.prune_history(&account_id, limit).await {
         Ok(0) => {}
         Ok(pruned) => {
             log::info!("Pruned {} transfer history entries (limit {})", pruned, limit);

@@ -111,11 +111,15 @@ impl CacheManager {
     /// 都以表行为遍历源 ⇒ 永远扫不到它，成为不可回收的磁盘孤儿。
     /// 反向留下的「行在、文件没了」则可自愈：下轮修剪会重试，且另存为/打开位置
     /// 本就处理了文件缺失。
-    pub async fn prune_history(&self, limit: u32) -> Result<usize, String> {
+    /// 注意本函数带账号而紧邻的 `sweep` 不带，这不是疏漏：
+    /// 条数上限是「界面列表保留多少条」，全局语义下一个账号狂传就会把另一个
+    /// 账号的历史挤光；而 `sweep` 管的 TTL 与容量约束的是磁盘——物理共享资源，
+    /// 按账号各分一份配额就是超卖。两者作用域不同是刻意的，别「统一一下」。
+    pub async fn prune_history(&self, account_id: &str, limit: u32) -> Result<usize, String> {
         // 1. 选取段：取完即释放锁
         let candidates = {
             let conn = self.db_conn.lock().await;
-            crate::storage::HistoryRepo::select_prune_candidates(&conn, limit)
+            crate::storage::HistoryRepo::select_prune_candidates(&conn, account_id, limit)
                 .map_err(|e| e.to_string())?
         };
         if candidates.is_empty() {
@@ -166,6 +170,11 @@ impl CacheManager {
     }
 
     /// 按保留策略清理缓存：TTL 淘汰 + 容量配额（LRU），返回删除的条目数。
+    ///
+    /// **刻意不按账号分区**，与 `prune_history` 相反：磁盘是物理共享资源，
+    /// 给 N 个账号各配 10 GB 就是超卖 N 倍，最后谁都写不进去。全局 LRU 下
+    /// 一个账号挤掉的是另一个账号的旧**缓存文件**而非历史行——行会保留并显示
+    /// 「缓存已清理」，与今天单账号下旧文件被淘汰是同一种体验。
     ///
     /// 与 `prune_history` 相同的三段式，**磁盘 IO 段不持 `db_conn` 锁**：
     /// 改造前本函数从取锁起一路持有到函数尾，`fs::remove_file` 循环就在锁内；
@@ -387,7 +396,7 @@ mod tests {
 
     async fn seed_completed(db: &Arc<Mutex<Connection>>, session_id: &str, file_path: &Path) {
         let conn = db.lock().await;
-        HistoryRepo::record_task(&conn, session_id, "peer", "RECEIVE", &sample_offer(session_id), "TRANSFERRING")
+        HistoryRepo::record_task(&conn, "acct", session_id, "peer", "RECEIVE", &sample_offer(session_id), "TRANSFERRING")
             .unwrap();
         HistoryRepo::update_task_status(&conn, session_id, "COMPLETED", None).unwrap();
         conn.execute(
@@ -428,7 +437,7 @@ mod tests {
         // 保留窗口 0 条之外的都算候选，但 limit 必须 > 0（0 表示不限制）
         seed_completed(&db, "s_keep", &tmp.path().join("keep.bin")).await;
 
-        let pruned = mgr.prune_history(1).await.unwrap();
+        let pruned = mgr.prune_history("acct", 1).await.unwrap();
 
         assert_eq!(pruned, 1, "只应删掉文件真正清理成功的那一个会话");
         assert!(task_exists(&db, "s_bad").await, "文件删除失败的会话必须保留行以便下轮重试");
@@ -461,13 +470,13 @@ mod tests {
         // 未装载时它确实是待删候选——先确认这一点，否则下面的断言可能是空过
         {
             let conn = db.lock().await;
-            let candidates = HistoryRepo::select_prune_candidates(&conn, 1).unwrap();
+            let candidates = HistoryRepo::select_prune_candidates(&conn, "acct", 1).unwrap();
             assert_eq!(candidates.len(), 1, "s_old 本应是待删候选");
             assert_eq!(candidates[0].session_id, "s_old");
         }
 
         mgr.mark_clipboard_injected("s_old").await.unwrap();
-        let pruned = mgr.prune_history(1).await.unwrap();
+        let pruned = mgr.prune_history("acct", 1).await.unwrap();
 
         assert_eq!(pruned, 0, "已装载进剪贴板的会话不应被删");
         assert!(task_exists(&db, "s_old").await, "刚被用户装载的历史条目不能消失");
@@ -656,7 +665,7 @@ mod tests {
         let tmp = TempDir::new();
         let (mgr, db) = manager_with_memory_db();
         seed_completed(&db, "s1", &tmp.path().join("a.bin")).await;
-        assert_eq!(mgr.prune_history(0).await.unwrap(), 0);
+        assert_eq!(mgr.prune_history("acct", 0).await.unwrap(), 0);
         assert!(task_exists(&db, "s1").await);
     }
 }

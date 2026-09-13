@@ -183,11 +183,13 @@ pub async fn cmd_save_settings(
         crate::storage::db::save_persisted_settings(&conn, &json_str).map_err(|e| e.to_string())?;
     }
 
-    // 1. Update in-memory settings
-    {
+    // 1. Update in-memory settings，顺带记下账号是否真的变了
+    let account_changed = {
         let mut s = state.settings.lock().await;
+        let changed = s.account_id != clean_settings.account_id;
         *s = clean_settings.clone();
-    }
+        changed
+    };
 
     // 2. Update dynamic actor config
     {
@@ -209,7 +211,37 @@ pub async fn cmd_save_settings(
     state.reconnect_notify.notify_waiters();
     log::info!("Settings saved and reconnected immediately with new config");
 
-    // 5. 立刻按新上限修剪历史：用户把条数调小后必须当场见效，
+    // 5. 认领无归属的历史行。
+    //
+    //    与启动时那次是同一个动作，这里再做一次是为了覆盖「首次启动时账号
+    //    非法、认领被跳过」的情形：用户改正账号的地方就是这个面板，若只在
+    //    启动认领，他改对之后还得重启一次才能看见老历史。
+    //
+    //    不会把上一个账号的历史搬过来——认领只触 account_id IS NULL 的行，
+    //    已有归属的行动不了（claim_is_idempotent_and_does_not_resteal 钉住了
+    //    这一点）。账号到这里必然合法：函数开头已经 validate 过并提前返回。
+    {
+        let conn = state.db_conn.lock().await;
+        match crate::storage::db::claim_unowned_history(&conn, &clean_settings.account_id) {
+            Ok(0) => {}
+            Ok(n) => log::info!("Claimed {} unowned history rows for account {}", n, clean_settings.account_id),
+            Err(e) => log::warn!("Failed to claim unowned history rows: {}", e),
+        }
+    }
+
+    // 6. 账号变了就让界面重拉历史。
+    //
+    //    不能指望 `history-pruned` 代劳：那是「修剪删掉了东西」的语义，而切账号
+    //    时很可能一条都不用删（prune_and_notify 在 Ok(0) 时本就不广播）。
+    //    缺了这条事件，历史面板会继续显示上一个账号的卡片——而那些卡片上的
+    //    按钮是真的能点的，装载 / 另存为 / 定位三条路径都直接读文件。
+    //    后端已有归属闸门兜底（见 history_cmd::ensure_session_owned），
+    //    但让用户点到一个必然报错的按钮本身就是缺陷。
+    if account_changed {
+        let _ = app.emit("account-changed", ());
+    }
+
+    // 7. 立刻按新上限修剪历史：用户把条数调小后必须当场见效，
     //    否则要等到下次传输才生效，看起来就像设置没保存。
     //    此处已在上面各锁的作用域之外，取 db_conn 锁是安全的。
     crate::core::history_pruner::prune_and_notify(&app).await;

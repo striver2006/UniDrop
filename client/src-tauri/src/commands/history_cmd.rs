@@ -16,8 +16,24 @@ const HISTORY_DISPLAY_CAP: u32 = 200;
 
 #[tauri::command]
 pub async fn cmd_list_history(state: State<'_, AppState>) -> Result<Vec<TransferHistoryEntry>, String> {
+    let account_id = { state.settings.lock().await.account_id.clone() };
     let conn = state.db_conn.lock().await;
-    HistoryRepo::list_history(&conn, HISTORY_DISPLAY_CAP).map_err(|e| e.to_string())
+    HistoryRepo::list_history(&conn, &account_id, HISTORY_DISPLAY_CAP).map_err(|e| e.to_string())
+}
+
+/// 三个直接操作会话文件的 IPC 命令共用的归属闸门。
+///
+/// 见 `HistoryRepo::session_belongs_to` 的注释：过滤列表只保证「看不见」，
+/// 挡不住「点得动」。切账号后界面若还残留着旧账号的卡片，用户点下去就会
+/// 真的读到另一个账号的文件。
+pub(crate) async fn ensure_session_owned(state: &State<'_, AppState>, session_id: &str) -> Result<(), String> {
+    let account_id = { state.settings.lock().await.account_id.clone() };
+    let conn = state.db_conn.lock().await;
+    if HistoryRepo::session_belongs_to(&conn, session_id, &account_id) {
+        Ok(())
+    } else {
+        Err("该记录不属于当前账号".to_string())
+    }
 }
 
 /// Opens a native folder picker and copies all cached files of a session into it.
@@ -28,6 +44,7 @@ pub async fn cmd_save_transfer_as(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<Option<u32>, String> {
+    ensure_session_owned(&state, &session_id).await?;
     let files = state.cache_manager.get_session_files(&session_id).await?;
     if files.is_empty() {
         return Err("该会话在缓存中无文件（可能已被清理）".into());
@@ -92,6 +109,7 @@ pub async fn cmd_save_transfer_as(
 /// Reveals the first cached file of a session in the platform file manager.
 #[tauri::command]
 pub async fn cmd_reveal_session(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    ensure_session_owned(&state, &session_id).await?;
     let files = state.cache_manager.get_session_files(&session_id).await?;
     let target = files.first().ok_or("该会话在缓存中无文件（可能已被清理）")?;
 
@@ -110,5 +128,49 @@ pub async fn cmd_reveal_session(state: State<'_, AppState>, session_id: String) 
     match result {
         Ok(_) => Ok(()),
         Err(e) => Err(format!("打开文件位置失败: {}", e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// 归属闸门的**接线**守卫。
+    ///
+    /// 闸门本身（`HistoryRepo::session_belongs_to`）在 repo 层有充分的单测，
+    /// 但那测的是判断逻辑；「四个动文件的命令各自真的调了它」这件事，
+    /// 在删掉任意一处调用后不会让任何既有测试变红——而「点得动」这条防线
+    /// 恰恰完全依赖那几处调用在位。
+    ///
+    /// `State<'_, AppState>` 在单测里构造不出来（需要完整的 Tauri 运行时），
+    /// 所以这里退而求其次做源码级断言。它确实脆弱——改个变量名就会红——
+    /// 但对「接线」这类东西，脆弱正是想要的：任何触碰都该让人重新确认一遍
+    /// 闸门还在。若将来重构使断言失效，**先确认闸门仍在再改断言**，
+    /// 不要反过来。
+    #[test]
+    fn every_session_file_command_keeps_the_ownership_gate() {
+        let history = include_str!("history_cmd.rs");
+        let clipboard = include_str!("clipboard_cmd.rs");
+
+        // 按函数切片，逐个确认闸门在自己的函数体内，而不是只数总数——
+        // 总数对得上但集中在一个函数里的话，守卫就形同虚设。
+        for (src, fn_name) in [
+            (history, "pub async fn cmd_save_transfer_as"),
+            (history, "pub async fn cmd_reveal_session"),
+            (clipboard, "pub async fn cmd_inject_files"),
+            (clipboard, "pub async fn cmd_inject_session"),
+        ] {
+            let start = src
+                .find(fn_name)
+                .unwrap_or_else(|| panic!("找不到命令 {fn_name}，它是否被改名或删除？"));
+            let rest = &src[start + fn_name.len()..];
+            // 到下一个 #[tauri::command] 为止就是本函数的范围
+            let end = rest.find("#[tauri::command]").unwrap_or(rest.len());
+            let body = &rest[..end];
+
+            assert!(
+                body.contains("ensure_session_owned"),
+                "{fn_name} 缺少归属闸门 ensure_session_owned —— \
+                 它会读取该会话的缓存文件，切账号后可能读到另一个账号的内容"
+            );
+        }
     }
 }
