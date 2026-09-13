@@ -322,7 +322,7 @@ enum ActionType {
 | `28..31` | `TotalChunks`| `uint32` | 当前文件的总切片数（单切片或短文本固定为 1）。 |
 | `32..35` | `PayloadLen` | `uint32` | 载荷字节长度。ACK/NACK 帧为 0；DATA 帧必须 $\le 4,194,304$ (4MB)。超过 4MB 即视为滥用攻击，服务端立刻掐线。 |
 | `36..39` | `Checksum` | `uint32` | Payload 原始字节流的 CRC32-IEEE 校验和（**注：用于快速信道检错，非密码学防篡改**）。ACK/NACK 填 0。 |
-| `40..51` | `Nonce` | `[12]byte` | 充足容纳 AES-256-GCM 标准 96 位 Nonce；未启用 E2EE 时全填 `0x00`。 |
+| `40..51` | `Nonce` | `[12]byte` | AES-256-GCM 的 96 位 Nonce；未启用 E2EE 时全填 `0x00`。v1 填 `ItemIndex‖ChunkIndex‖域分隔`，但**接收端自行重算而不读此字段**（见 6.0），填写仅为抓包可读。 |
 | `52..55` | `Flags` | `uint32` | 位标记掩码：<br>• Bit 0: `IS_ENCRYPTED` (是否启用 E2EE)<br>• Bit 1: `IS_COMPRESSED` (预留压缩标记)<br>• Bit 2: `IS_LAST_CHUNK` (当前文件最后一个分片) |
 | `56..63` | `Reserved` | `[8]byte` | 保留填充对齐字节，必须全置为 `0x00`。 |
 | `64..` | `Payload` | `[]byte` | 实际数据或密文载荷。 |
@@ -618,7 +618,7 @@ func (p *RelayPipe) Push(data *[]byte, timeout time.Duration) error {
   * `unidrop_relay_bytes_total{direction}`：流式中转吞吐累计字节数。
   * `unidrop_active_relay_pipes`：当前活跃数据管道数。
   * `unidrop_chunk_retransmit_total{reason}`：分片重传累计次数（区分 timeout 或 nack）。
-  * `unidrop_e2ee_sessions_total`：端到端加密传输会话数。
+  * `unidrop_e2ee_sessions_total`：端到端加密传输会话数。**尚未实现**——v1 的加密完全在客户端，服务端不解密也不感知 `encrypted` 标志，要出这个指标得让中继去读 OFFER 载荷。
 * 全量信令日志均携带 `trace_id` 字段，采用 Go 官方 `log/slog` 输出结构化 JSON 日志。
 
 ---
@@ -1070,6 +1070,31 @@ CREATE TABLE IF NOT EXISTS cache_entries (
 ## 6. 端到端加密 (E2EE) 深度设计
 
 针对评审 P0-2、P1-10 指出的“纯临时 DH 易受中间人攻击”、“未绑定 AAD 导致重排重放”以及“明文元数据泄露”三大硬伤，本节给出具有密码学强度的完备设计。
+
+### 6.0 当前实现状态（v1，2026-09-14）
+
+**本节 6.1 / 6.2 描述的是目标设计，与已落地的 v1 实现有实质差异，请勿照本节阅读代码。**
+v1 走的是「复用既有 PSK」的简化路线：密钥分发这一 E2EE 最昂贵的环节，
+在本项目里已由用户手动在每台设备填写同一把 PSK 解决，因此 v1 不引入配对流程。
+
+| 维度 | 本节设计 | v1 实现 | 差异理由 |
+| :--- | :--- | :--- | :--- |
+| 密钥来源 | Ed25519/X25519 设备长期密钥 + 配对 | `HKDF-SHA256(psk, salt=session_id, info="UNIDROP-E2EE-v1"‖account_id)` | 无需配对 UX；代价是**没有前向保密、设备间不隔离**（同 PSK 即组密钥） |
+| 防 MITM | 长期身份签名，中继无法伪造 | 依赖 PSK 保密性；协商信息经服务器，**恶意服务端可强制降级为明文**（界面会提示） | v1 是机会性加密，不是抗主动攻击的保证 |
+| AAD | `SessionID‖ItemIndex‖ChunkIndex‖TotalChunks‖Flags` | **`Aad::empty()`** | `ItemIndex`/`ChunkIndex` 已通过 nonce 参与认证（改动即 nonce 不匹配、tag 失败）；`TotalChunks`/`Flags` 的篡改由上层兜住。非空 AAD 会新增一处两端必须逐字节一致的约定，而失败形态是「本该能解密的数据解不开」 |
+| Nonce | 前 4B 随机盐 + 后 8B 计数器 | `ItemIndex(4B)‖ChunkIndex(4B)‖域分隔(4B)` | 随机盐要靠握手协商传递，而 v1 没有握手；改用确定性构造让**接收端可自行重算**，不必信任帧头里的 nonce。唯一性由「每次传输现铸 session_id ⇒ 每次一把新 key」保证 |
+| 元数据 | 见 6.3 | 已实现：文件名 / sha256 / 预览摘要加密进 `encrypted_metadata` | 与 6.3 一致；但 `total_size` / `data_type` / 每项 `size` 必须留明文供服务端限额检查 |
+
+v1 另有两处实现约束值得记在设计层面：
+
+* **明文块长必须是 `MAX_PAYLOAD_LENGTH - 16`**。GCM 密文比明文长 16 字节，
+  按 4MB 满块加密会得到 4MB+16，中继 `DecodeBinaryHeader` 当场 `ErrPayloadTooLarge`
+  断连，而客户端只能看到「连接被关」。
+* **CRC32 改算在密文上**。算在明文上等于把明文的 32 位指纹写进对中继完全可见的
+  帧头，短内容（剪贴板文本）可被枚举确认。算密文还保留了「解密前就能拒绝坏块」。
+
+升级到本节完整设计时，`paired_devices` 表按 schema 注记重建，
+HKDF 的 `info` 前缀改版本号即可与 v1 的密钥域分隔。
 
 ### 6.1 基于设备长期身份密钥的认证密钥协商 (Noise-based AKE)
 彻底消除中间人（MITM）攻击风险：
