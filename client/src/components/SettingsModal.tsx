@@ -161,8 +161,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 z-50">
-      <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-sm p-5 shadow-2xl">
-        <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+      <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-sm max-h-full flex flex-col shadow-2xl">
+        <div className="flex items-center justify-between px-5 pt-5 pb-3 border-b border-slate-800 shrink-0">
           <div className="flex items-center space-x-2">
             <Shield className="w-5 h-5 text-teal-400" />
             <h3 className="font-semibold text-slate-100">连接与安全偏好</h3>
@@ -172,7 +172,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
           </button>
         </div>
 
-        <form onSubmit={handleSubmit} className="mt-4 space-y-3.5 text-xs">
+        <form onSubmit={handleSubmit} className="flex flex-col min-h-0 flex-1 text-xs">
+          {/* 字段区独立滚动：窗口固定 380x560 且不可缩放，设置项一多就会把
+              底部按钮顶出可视区，导致弹窗既看不全也关不掉。 */}
+          <div className="flex-1 overflow-y-auto px-5 pt-4 space-y-3.5">
           <div>
             <label className="block text-slate-400 mb-1">公网中继服务器地址 (WSS/WS)</label>
             <input
@@ -303,6 +306,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
             )}
           </div>
 
+          </div>
+
+          <div className="shrink-0 px-5 py-4 border-t border-slate-800 space-y-3">
           {error && (
             <div className="flex items-start space-x-1.5 text-[11px] text-rose-400">
               <AlertCircle className="w-3.5 h-3.5 mt-px shrink-0" />
@@ -310,7 +316,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
             </div>
           )}
 
-          <div className="pt-3 flex space-x-2">
+          <div className="flex space-x-2">
             <button
               type="button"
               onClick={onClose}
@@ -326,6 +332,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
               <Save className="w-4 h-4" />
               <span>{saving ? "保存中..." : "保存配置"}</span>
             </button>
+          </div>
           </div>
         </form>
       </div>
