@@ -1,0 +1,124 @@
+---
+schema: trivium.review.v1
+topic: local-store-account-scope
+stage: code
+role: gemini
+vendor: antigravity
+agent_cli: agy/1.2.2
+model_requested: gemini-3.8-flash-high
+model_effective: gemini-3.8-flash-high
+model_effective_source: envelope
+effort: high
+run_id: 20260913T111246Z
+rerun_index: 1
+snapshot_hash: sha256:1ccd44c58415b4e8be5a49cd9bd4e0a0bcd86776b0617d40a8589d7f82e32fd1
+blind: true
+started_at: 2026-09-13T11:12:47.844Z
+finished_at: 2026-09-13T11:28:51.608Z
+duration_s: 158
+tool_calls:
+  read: 29
+  grep: 8
+  glob: 0
+  run_command: 0
+  project_reads: 19
+evidence_ok: true
+verdict: request-changes
+findings_count:
+  blocker: 0
+  major: 1
+  minor: 1
+  nit: 0
+degraded: false
+parse_fallback: false
+peer_deny: false
+drift: false
+heterogeneous: true
+session_id: 2753fa6d-8709-46a2-9897-26f69552b9c8
+---
+
+# 代码审查：local-store-account-scope
+
+> Critic-A · Google Antigravity ｜ 模型 `gemini-3.8-flash-high`
+> ｜ 运行 `20260913T111246Z`
+
+> ⚠️ **路径级 deny 未生效**：本机该侧 CLI 不支持路径级读取拒绝，对方历史产出的屏蔽仅依赖任务书禁读清单与事后轨迹核验。
+
+## 总判断
+
+本次变更在 SQLite 存储层按账号分区设计精良，select_prune_candidates 的两处过滤及 ensure_session_owned 归属闸门扎实可靠。但前端防线存在明显漏洞：前端重拉只覆盖了 HistoryPanel，完全遗漏了 App.tsx 主界面的 TransferProgress 活跃传输列表，导致切账号后旧账号文件卡片滞留且其装载按钮可点击并必然红字报错。此外，存量历史认领由于对 SQL 语义的误判，未在保存配置时补认领，导致非法账号升级用户修改配置后必须重启客户端才能看到老历史。建议修复 App.tsx 的卡片清理后再行合并。
+
+**结论**：`request-changes`
+
+## 审查意见（共 2 条：重要 1 ｜ 次要 1）
+
+### AGY-01 · 重要（major）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `client/src/App.tsx:127-223` |
+| 类别 | correctness ｜ 层次 code |
+| 置信度 | high |
+
+**问题**：切账号后前端重拉仅覆盖了 HistoryPanel，遗漏了主界面的活跃/完成传输卡片列表（TransferProgress）。旧账号刚完成或失败的卡片继续悬挂在新账号界面中央，其上的【装载到剪贴板】按钮依然可点，点击后必然被后端归属闸门拦截并弹出红字报错；且旧账号传输的文件名与摘要直接泄露，若配置了保留时间为 0 或属于失败卡片则永久滞留。
+
+**依据**：读 client/src/App.tsx:37-239 可知，全局活跃传输 transfers 状态仅响应 transfer-progress 事件和手动点 X，App 组件既未监听 account-changed 事件，也未在 handleSaveSettings 中清空 transfers 与 dismissTimersRef；读 client/src/components/TransferProgress.tsx:104-132 可知，完成态的卡片会渲染明显的【装载到剪贴板】按钮，点击即发起 cmd_inject_session；对比 client/src-tauri/src/commands/settings_cmd.rs:215-224 的注释，开发者已明确指出残留卡片上点得动的装载按钮必然报错且是缺陷，但前端重拉机制却遗漏了主界面的 TransferProgress。
+
+**建议**：在 App.tsx 中监听 account-changed 事件（以及在 handleSaveSettings 切换账号成功时），重置清空 transfers 状态数组并清空注销 dismissTimersRef 中的所有自动消失定时器。
+
+### AGY-02 · 次要（minor）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `client/src-tauri/src/lib.rs:76-78` |
+| 类别 | maintainability ｜ 层次 code |
+| 置信度 | high |
+
+**问题**：存量历史认领在 cmd_save_settings 路径上的缺位源于对 SQL 行为的错误假设。注释误认为在保存设置时认领会把前一账号的历史搬走，但实际上认领只作用于 NULL 行。该限制导致从旧版升级后首次启动时若账号非法（启动期跳过认领），用户在设置界面更正并保存合法账号后，存量历史依然无法恢复（依然是 NULL，列表查不到且归属闸门报错），必须完全重启客户端才能完成认领。
+
+**依据**：读 client/src-tauri/src/storage/db.rs:126-131（claim_unowned_history 的 SQL 明确带有 WHERE account_id IS NULL 条件）以及 client/src-tauri/src/storage/history_repo.rs:627-639（单元测试 claim_is_idempotent_and_does_not_resteal 证实已有归属行绝不会被盗走）；对比 client/src-tauri/src/lib.rs:76-78 注释中声称“刻意不在 cmd_save_settings 的切账号路径上做同样的事：那会把上一个账号的历史搬到新账号名下”，该断言在逻辑与 SQL 语义上均不成立；读 client/src-tauri/src/commands/settings_cmd.rs:186-232 证实确实没有任何认领调用。
+
+**建议**：在 cmd_save_settings 保存合法账号后补充调用 claim_unowned_history，使用户在设置面板修正合法账号后当场完成对老数据的认领，无需强制重启应用；同时修正 lib.rs 中与 SQL 语义矛盾的注释说明。
+
+## 认为正确的部分
+
+- select_prune_candidates 的两处过滤（外层 WHERE 与 NOT IN 保留窗口子查询）均严格按 account_id 过滤，且排序键与 list_history 逐字一致，完美避免了跨账号新任务挤占保留窗口导致本账号该留记录被误删的反直觉缺陷，单元测试覆盖十分扎实。
+- ensure_session_owned 归属闸门在后端拦截层面设计严密，覆盖了装载剪贴板（cmd_inject_session）、另存为（cmd_save_transfer_as）和定位文件（cmd_reveal_session）三处全部动文件的 IPC 命令，死死守住了绝不越权读文件的安全底线。
+- 磁盘缓存清理（sweep）与历史记录修剪（prune_history）的作用域区分权衡合理，容量配额与 TTL 全局化避免了物理共享磁盘配额超卖，设计自洽。
+- 启动期 reset_stale_in_flight 保持全局复位，保证了前一个账号异常退出留下的在途死行能被正确转换为 FAILED，不会永久霸占保留配额。
+
+## 未覆盖范围（本侧盲区）
+
+- 真实多端操作系统（Windows / macOS / Linux）本地文件系统 IO 权限及文件管理器唤起行为（cmd_reveal_session）的运行时兼容性实测。
+- SQLite 在单表历史数据量极端膨胀（数万条以上）时无复合索引对查询与修剪造成的微秒级耗时影响。
+- 在途大文件传输中途强制保存设置并发重连时，底座网络层连接关闭与 tokio task 终止的极端竞态测试。
+
+## 实际查阅的项目文件
+
+- `CLAUDE.md`
+- `AGENTS.md`
+- `README.md`
+- `docs/USER_GUIDE.md`
+- `docs/需求.md`
+- `.reviews/local-store-account-scope/code/_meta/changes-20260913T111246Z.diff`
+- `client/src-tauri/src/storage/db.rs`
+- `client/src-tauri/src/storage/history_repo.rs`
+- `client/src-tauri/src/core/cache_manager.rs`
+- `client/src-tauri/src/core/history_pruner.rs`
+- `client/src-tauri/src/core/connection_actor.rs`
+- `client/src-tauri/src/core/transfer_engine.rs`
+- `client/src-tauri/src/commands/history_cmd.rs`
+- `client/src-tauri/src/commands/clipboard_cmd.rs`
+- `client/src-tauri/src/commands/settings_cmd.rs`
+- `client/src-tauri/src/lib.rs`
+- `client/src/App.tsx`
+- `client/src/components/HistoryPanel.tsx`
+- `client/src/components/HistoryPanel.test.tsx`
+- `client/src/components/TransferProgress.tsx`
+
+> 编排器从工具轨迹中记录到的读取次数：{"read":29,"grep":8,"glob":0,"run_command":0,"project_reads":19}
+
+---
+
+*本文档由 TriviumCode 编排器从 `gemini` 侧的结构化输出渲染而成。
+审查员无写仓库权限，全部落盘由编排器完成。*

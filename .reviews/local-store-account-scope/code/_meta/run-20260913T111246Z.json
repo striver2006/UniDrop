@@ -1,0 +1,155 @@
+{
+  "schema": "trivium.run.v1",
+  "run_id": "20260913T111246Z",
+  "topic": "local-store-account-scope",
+  "stage": "code",
+  "rerun_index": 1,
+  "command": "trivium review --start --stage code",
+  "prompt_hint": "重点看两处过滤是否都到位、归属闸门与前端重拉是否真能堵住误装载，以及认领的边界",
+  "task_goal": "本地历史与缓存按账号分区 — 计划",
+  "entry": "C",
+  "snapshot": {
+    "git_head": "69b997596d511e794f677cb7cc615c4ac6bbb027",
+    "tree_hash": "f5405b7e1fa20dd2530dc6d440a25fd313a9a120",
+    "dirty": true,
+    "subject_sha256": "1ccd44c58415b4e8be5a49cd9bd4e0a0bcd86776b0617d40a8589d7f82e32fd1",
+    "drift": {
+      "changed": false,
+      "files": [],
+      "policy": "warn"
+    }
+  },
+  "started_at": "2026-09-13T11:12:47.725Z",
+  "finished_at": "2026-09-13T11:28:51.608Z",
+  "review_mode": "dual",
+  "degraded_reason": null,
+  "critics": {
+    "gemini": {
+      "vendor": "antigravity",
+      "cli_version": "1.2.2",
+      "model_requested": "gemini-3.8-flash-high",
+      "model_effective": "gemini-3.8-flash-high",
+      "model_effective_source": "envelope",
+      "effort": "high",
+      "status": "ok",
+      "exit_code": 0,
+      "duration_s": 158.197,
+      "tool_calls": {
+        "read": 29,
+        "grep": 8,
+        "glob": 0,
+        "run_command": 0,
+        "project_reads": 19
+      },
+      "evidence_ok": true,
+      "usage": {
+        "input_tokens": 330877,
+        "output_tokens": 35711,
+        "thinking_tokens": 31219,
+        "cache_read_tokens": 3071278,
+        "total_tokens": 366588
+      },
+      "heterogeneous": true,
+      "fail_reason": null,
+      "empty_review": false,
+      "parse_fallback": false,
+      "session_id": "2753fa6d-8709-46a2-9897-26f69552b9c8",
+      "peer_deny_applied": false
+    },
+    "glm": {
+      "vendor": "zcode",
+      "cli_version": "0.16.5",
+      "model_requested": "GLM-5.3-Flash",
+      "model_effective": "bigmodel-coding-plan/GLM-5.3-Flash",
+      "model_effective_source": "trace",
+      "model_route": "config_copy",
+      "status": "ok",
+      "exit_code": 0,
+      "duration_s": 963.742,
+      "tool_calls": {
+        "read": 17,
+        "grep": 3,
+        "glob": 0,
+        "run_command": 0,
+        "project_reads": 18
+      },
+      "evidence_ok": true,
+      "usage": {
+        "source": "provider",
+        "modelRequestCount": 12,
+        "inputTokens": 1024065,
+        "outputTokens": 30358,
+        "totalTokens": 1054423,
+        "cacheReadTokens": 907904,
+        "cacheWriteTokens": 0,
+        "reasoningTokens": 0,
+        "webFetchRequests": 0,
+        "webSearchRequests": 0
+      },
+      "heterogeneous": true,
+      "fail_reason": null,
+      "empty_review": false,
+      "parse_fallback": false,
+      "session_id": "sess_f2b7788a-c6c2-438c-9709-49fdbf80f575",
+      "peer_deny_applied": false
+    }
+  },
+  "deny_paths": [
+    ".reviews/autostart-single-instance/code/2026-09-13-autostart-single-instance-glm.md",
+    ".reviews/autostart-single-instance/plan/2026-09-13-autostart-single-instance-glm.md",
+    ".reviews/cache-cleanup-configurable/code/2026-09-13-cache-cleanup-configurable-glm.md",
+    ".reviews/cache-cleanup-configurable/plan/2026-09-13-cache-cleanup-configurable-glm.md",
+    ".reviews/history-retention-autodismiss/code/2026-09-13-history-retention-autodismiss-glm.md",
+    ".reviews/history-retention-autodismiss/plan/2026-09-13-history-retention-autodismiss-glm.md",
+    ".reviews/local-store-account-scope/plan/2026-09-13-local-store-account-scope-glm.md",
+    ".reviews/multi-account-hardening/code/2026-09-13-multi-account-hardening-glm.md",
+    ".reviews/multi-account-hardening/plan/2026-09-13-multi-account-hardening-glm.md",
+    ".reviews/server-transfer-limits/code/2026-09-13-server-transfer-limits-glm.md",
+    ".reviews/server-transfer-limits/plan/2026-09-13-server-transfer-limits-glm.md"
+  ],
+  "guard": {
+    "readonly_breach": false,
+    "peer_artifact_read": false,
+    "peer_deny_applied": {
+      "gemini": false,
+      "glm": false
+    },
+    "forged_role_file": false,
+    "breached_files": []
+  },
+  "artifacts": [
+    {
+      "path": "local-store-account-scope/code/_meta/changes-20260913T111246Z.diff",
+      "sha256": "1ccd44c58415b4e8be5a49cd9bd4e0a0bcd86776b0617d40a8589d7f82e32fd1"
+    },
+    {
+      "path": "local-store-account-scope/code/_meta/brief-gemini-20260913T111246Z.md",
+      "sha256": "806c31144de571f2c39dc3fc517e11c5abf2137f1650451efee85b1472f3b6f2"
+    },
+    {
+      "path": "local-store-account-scope/code/_meta/brief-glm-20260913T111246Z.md",
+      "sha256": "38df6e141cfd31b864630344310bdd9780def7a9d38e4653276dfbe1d2d554e3"
+    },
+    {
+      "path": "local-store-account-scope/code/_meta/review-gemini-20260913T111246Z.json",
+      "sha256": "e73f5198d726b36d43dd09f48150771ade0c518cb611e0c7842e673e1303cfd1"
+    },
+    {
+      "path": "local-store-account-scope/code/_meta/review-glm-20260913T111246Z.json",
+      "sha256": "cb8466c99d24d6babae99fe8bdee19465f748eab32b41366e1f491d0dc59f989"
+    },
+    {
+      "path": "local-store-account-scope/code/2026-09-13-local-store-account-scope-gemini.md",
+      "sha256": "3be8c08050cf7ef86b6c567eb7d2ba72f421195746d5469694b3f1f999fbf670"
+    },
+    {
+      "path": "local-store-account-scope/code/2026-09-13-local-store-account-scope-glm.md",
+      "sha256": "5887820eec2270fc2c375ca225c59385384d9ea9fba0121c8872be7d28774b0e"
+    }
+  ],
+  "gate": {
+    "adjudication_complete": false,
+    "state": "review_done_awaiting_disposition"
+  },
+  "status": "success"
+}

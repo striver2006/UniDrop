@@ -1,0 +1,116 @@
+{
+  "schema": "trivium.review.v1",
+  "verdict": "request-changes",
+  "summary": "方向正确：三条保留策略的作用域划分（history_max_entries 每账号、cache 容量/TTL 全局）经源码核实成立，认领时机的主线（只在启动后认领 NULL 行、切账号不认领）也能避免搬走旧历史。最危险的一条是认领对空/非法 account_id 无防护：老库可带空账号原样载入且空账号无法再被选回，误认领后存量历史在应用内永久不可见（GLM-01）。其次是 §2.2 对 select_prune_candidates 账号化的描述指错了子查询且低估了改动——保留窗口 NOT IN 子查询需要第二处独立过滤，照字面实现会静默误删本账号应保留的行，且所列测试测不出（GLM-02）。另有 §4.8 点名了不存在 record_task 调用的文件、一处 TLS 文档断言与代码路径对不上待复核，以及两个 nit。",
+  "findings": [
+    {
+      "id": "GLM-01",
+      "severity": "major",
+      "layer": "plan",
+      "kind": "correctness",
+      "location": "plan §3 / §4.3（迁移认领）",
+      "problem": "认领（UPDATE transfer_tasks SET account_id = ? WHERE account_id IS NULL）在启动时无条件用 initial_settings.account_id 执行，但该值可能是空串或与真实账号无关的名字：老库 settings JSON 带空 account_id 会被原样载入（settings_cmd.rs 的测试 legacy_settings_json_with_invalid_account_id_still_deserializes 明确钉死「非法账号仍能反序列化」）；settings 解析失败时 lib.rs:54-59 回落 default_config()，账号变成 default_user。由于认领的幂等性建立在 WHERE account_id IS NULL 上，行一旦被空串/default_user 认领就永远不会再被认领，而 validate_account_id 又使空账号永远无法成为当前账号——存量历史在应用内永久不可见，只能手工改库恢复。需求.md:88 证实空账号真实存在过（「此前空账号会形成一个所有忘了填的客户端共享的公共桶」）。",
+      "evidence": "读 client/src-tauri/src/lib.rs:53-66（initial_settings 的两条异常来源）、client/src-tauri/src/commands/settings_cmd.rs:129-139 与测试 legacy_settings_json_with_invalid_account_id_still_deserializes（空账号可载入、校验只在保存时）、docs/需求.md:88（空账号曾真实存在）、plan §3/§4.3（认领无任何合法性判断）。",
+      "suggestion": "认领前先过 validate_account_id，非法（含空）则本次跳过——NULL 行保留，推迟到某个合法账号的启动再认领，认领的 NULL-幂等性使推迟天然安全；record_task 的账号入参采用同一防御。认领模糊性的文档说明（§3 已承诺）中补上这条边界。",
+      "confidence": "high"
+    },
+    {
+      "id": "GLM-02",
+      "severity": "major",
+      "layer": "plan",
+      "kind": "correctness",
+      "location": "plan §2.2 / §4.4（select_prune_candidates 的账号化改写）",
+      "problem": "§2.2 把代价描述为「cache_entries 子查询要经 transfer_tasks 关联才能知道账号，该查询已经是关联形态，加一个 t.account_id = ? 条件即可」——这不成立且漏了真正的要点：NOT EXISTS 免疫子查询（history_repo.rs:209-214）本来就以 c.session_id = t.session_id 与外层关联，外层 WHERE 加一个条件即覆盖，无需任何关联改写；而每账号语义的承载点是「保留窗口」子查询 t.session_id NOT IN (SELECT session_id FROM transfer_tasks ORDER BY created_at DESC, rowid DESC LIMIT ?1)（history_repo.rs:215-219），它直接扫 transfer_tasks，必须加自己的 WHERE account_id = ? 才是「每账号前 N 条」。若照计划字面只在外层加一个条件，保留窗口仍是全局的：账号 B 的行占掉窗口名额后，A 的修剪会误删 A 自己最新 N 条之内的行——静默过度删除，且恰好违反 history_repo.rs:503-521 注释与测试所守护的「候选集与可见前 N 条不得相交」不变量。§5 所列的 prune_counts_per_account_not_globally 与 prune_never_touches_other_account_rows 按其命名与守护描述都测不出这个缺陷：外层单过滤的失败形态是「删掉 A 自己应保留的行」而非「删到 B 的行」，且分歧只在两账号行的时间交错时出现（B 的行全部更旧或更新时两种实现结果相同）。",
+      "evidence": "读 client/src-tauri/src/storage/history_repo.rs:205-243（select_prune_candidates 完整 SQL：外层、NOT EXISTS 免疫子查询、NOT IN 保留窗口子查询三段结构）与 :503-521（可见头/候选集不变量的既有测试，单账号）；对照 plan §2.2 的「加一个条件即可」与 §5 两条修剪测试的守护描述推演其覆盖面。",
+      "suggestion": "计划里明确两处过滤各自的位置与理由：外层 WHERE t.account_id = ?（圈定本账号候选）+ 保留窗口子查询内 WHERE account_id = ?（窗口按账号计）；§2.2 那句「cache_entries 子查询要经 transfer_tasks 关联」删掉或改写为「无需改动，已天然关联」。测试表补一条两账号时间交错的用例（B 有较新的行占位时，A 的修剪不得删掉 A 自己保留窗口内的行）。",
+      "confidence": "high"
+    },
+    {
+      "id": "GLM-03",
+      "severity": "minor",
+      "layer": "plan",
+      "kind": "correctness",
+      "location": "plan §4 步骤 8",
+      "problem": "步骤 8 写「transfer_engine.rs：record_task 的调用点补账号（它已能拿到 settings）」，但 transfer_engine.rs 中没有任何 record_task 调用（它只调 update_task_status，transfer_engine.rs:58）。全仓 record_task 的生产调用点恰是两个：lib.rs:194（RECEIVE，actor 循环内，settings_ref 在同循环 :211 已被使用）与 clipboard_cmd.rs:254（SEND，dispatch_offer 内，持有 State<AppState>）——这两个文件都不在计划步骤里（lib.rs 只出现在认领一步，clipboard_cmd.rs 全计划未提及）。显式参数会让漏改成为编译错误，不会静默出错，但改动面清单点名了错误的文件、漏了真实的两个。",
+      "evidence": "对 client/src-tauri/src 全目录 grep record_task/list_history 等，调用点清单见 clipboard_cmd.rs:254、lib.rs:194、history_cmd.rs:20、cache_manager.rs:118；transfer_engine.rs 仅有 update_task_status（:58）。",
+      "suggestion": "把步骤 8 改为点名 lib.rs 的 TRANSFER_OFFER 分支与 clipboard_cmd.rs 的 dispatch_offer 两处，并注明各自取账号的现成来源（settings_ref / state.settings）。",
+      "confidence": "high"
+    },
+    {
+      "id": "GLM-04",
+      "severity": "minor",
+      "layer": "code",
+      "kind": "correctness",
+      "location": "docs/USER_GUIDE.md:70-82（69b9975 新增的 X.509 v3/SAN 说明）",
+      "problem": "文档断言「自签证书必须是 X.509 v3 且带 SAN，否则即使勾选了允许不安全连接也连不上——客户端在解析阶段就会拒绝 v1」。但 insecure 档装的是 InsecureServerCertVerifier（connection_actor.rs:47-57）：verify_server_cert 无条件放行，不看证书版本、名称、链；两个签名校验函数只解析 SPKI（版本无关）。从代码路径推不出「解析阶段拒绝 v1」与「必须带 SAN」（insecure 档根本不查名称）。提交信息称该结论出自实机验证，观察到的失败可能另有机制（例如 LibreSSL 旧版 req -x509 默认 v1 证书同时以 SHA1 签名，而 TLS 1.3 的签名方案协商会拒绝 SHA1），但文档把机制写死为「v1 解析被拒 + 需要 SAN」可能把排障引向错误方向。",
+      "evidence": "读 client/src-tauri/src/core/connection_actor.rs:31-121（InsecureServerCertVerifier 的四个方法与 create_tls_connector）与 docs/USER_GUIDE.md:61-82；未能实机复现 TLS 握手行为，仅做了代码与文档的一致性推演。",
+      "suggestion": "复测一次「v1 证书 + 勾选不安全连接」的确切失败点（抓 rustls 错误文本），把文档措辞锚定在实测现象上；若确为签名算法/方案问题，修正「解析阶段拒绝 v1」「必须带 SAN」的机制表述——给出的 openssl -addext 命令本身是对的，应保留。",
+      "confidence": "low"
+    },
+    {
+      "id": "GLM-05",
+      "severity": "nit",
+      "layer": "plan",
+      "kind": "test-gap",
+      "location": "plan §2.3 / §5",
+      "problem": "§2.3 的「reset_stale_in_flight 刻意保持全局」是一个容易被后人当成漏网之鱼『补上』的决策，计划只安排了注释，没有安排测试。计划的自我标准是「让误操作成为编译错误或测试红」（§4.4），这一条两者都没有：未来有人给它加上账号过滤，现有测试（单账号种子）不会变红，死行滞留的缺陷要到真实多账号用户撞上才发现。",
+      "evidence": "读 client/src-tauri/src/lib.rs:418-434（启动复位仅在启动时全局执行）与 history_repo.rs 既有测试 reset_stale_in_flight_converts_only_unfinished_rows（单账号、无法区分全局/过滤）；plan §5 测试表无对应条目。",
+      "suggestion": "§5 补一条用例：库中两个账号各有死行、以账号 B 为当前账号执行复位时，A 的死行也必须被复位为 FAILED。",
+      "confidence": "high"
+    },
+    {
+      "id": "GLM-06",
+      "severity": "nit",
+      "layer": "plan",
+      "kind": "contract",
+      "location": "plan §4（实施步骤）",
+      "problem": "计划的实施步骤没有任何文档更新项，但计划自身两处承诺了要写文档：§3「认领的归属模糊……文档里要写」，以及 §2.1 把 history_max_entries 的语义从全局改成了每账号——这改变用户可见的设置含义（多账号时库内总条数会超过设定值），需求.md 第 4 条「保存最新的多少条」与 USER_GUIDE 的相应表述都受影响。不落进步骤清单，Driver 按 §4 执行时大概率漏掉。",
+      "evidence": "读 plan §4（8 个步骤全是代码/测试，无文档项）与 docs/需求.md:70-72（第 4 条的现有表述按全局条数理解）。",
+      "suggestion": "§4 增加一步：更新 USER_GUIDE/需求文档，写明 history_max_entries 为每账号上限、cache 两项为全局上限，以及存量行归属「升级后首个启动的账号」这一模糊性。",
+      "confidence": "high"
+    }
+  ],
+  "agreed": [
+    "§2.1 三条作用域划分成立：history_max_entries 是界面列表承诺，全局语义下 A 狂传会挤掉 B 的历史，分区后必须每账号；cache 容量/TTL 全局正确——磁盘物理共享，按账号配额即超卖。关注的饿死场景可接受：全局 LRU 下 A 挤掉的是 B 的旧缓存文件而非历史行（sweep 只删 cache_entries，行保留并显示「缓存已清理」，history_cmd.rs:9-15 与 HistoryPanel.tsx 的自愈展示均支持），与今天单账号下旧文件被 LRU 淘汰同构。",
+    "§2.2 只给 transfer_tasks 加列正确：三张子表的全部既有查询都按 session_id 精确定位（bitmap_repo.rs 三个函数、cache_manager.rs 的 mark/get_session_files/register_entry），不存在需要账号条件的子表列表查询，单一归属源避免四份冗余互相矛盾。",
+    "§2.3 reset_stale_in_flight 保持全局的论证成立：复位只在启动时执行（lib.rs:418-434），按账号过滤会让上个账号的崩溃死行永远无人复位、永久占用该账号保留额度——与注释所述约束 A 的相互作用核实无误。",
+    "§2.4 缓存不分账号目录成立：transfer_engine.rs:642 显示接收文件已写入以 session_id（UUID）命名的会话子目录，跨账号不会撞；按账号分目录需迁移有主文件且半途失败会产生脱离 cache_entries 索引的孤儿，取舍合理。",
+    "§3 认领时机主线正确：认领只触 NULL 行，且按计划放在 run() 读到 initial_settings 之后、任何 actor/任务启动之前（单线程段，无并发交错）；cmd_save_settings 末尾只调 prune_and_notify（settings_cmd.rs:215）不认领——切账号确实不会搬走旧账号的历史。init_database 先于 settings 读取的论据与 lib.rs:50-66 一致。",
+    "§1 函数表的定位方式与过滤决策逐条与源码相符；「不加过滤」那批函数在该威胁模型下安全：session_id 是客户端现铸 UUIDv4（clipboard_cmd.rs:267/299）或经服务端同账号信令转发的对端 UUID，get_task_brief 的信令来源调用点（lib.rs:276/354）与前端入口（HistoryPanel 仅渲染 cmd_list_history 结果，按钮只作用于可见行）都核实过。",
+    "§4.4「account_id 作为显式首参、让漏过滤成为编译错误」与 §5 测试设计质量高，尤其 claim_is_idempotent_and_does_not_resteal 与 switching_account_hides_but_keeps_history 精准钉住切账号语义；delete_sessions_still_clears_all_four_tables 保留既有正例也必要。",
+    "69b9975 的 install_default() 移位核实为正确：connection_actor.rs:106 在默认档早退之前安装 provider，`let _ =` 恰当忽略已安装时的 Err（幂等），与 lib.rs:47 的冗余关系已在注释说明清楚；默认档不应依赖远处副作用才能不 panic 的理由成立。",
+    "每账号修剪的一个隐含推论——非当前账号的行只能等切回该账号才被修剪——是分区语义的正确代价而非缺陷：用户停留在 A 时 B 的行冻结在切走时的数量（有界），B 的缓存文件仍受全局 TTL/LRU 约束，磁盘不会被无界占用。"
+  ],
+  "not_covered": [
+    "纯静态审查：未运行 cargo test / npm test / go test，未做任何构建或端到端验证。",
+    "未复核 server/ 的 Go 代码（本轮明确不改服务端，计划验证项 go test 的影响无法预判）。",
+    "69b9975 的 TLS 行为断言（尤其 v1 证书在勾选不安全连接后仍连不上）未实机复现；该 commit 的 diff 细节经 .git 内部文件（logs/HEAD、COMMIT_EDITMSG、refs）与当前工作树状态还原（所用探索子代理无 shell 工具），非 git show 的逐行 unified diff；docs/需求.md 的验证段落属于 69b9975 还是相邻提交 ead6f44 未确证。",
+    "App.tsx、types.ts、前端测试未读；HistoryPanel.tsx 已读但 SettingsPanel 等组件未读。",
+    "transfer_engine.rs 仅按结论需要做了定点 grep 与片段阅读（缓存目录、update_task_status），未全文审读其传输状态机。",
+    "未评估 transfer_tasks.account_id 是否需要索引：行数受保留策略约束时全表扫预计可忽略，但 history_max_entries=0（不限）且多账号长期使用的场景未做量化判断。",
+    "docs/design/DESIGN.md 与 docs/需求.md 仅做了关键词定位阅读，未全文过一遍以排查其他与本轮相关的未列需求。"
+  ],
+  "consulted": [
+    ".reviews/local-store-account-scope/plan/2026-09-13-local-store-account-scope-claude.md",
+    "CLAUDE.md",
+    "README.md",
+    "docs/USER_GUIDE.md",
+    "docs/需求.md",
+    "docs/design/DESIGN.md",
+    "client/src-tauri/src/lib.rs",
+    "client/src-tauri/src/app_state.rs",
+    "client/src-tauri/src/storage/db.rs",
+    "client/src-tauri/src/storage/mod.rs",
+    "client/src-tauri/src/storage/history_repo.rs",
+    "client/src-tauri/src/storage/bitmap_repo.rs",
+    "client/src-tauri/src/core/cache_manager.rs",
+    "client/src-tauri/src/core/history_pruner.rs",
+    "client/src-tauri/src/core/retention.rs",
+    "client/src-tauri/src/core/connection_actor.rs",
+    "client/src-tauri/src/core/transfer_engine.rs",
+    "client/src-tauri/src/commands/history_cmd.rs",
+    "client/src-tauri/src/commands/settings_cmd.rs",
+    "client/src-tauri/src/commands/clipboard_cmd.rs",
+    "client/src/components/HistoryPanel.tsx"
+  ]
+}

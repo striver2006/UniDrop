@@ -1,0 +1,97 @@
+{
+  "schema": "trivium.review.v1",
+  "verdict": "approve-with-nits",
+  "summary": "审查焦点三件事本身成立：两处过滤（list 的 WHERE、prune 的外层+保留窗口子查询）都到位且各有交错分布的测试钉住；三条 IPC 读文件路径的闸门接线正确、新增取账号点全部遵守 settings/db 锁不交叠纪律；认领「只触 NULL 行＋调用方先校验＋仅启动时」自洽且有幂等/不抢行测试。最值得改的一条：cmd_inject_files 是注册在 IPC 上的第四条读会话文件路径（paths 缺省时回退读会话缓存并写剪贴板），没有闸门——当前前端不调用它，属休眠缺口，且需求文档「三个 IPC 命令」的说法不准。其余为边界残留：传输中途切账号时完成后的自动装载不经闸门；USER_GUIDE 把认领时机写成「填了合法账号」而实现是「下次启动」；App 层传输卡片不受 account-changed 影响，残留的完成卡片按钮点到必报错；闸门的命令级接线无测试。",
+  "findings": [
+    {
+      "id": "GLM-01",
+      "severity": "minor",
+      "layer": "code",
+      "kind": "security",
+      "location": "client/src-tauri/src/commands/clipboard_cmd.rs:36-59（注册点 client/src-tauri/src/lib.rs:587）",
+      "problem": "归属闸门漏了第四条会话文件路径。cmd_inject_files 在 paths 缺省/为空时回退到 cache_manager.get_session_files(&session_id) 读取会话缓存文件、写入系统剪贴板并打免疫标记（41-56 行），全程未经 ensure_session_owned。它与本轮要堵的「把另一账号的文件写进剪贴板」是同一条事故链，只是当前前端恰好不调用它（全 client/src 无任何 invoke 点），处于休眠状态。任何未来改动复用这个看起来最自然的「按会话装载」API 时会静默绕过闸门。",
+      "evidence": "读 clipboard_cmd.rs 全文：41-44 行回退分支、51 行写剪贴板、56 行 mark_clipboard_injected，均无闸门；grep client/src 全部 ts/tsx 无 cmd_inject_files 调用，App.tsx:258 与 HistoryPanel.tsx:71 均走 cmd_inject_session；lib.rs:587 仍把它注册进 invoke_handler。docs/需求.md:109-111 与 ensure_session_owned 注释均只声称「三个」命令。",
+      "suggestion": "二选一：给 cmd_inject_files（至少回退分支）加 ensure_session_owned；或确认它已死代码后从 invoke_handler 摘除。同时把需求文档「三个」的表述改准。",
+      "confidence": "high"
+    },
+    {
+      "id": "GLM-02",
+      "severity": "minor",
+      "layer": "code",
+      "kind": "concurrency",
+      "location": "client/src-tauri/src/core/transfer_engine.rs:793-848（配合 client/src-tauri/src/lib.rs:257-275）",
+      "problem": "闸门+前端重拉封住的是「点残留卡片」链路；接收完成后的自动写剪贴板是第四条不经闸门也无法经闸门的路径。历史行在 offer 到达时按当时账号落库（lib.rs:213-218），而接收任务把 server_url/auto_inject 快照在 spawn 时刻：保存设置只重连控制面 actor，已在飞的接收任务继续跑完。若用户在传输中途切账号，完成后 TEXT/IMAGE 无条件写剪贴板（FILES 按 auto_inject），内容落进新账号的剪贴板，而历史行归属旧账号、两个账号的列表里都看不到这次完成。场景窄（同一人、传输窗口内切账号），但它正是焦点所问「闸门是否真能堵住误装载」的残余答案。",
+      "evidence": "读 transfer_engine.rs 740-869：完成分支直接调 platform 写剪贴板并 mark_clipboard_injected，无任何账号判断；读 lib.rs 222-277：接收任务以捕获的 settings 快照 spawn，独立于控制面重连；settings_cmd.rs cmd_save_settings 只 notify 控制面 actor。",
+      "suggestion": "至少在 ensure_session_owned/history_cmd 的注释里把这条残余路径写明，避免「所有写剪贴板都过闸门」的误解。若要收口：完成时重读当前账号，与会话归属不一致则跳过自动装载，只发通知。",
+      "confidence": "medium"
+    },
+    {
+      "id": "GLM-03",
+      "severity": "nit",
+      "layer": "code",
+      "kind": "contract",
+      "location": "docs/USER_GUIDE.md:66-68（对照 client/src-tauri/src/lib.rs:68-86）",
+      "problem": "认领时机的文档与实现不一致。USER_GUIDE 写「认领会推迟到下次填了合法账号再进行」，读起来像「在设置里填好合法账号即可触发」；实现只在启动时认领（run()），cmd_save_settings 刻意不做。于是：空账号启动 → 老记录不可见 → 设置里填好合法账号 → 记录仍不可见，必须重启才回来。用户会误以为历史丢了。另外 lib.rs:76-77 给「不在保存路径认领」写的理由（「那会把上一个账号的历史搬到新账号名下」）对只触 NULL 行的认领并不成立——已有归属的行根本搬不动，真实权衡只是「推迟到下次启动」。",
+      "evidence": "读 lib.rs 68-86：认领只在 run() 且先 validate；读 settings_cmd.rs cmd_save_settings 全文无认领调用；读 db.rs claim_unowned_history：WHERE account_id IS NULL；读 USER_GUIDE.md 59-68 原文。",
+      "suggestion": "USER_GUIDE 改为「重启应用且启动时账号合法后才认领」；lib.rs 注释把理由改成真实权衡（避免在保存路径引入写库副作用、宁推迟勿错认领），不解释成防搬历史。",
+      "confidence": "high"
+    },
+    {
+      "id": "GLM-04",
+      "severity": "nit",
+      "layer": "code",
+      "kind": "correctness",
+      "location": "client/src/components/TransferProgress.tsx:104-132（对照 client/src/App.tsx:165-223, 386-390）",
+      "problem": "account-changed 只被 HistoryPanel 订阅；App 层的传输卡片不在重拉范围。上一账号的 COMPLETED 接收卡片在 transfer_card_retain_secs 窗口内（设为 0 时永久）残留「装载到剪贴板」按钮，切账号后点击必然收到「该记录不属于当前账号」报错——这正是本次改动注释里自己定义的缺陷（「让用户点到一个必然报错的按钮本身就是缺陷」），在第二个界面上仍然成立。闸门保证了不泄露数据，纯 UX 一致性问题。",
+      "evidence": "读 TransferProgress.tsx：COMPLETED RECEIVE 卡片带 onInject 按钮；读 App.tsx：transfers 状态无 account-changed 监听、不清空；HistoryPanel.tsx 是该事件唯一订阅者；FAILED 卡片只有移除按钮、无装载按钮，故影响面限于 COMPLETED 卡片。",
+      "suggestion": "收到 account-changed 时清空（或仅保留在途）transfers 状态；或明确接受并记录「第二界面靠后端闸门报错兜底」。",
+      "confidence": "high"
+    },
+    {
+      "id": "GLM-05",
+      "severity": "nit",
+      "layer": "code",
+      "kind": "test-gap",
+      "location": "client/src-tauri/src/commands/history_cmd.rs:29-37（三处调用点 :47、:112、clipboard_cmd.rs:358）",
+      "problem": "闸门的命令级接线无回归保护。现有测试全部落在 repo 层（session_belongs_to 及其 NULL 拒绝语义），把任何一个命令里的 ensure_session_owned 调用删掉，不会有任何测试变红——而「点得动」这条防线恰恰完全依赖这三处调用点在位。前端测试（HistoryPanel.test.tsx）只 mock 了 cmd_list_history，也不经过闸门路径。",
+      "evidence": "读 history_repo.rs 测试模块与 HistoryPanel.test.tsx 全文，确认覆盖止步于 repo 层与列表刷新；三处命令内调用点仅能靠人工评审保证。",
+      "suggestion": "若 Tauri State 难以在单测构造，可把闸门判断提为接受 (conn, account, session) 的纯函数级测试已有，缺口只在接线；考虑集成测试或至少在需求文档标注「闸门接线由评审保证」这一接受残余。",
+      "confidence": "medium"
+    }
+  ],
+  "agreed": [
+    "两处过滤都到位且可证：list_history 的 WHERE t.account_id（history_repo.rs:160）与 select_prune_candidates 的外层过滤+NOT IN 保留窗口双处过滤（:250、:260）。对 prune_window_is_per_account_when_rows_interleave 做了手工推演：bob 两行与 alice 三行时间交错时，去掉窗口子查询过滤会多删 a_mid（该测试变红），去掉外层过滤会选进 bob 的行（被 prune_never_touches_other_account_rows 抓住）——两条测试合起来把两处过滤各自钉死。",
+    "闸门与 NULL 语义自洽：session_belongs_to 对 NULL 行拒绝放行（history_repo.rs:103-111），与 list_history 的 WHERE 对 NULL 不可见（SQL = 不匹配 NULL）是同一语义；未认领老行「宁可拒绝、重启认领」的选择有测试钉住。",
+    "锁纪律保持：四处新增「先取 settings 锁取账号即放、再取 db_conn 锁」的改动点（dispatch_offer、lib.rs 接收路径、cmd_list_history、ensure_session_owned）均无两锁交叠；history_pruner 的取法与既有注释纪律一致。",
+    "认领边界设计成立：只触 NULL 行天然幂等、调用方先 validate（空串认领会导致行永久不可见的推演成立）、失败仅告警不阻断启动、claim 在启动修剪之前执行（先归属后修剪，顺序正确）；claim_assigns_legacy_rows / claim_is_idempotent_and_does_not_resteal 两条测试到位。",
+    "account-changed 的发射时机正确：先更新内存 settings（settings_cmd.rs:187-192）再 emit（:222-224），前端 refresh 拉到的必是新账号数据；emit 在 prune_and_notify 之前，若修剪有删减会再广播 history-pruned 形成二次刷新，无害。",
+    "reset_stale_in_flight 保持全局、sweep 保持全局这两个「刻意不做按账号分区」的决策都有注释讲清理由，且分别有会红的测试（reset_stale_in_flight_covers_all_accounts）与需求文档记录。",
+    "前端测试有鉴别力：「收到 account-changed 后重新拉取历史」是行为断言而非实现断言，监听注册/解绑成对测试防住了上一轮 tls-cert-failed「发了没人接」的同类回归。"
+  ],
+  "not_covered": [
+    "本会话无 shell，未能运行 git 对比工作树与被审 head 69b9975 的未提交漂移（会话开始时的 status 显示同批文件有未提交改动）；采用的核对方式是「diff 后像与当前工作树逐 hunk 对齐」，所有读过的区域均一致，但无法排除被审区域之外的漂移。",
+    "未实际运行 cargo test 与 vitest（只读约束），测试有效性结论基于静态阅读与手工推演。",
+    "服务端代码未读：validate_account_id 与服务端 auth/identity.go 规则的一致性未独立核实（仅核对客户端自身注释与测试）。",
+    "connection_actor.rs 的 TLS provider 变更只做粗读（非本次焦点），「rustls 0.23 双 provider 并存时返回 None 会 panic」的断言未独立验证。",
+    "platform 层三份剪贴板实现（macos/windows/linux）未读；transfer_engine.rs 只读了接收完成段（740-869），发送路径未逐行核对。",
+    "cache_manager.rs 只读到 360 行（生产代码全量、测试模块部分），其测试模块未逐条复核。"
+  ],
+  "consulted": [
+    ".reviews/local-store-account-scope/code/_meta/changes-20260913T111246Z.diff",
+    "client/src-tauri/src/storage/history_repo.rs",
+    "client/src-tauri/src/storage/db.rs",
+    "client/src-tauri/src/lib.rs",
+    "client/src-tauri/src/commands/settings_cmd.rs",
+    "client/src-tauri/src/commands/history_cmd.rs",
+    "client/src-tauri/src/commands/clipboard_cmd.rs",
+    "client/src-tauri/src/core/history_pruner.rs",
+    "client/src-tauri/src/core/cache_manager.rs",
+    "client/src-tauri/src/core/transfer_engine.rs",
+    "client/src/components/HistoryPanel.tsx",
+    "client/src/components/HistoryPanel.test.tsx",
+    "client/src/components/TransferProgress.tsx",
+    "client/src/App.tsx",
+    "docs/USER_GUIDE.md",
+    "docs/需求.md"
+  ]
+}

@@ -1,0 +1,999 @@
+# trivium changes.diff
+# run_id: 20260913T111246Z
+# base: 47766fb
+# head: 69b997596d511e794f677cb7cc615c4ac6bbb027
+# files: 13
+#   client/src-tauri/src/commands/clipboard_cmd.rs
+#   client/src-tauri/src/commands/history_cmd.rs
+#   client/src-tauri/src/commands/settings_cmd.rs
+#   client/src-tauri/src/core/cache_manager.rs
+#   client/src-tauri/src/core/connection_actor.rs
+#   client/src-tauri/src/core/history_pruner.rs
+#   client/src-tauri/src/lib.rs
+#   client/src-tauri/src/storage/db.rs
+#   client/src-tauri/src/storage/history_repo.rs
+#   client/src/components/HistoryPanel.test.tsx
+#   client/src/components/HistoryPanel.tsx
+#   docs/USER_GUIDE.md
+#   docs/需求.md
+diff --git a/client/src-tauri/src/commands/clipboard_cmd.rs b/client/src-tauri/src/commands/clipboard_cmd.rs
+index a7dc5c1..7d4f5a2 100644
+--- a/client/src-tauri/src/commands/clipboard_cmd.rs
++++ b/client/src-tauri/src/commands/clipboard_cmd.rs
+@@ -250,8 +250,10 @@ async fn dispatch_offer(
+     state.outgoing_tx.send(offer_env).await.map_err(|e| e.to_string())?;
+ 
+     {
++        // 账号在这里取而不是更早：settings 锁与 db_conn 锁不要交叠持有。
++        let account_id = { state.settings.lock().await.account_id.clone() };
+         let conn = state.db_conn.lock().await;
+-        let _ = HistoryRepo::record_task(&conn, &session_id, target_device, "SEND", &offer, "TRANSFERRING");
++        let _ = HistoryRepo::record_task(&conn, &account_id, &session_id, target_device, "SEND", &offer, "TRANSFERRING");
+     }
+ 
+     Ok(session_id)
+@@ -351,6 +353,10 @@ pub async fn cmd_send_clipboard(state: State<'_, AppState>, target_device: Strin
+ /// FILES -> file references, TEXT -> text, IMAGE -> PNG image.
+ #[tauri::command]
+ pub async fn cmd_inject_session(state: State<'_, AppState>, session_id: String) -> Result<String, String> {
++    // 归属闸门。这条路径直接把文件写进系统剪贴板，是「切账号后误装载上一个
++    // 账号的文件」这条事故链的终点，必须挡在读文件之前。
++    crate::commands::history_cmd::ensure_session_owned(&state, &session_id).await?;
++
+     let data_type = {
+         let conn = state.db_conn.lock().await;
+         HistoryRepo::get_task_brief(&conn, &session_id)
+diff --git a/client/src-tauri/src/commands/history_cmd.rs b/client/src-tauri/src/commands/history_cmd.rs
+index 44e904d..b352dc4 100644
+--- a/client/src-tauri/src/commands/history_cmd.rs
++++ b/client/src-tauri/src/commands/history_cmd.rs
+@@ -16,8 +16,24 @@ const HISTORY_DISPLAY_CAP: u32 = 200;
+ 
+ #[tauri::command]
+ pub async fn cmd_list_history(state: State<'_, AppState>) -> Result<Vec<TransferHistoryEntry>, String> {
++    let account_id = { state.settings.lock().await.account_id.clone() };
+     let conn = state.db_conn.lock().await;
+-    HistoryRepo::list_history(&conn, HISTORY_DISPLAY_CAP).map_err(|e| e.to_string())
++    HistoryRepo::list_history(&conn, &account_id, HISTORY_DISPLAY_CAP).map_err(|e| e.to_string())
++}
++
++/// 三个直接操作会话文件的 IPC 命令共用的归属闸门。
++///
++/// 见 `HistoryRepo::session_belongs_to` 的注释：过滤列表只保证「看不见」，
++/// 挡不住「点得动」。切账号后界面若还残留着旧账号的卡片，用户点下去就会
++/// 真的读到另一个账号的文件。
++pub(crate) async fn ensure_session_owned(state: &State<'_, AppState>, session_id: &str) -> Result<(), String> {
++    let account_id = { state.settings.lock().await.account_id.clone() };
++    let conn = state.db_conn.lock().await;
++    if HistoryRepo::session_belongs_to(&conn, session_id, &account_id) {
++        Ok(())
++    } else {
++        Err("该记录不属于当前账号".to_string())
++    }
+ }
+ 
+ /// Opens a native folder picker and copies all cached files of a session into it.
+@@ -28,6 +44,7 @@ pub async fn cmd_save_transfer_as(
+     state: State<'_, AppState>,
+     session_id: String,
+ ) -> Result<Option<u32>, String> {
++    ensure_session_owned(&state, &session_id).await?;
+     let files = state.cache_manager.get_session_files(&session_id).await?;
+     if files.is_empty() {
+         return Err("该会话在缓存中无文件（可能已被清理）".into());
+@@ -92,6 +109,7 @@ pub async fn cmd_save_transfer_as(
+ /// Reveals the first cached file of a session in the platform file manager.
+ #[tauri::command]
+ pub async fn cmd_reveal_session(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
++    ensure_session_owned(&state, &session_id).await?;
+     let files = state.cache_manager.get_session_files(&session_id).await?;
+     let target = files.first().ok_or("该会话在缓存中无文件（可能已被清理）")?;
+ 
+diff --git a/client/src-tauri/src/commands/settings_cmd.rs b/client/src-tauri/src/commands/settings_cmd.rs
+index 0fb9dff..2cbee83 100644
+--- a/client/src-tauri/src/commands/settings_cmd.rs
++++ b/client/src-tauri/src/commands/settings_cmd.rs
+@@ -183,11 +183,13 @@ pub async fn cmd_save_settings(
+         crate::storage::db::save_persisted_settings(&conn, &json_str).map_err(|e| e.to_string())?;
+     }
+ 
+-    // 1. Update in-memory settings
+-    {
++    // 1. Update in-memory settings，顺带记下账号是否真的变了
++    let account_changed = {
+         let mut s = state.settings.lock().await;
++        let changed = s.account_id != clean_settings.account_id;
+         *s = clean_settings.clone();
+-    }
++        changed
++    };
+ 
+     // 2. Update dynamic actor config
+     {
+@@ -209,7 +211,19 @@ pub async fn cmd_save_settings(
+     state.reconnect_notify.notify_waiters();
+     log::info!("Settings saved and reconnected immediately with new config");
+ 
+-    // 5. 立刻按新上限修剪历史：用户把条数调小后必须当场见效，
++    // 5. 账号变了就让界面重拉历史。
++    //
++    //    不能指望 `history-pruned` 代劳：那是「修剪删掉了东西」的语义，而切账号
++    //    时很可能一条都不用删（prune_and_notify 在 Ok(0) 时本就不广播）。
++    //    缺了这条事件，历史面板会继续显示上一个账号的卡片——而那些卡片上的
++    //    按钮是真的能点的，装载 / 另存为 / 定位三条路径都直接读文件。
++    //    后端已有归属闸门兜底（见 history_cmd::ensure_session_owned），
++    //    但让用户点到一个必然报错的按钮本身就是缺陷。
++    if account_changed {
++        let _ = app.emit("account-changed", ());
++    }
++
++    // 6. 立刻按新上限修剪历史：用户把条数调小后必须当场见效，
+     //    否则要等到下次传输才生效，看起来就像设置没保存。
+     //    此处已在上面各锁的作用域之外，取 db_conn 锁是安全的。
+     crate::core::history_pruner::prune_and_notify(&app).await;
+diff --git a/client/src-tauri/src/core/cache_manager.rs b/client/src-tauri/src/core/cache_manager.rs
+index f5a7363..fbac97d 100644
+--- a/client/src-tauri/src/core/cache_manager.rs
++++ b/client/src-tauri/src/core/cache_manager.rs
+@@ -111,11 +111,15 @@ impl CacheManager {
+     /// 都以表行为遍历源 ⇒ 永远扫不到它，成为不可回收的磁盘孤儿。
+     /// 反向留下的「行在、文件没了」则可自愈：下轮修剪会重试，且另存为/打开位置
+     /// 本就处理了文件缺失。
+-    pub async fn prune_history(&self, limit: u32) -> Result<usize, String> {
++    /// 注意本函数带账号而紧邻的 `sweep` 不带，这不是疏漏：
++    /// 条数上限是「界面列表保留多少条」，全局语义下一个账号狂传就会把另一个
++    /// 账号的历史挤光；而 `sweep` 管的 TTL 与容量约束的是磁盘——物理共享资源，
++    /// 按账号各分一份配额就是超卖。两者作用域不同是刻意的，别「统一一下」。
++    pub async fn prune_history(&self, account_id: &str, limit: u32) -> Result<usize, String> {
+         // 1. 选取段：取完即释放锁
+         let candidates = {
+             let conn = self.db_conn.lock().await;
+-            crate::storage::HistoryRepo::select_prune_candidates(&conn, limit)
++            crate::storage::HistoryRepo::select_prune_candidates(&conn, account_id, limit)
+                 .map_err(|e| e.to_string())?
+         };
+         if candidates.is_empty() {
+@@ -167,6 +171,11 @@ impl CacheManager {
+ 
+     /// 按保留策略清理缓存：TTL 淘汰 + 容量配额（LRU），返回删除的条目数。
+     ///
++    /// **刻意不按账号分区**，与 `prune_history` 相反：磁盘是物理共享资源，
++    /// 给 N 个账号各配 10 GB 就是超卖 N 倍，最后谁都写不进去。全局 LRU 下
++    /// 一个账号挤掉的是另一个账号的旧**缓存文件**而非历史行——行会保留并显示
++    /// 「缓存已清理」，与今天单账号下旧文件被淘汰是同一种体验。
++    ///
+     /// 与 `prune_history` 相同的三段式，**磁盘 IO 段不持 `db_conn` 锁**：
+     /// 改造前本函数从取锁起一路持有到函数尾，`fs::remove_file` 循环就在锁内；
+     /// 容量上限开放到 1 TB 后，单轮可能删数千个文件，持锁停顿会把整条信令链路
+@@ -387,7 +396,7 @@ mod tests {
+ 
+     async fn seed_completed(db: &Arc<Mutex<Connection>>, session_id: &str, file_path: &Path) {
+         let conn = db.lock().await;
+-        HistoryRepo::record_task(&conn, session_id, "peer", "RECEIVE", &sample_offer(session_id), "TRANSFERRING")
++        HistoryRepo::record_task(&conn, "acct", session_id, "peer", "RECEIVE", &sample_offer(session_id), "TRANSFERRING")
+             .unwrap();
+         HistoryRepo::update_task_status(&conn, session_id, "COMPLETED", None).unwrap();
+         conn.execute(
+@@ -428,7 +437,7 @@ mod tests {
+         // 保留窗口 0 条之外的都算候选，但 limit 必须 > 0（0 表示不限制）
+         seed_completed(&db, "s_keep", &tmp.path().join("keep.bin")).await;
+ 
+-        let pruned = mgr.prune_history(1).await.unwrap();
++        let pruned = mgr.prune_history("acct", 1).await.unwrap();
+ 
+         assert_eq!(pruned, 1, "只应删掉文件真正清理成功的那一个会话");
+         assert!(task_exists(&db, "s_bad").await, "文件删除失败的会话必须保留行以便下轮重试");
+@@ -461,13 +470,13 @@ mod tests {
+         // 未装载时它确实是待删候选——先确认这一点，否则下面的断言可能是空过
+         {
+             let conn = db.lock().await;
+-            let candidates = HistoryRepo::select_prune_candidates(&conn, 1).unwrap();
++            let candidates = HistoryRepo::select_prune_candidates(&conn, "acct", 1).unwrap();
+             assert_eq!(candidates.len(), 1, "s_old 本应是待删候选");
+             assert_eq!(candidates[0].session_id, "s_old");
+         }
+ 
+         mgr.mark_clipboard_injected("s_old").await.unwrap();
+-        let pruned = mgr.prune_history(1).await.unwrap();
++        let pruned = mgr.prune_history("acct", 1).await.unwrap();
+ 
+         assert_eq!(pruned, 0, "已装载进剪贴板的会话不应被删");
+         assert!(task_exists(&db, "s_old").await, "刚被用户装载的历史条目不能消失");
+@@ -656,7 +665,7 @@ mod tests {
+         let tmp = TempDir::new();
+         let (mgr, db) = manager_with_memory_db();
+         seed_completed(&db, "s1", &tmp.path().join("a.bin")).await;
+-        assert_eq!(mgr.prune_history(0).await.unwrap(), 0);
++        assert_eq!(mgr.prune_history("acct", 0).await.unwrap(), 0);
+         assert!(task_exists(&db, "s1").await);
+     }
+ }
+diff --git a/client/src-tauri/src/core/connection_actor.rs b/client/src-tauri/src/core/connection_actor.rs
+index c693ebb..7c44fdc 100644
+--- a/client/src-tauri/src/core/connection_actor.rs
++++ b/client/src-tauri/src/core/connection_actor.rs
+@@ -93,11 +93,22 @@ impl rustls::client::danger::ServerCertVerifier for InsecureServerCertVerifier {
+ /// 改造前这里**无条件**装载那个跳过校验的 verifier，也就是说即便连的是
+ /// `wss://`，中间人也照样能接管连接。默认走真实校验是本轮的目的之一。
+ pub fn create_tls_connector(allow_insecure: bool) -> Option<tokio_tungstenite::Connector> {
++    // 两档都要装 provider，即便默认档马上就 return None。
++    //
++    // 返回 None 之后由 tokio-tungstenite 自己构建 ClientConfig，而 rustls 0.23
++    // 在依赖树里同时存在 ring 与 aws-lc-rs 时（本项目正是如此）无法自动选定
++    // provider，会直接 panic 而不是返回 Err——发生在连接 actor 的 task 里，
++    // 整个重连循环就此死掉。
++    //
++    // 今天 lib.rs 的 run() 开头已经装过一次，所以这行是冗余的；写在这里是因为
++    // 默认档不该依赖一个远在别处的副作用才能不 panic。insecure 档本来就自带
++    // 初始化，只有默认档赤裸着——而它恰恰是绝大多数用户走的那条路。
++    let _ = rustls::crypto::ring::default_provider().install_default();
++
+     if !allow_insecure {
+         return None;
+     }
+ 
+-    let _ = rustls::crypto::ring::default_provider().install_default();
+     let provider = Arc::new(rustls::crypto::ring::default_provider());
+     let client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
+         .with_safe_default_protocol_versions()
+diff --git a/client/src-tauri/src/core/history_pruner.rs b/client/src-tauri/src/core/history_pruner.rs
+index 972f7fa..d93b717 100644
+--- a/client/src-tauri/src/core/history_pruner.rs
++++ b/client/src-tauri/src/core/history_pruner.rs
+@@ -26,15 +26,20 @@ pub async fn prune_and_notify(app: &AppHandle) {
+     let state = app.state::<AppState>();
+ 
+     // 单独取一次 settings 锁并立刻释放，避免与下面的 db_conn 锁交叠持有
+-    let limit = {
++    let (limit, account_id) = {
+         let settings = state.settings.lock().await;
+-        settings.history_max_entries
++        (settings.history_max_entries, settings.account_id.clone())
+     };
+     if limit == 0 {
+         return; // 0 = 不限制
+     }
++    // 账号非法时不修剪：带着空账号去查只会命中零行（认领同样会跳过它），
++    // 白跑一趟还不如不跑。
++    if crate::commands::settings_cmd::validate_account_id(&account_id).is_err() {
++        return;
++    }
+ 
+-    match state.cache_manager.prune_history(limit).await {
++    match state.cache_manager.prune_history(&account_id, limit).await {
+         Ok(0) => {}
+         Ok(pruned) => {
+             log::info!("Pruned {} transfer history entries (limit {})", pruned, limit);
+diff --git a/client/src-tauri/src/lib.rs b/client/src-tauri/src/lib.rs
+index 25069fd..0fe9258 100644
+--- a/client/src-tauri/src/lib.rs
++++ b/client/src-tauri/src/lib.rs
+@@ -65,6 +65,26 @@ pub fn run() {
+         commands::settings_cmd::AppSettings::default_config()
+     };
+ 
++    // 存量历史认领：把老库里没有归属的行归给当前账号。
++    //
++    // 必须在这里而不是 init_database 里——那时还没读到 settings。
++    // 也必须先校验账号合法性：认领只触 NULL 行，一旦用空串之类的非法账号
++    // 认领过，那些行既不会被重新认领、又永远不可能被看见（非法账号无法
++    // 通过 validate_account_id 成为当前账号）。跳过则是安全的：NULL 行原样
++    // 留着，推迟到某个合法账号启动时再认领。
++    //
++    // 刻意**不**在 cmd_save_settings 的切账号路径上做同样的事：那会把上一个
++    // 账号的历史搬到新账号名下。
++    if commands::settings_cmd::validate_account_id(&initial_settings.account_id).is_ok() {
++        match storage::db::claim_unowned_history(&db, &initial_settings.account_id) {
++            Ok(0) => {}
++            Ok(n) => log::info!("Claimed {} legacy history rows for account {}", n, initial_settings.account_id),
++            Err(e) => log::warn!("Failed to claim legacy history rows: {}", e),
++        }
++    } else {
++        log::warn!("Skipped claiming legacy history: current account id is invalid");
++    }
++
+     let config = ConnectionConfig {
+         server_url: initial_settings.server_url.clone(),
+         account_id: initial_settings.account_id.clone(),
+@@ -189,9 +209,13 @@ pub fn run() {
+ 
+                                 // Persist incoming transfer in history
+                                 {
++                                    // settings 锁先取先放，不与 db_conn 锁交叠
++                                    let record_account_id = {
++                                        settings_ref.lock().await.account_id.clone()
++                                    };
+                                     let state = app_handle.state::<AppState>();
+                                     let conn = state.db_conn.lock().await;
+-                                    let _ = HistoryRepo::record_task(&conn, &offer.session_id, &env.from_device, "RECEIVE", &offer, "TRANSFERRING");
++                                    let _ = HistoryRepo::record_task(&conn, &record_account_id, &offer.session_id, &env.from_device, "RECEIVE", &offer, "TRANSFERRING");
+                                 }
+                             }
+                         }
+diff --git a/client/src-tauri/src/storage/db.rs b/client/src-tauri/src/storage/db.rs
+index 7ffc5e6..a12eeac 100644
+--- a/client/src-tauri/src/storage/db.rs
++++ b/client/src-tauri/src/storage/db.rs
+@@ -35,6 +35,11 @@ pub fn init_database(db_path: Option<PathBuf>) -> Result<Connection, rusqlite::E
+     // 任何有数据的表上——那需要真正的迁移，而不是一句 DROP。
+     let _ = conn.execute_batch("DROP TABLE IF EXISTS paired_devices;");
+ 
++    // 历史按账号分区。老库的行没有归属，列留 NULL——
++    // 此刻还读不到 settings（init_database 跑在它之前），不知道当前账号是谁。
++    // 回填由 claim_unowned_history 在读到 settings 之后完成。
++    let _ = conn.execute_batch("ALTER TABLE transfer_tasks ADD COLUMN account_id TEXT;");
++
+     Ok(conn)
+ }
+ 
+@@ -45,6 +50,10 @@ pub fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+         -- 1. Transfer Tasks
+         CREATE TABLE IF NOT EXISTS transfer_tasks (
+             session_id TEXT PRIMARY KEY,
++            -- 归属账号。只有本表带这一列：transfer_items / chunk_bitmaps /
++            -- cache_entries 都以 session_id 为外键，归属由父表唯一决定，
++            -- 各存一份只会产生四份可能互相矛盾的记录。
++            account_id TEXT,
+             remote_device_id TEXT NOT NULL,
+             direction TEXT CHECK(direction IN ('SEND', 'RECEIVE')) NOT NULL,
+             data_type TEXT NOT NULL,
+@@ -104,6 +113,23 @@ pub fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
+     Ok(())
+ }
+ 
++/// 把没有归属的历史行认领给 `account_id`，返回认领的行数。
++///
++/// 只触 NULL 行，因此天然幂等，也因此**绝不能用一个非法账号调用它**：
++/// 行一旦被认领就不再是 NULL、永远不会被重新认领，而空串之类的非法账号
++/// 又永远无法通过 `validate_account_id` 成为当前账号——那些历史就此在应用内
++/// 永久不可见，只能手工改库恢复。调用方必须先校验（见 lib.rs 的调用点）。
++///
++/// 跳过一次是安全的：NULL 行原样留着，推迟到某个合法账号启动时再认领。
++/// 这个「宁可推迟也不要错认领」的不对称性，正是校验放在调用方而不是
++/// 在这里兜底的理由。
++pub fn claim_unowned_history(conn: &Connection, account_id: &str) -> Result<usize, rusqlite::Error> {
++    conn.execute(
++        "UPDATE transfer_tasks SET account_id = ?1 WHERE account_id IS NULL",
++        [account_id],
++    )
++}
++
+ /// Retrieves the existing device_id from SQLite or generates and persists a new one (P1-4).
+ pub fn get_or_create_device_id(conn: &Connection) -> Result<String, rusqlite::Error> {
+     let mut stmt = conn.prepare("SELECT value FROM local_config WHERE key = 'device_id'")?;
+diff --git a/client/src-tauri/src/storage/history_repo.rs b/client/src-tauri/src/storage/history_repo.rs
+index 1f5a65b..31773e7 100644
+--- a/client/src-tauri/src/storage/history_repo.rs
++++ b/client/src-tauri/src/storage/history_repo.rs
+@@ -49,6 +49,7 @@ impl HistoryRepo {
+     /// transfer is first observed (outgoing send / incoming offer).
+     pub fn record_task(
+         conn: &Connection,
++        account_id: &str,
+         session_id: &str,
+         remote_device_id: &str,
+         direction: &str,
+@@ -57,11 +58,12 @@ impl HistoryRepo {
+     ) -> Result<(), rusqlite::Error> {
+         conn.execute(
+             "INSERT OR REPLACE INTO transfer_tasks
+-                (session_id, remote_device_id, direction, data_type, preview_summary,
++                (session_id, account_id, remote_device_id, direction, data_type, preview_summary,
+                  total_size, total_items, status, error_message, created_at, completed_at)
+-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, CURRENT_TIMESTAMP, NULL)",
++             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, CURRENT_TIMESTAMP, NULL)",
+             (
+                 session_id,
++                account_id,
+                 remote_device_id,
+                 direction,
+                 offer.data_type.clone(),
+@@ -90,6 +92,25 @@ impl HistoryRepo {
+         Ok(())
+     }
+ 
++    /// 核验某个会话是否归属指定账号。
++    ///
++    /// 供三个直接操作文件的 IPC 命令（装载剪贴板 / 另存为 / 在文件管理器中显示）
++    /// 在动文件之前调用。这不是冗余的纵深防御：`list_history` 的过滤只保证
++    /// 「看不见」，而界面残留、事件丢失、用户在刷新落地前抢先点击，任何一种
++    /// 都会让「按钮只作用于可见行」这个前提失效——失效的后果是把另一个账号的
++    /// 文件写进剪贴板。前端状态的正确性不该是文件访问控制的唯一依据。
++    ///
++    /// 归属未知（account_id 为 NULL，即尚未认领的老库行）时返回 false：
++    /// 宁可让用户重启一次应用完成认领，也不要放行一条来历不明的记录。
++    pub fn session_belongs_to(conn: &Connection, session_id: &str, account_id: &str) -> bool {
++        conn.query_row(
++            "SELECT 1 FROM transfer_tasks WHERE session_id = ?1 AND account_id = ?2",
++            rusqlite::params![session_id, account_id],
++            |_| Ok(()),
++        )
++        .is_ok()
++    }
++
+     /// Updates task status; stamps completed_at on terminal states.
+     pub fn update_task_status(
+         conn: &Connection,
+@@ -126,17 +147,22 @@ impl HistoryRepo {
+     }
+ 
+     /// Lists the most recent tasks, oldest first is reversed — newest first.
+-    pub fn list_history(conn: &Connection, limit: u32) -> Result<Vec<TransferHistoryEntry>, rusqlite::Error> {
++    /// 列出**当前账号**的历史。
++    ///
++    /// 账号作为显式首参而不从全局读：显式参数让「忘了过滤」成为编译错误，
++    /// 读全局只会让它成为运行期的静默串台。与服务端 registry 改复合键同理。
++    pub fn list_history(conn: &Connection, account_id: &str, limit: u32) -> Result<Vec<TransferHistoryEntry>, rusqlite::Error> {
+         let mut stmt = conn.prepare(
+             "SELECT t.session_id, t.direction, t.data_type, t.preview_summary, t.total_size,
+                     t.total_items, t.status, t.error_message, t.created_at, t.completed_at,
+                     (SELECT COUNT(*) FROM cache_entries c WHERE c.session_id = t.session_id) AS cached_count
+              FROM transfer_tasks t
++             WHERE t.account_id = ?1
+              ORDER BY t.created_at DESC, t.rowid DESC
+-             LIMIT ?1",
++             LIMIT ?2",
+         )?;
+ 
+-        let rows = stmt.query_map([limit], |row| {
++        let rows = stmt.query_map(rusqlite::params![account_id, limit], |row| {
+             Ok(TransferHistoryEntry {
+                 session_id: row.get(0)?,
+                 direction: row.get(1)?,
+@@ -194,8 +220,24 @@ impl HistoryRepo {
+     /// - 约束 B：会话中只要还有一个文件处在 2 小时剪贴板免疫窗口内就整体跳过——
+     ///   用户刚把它装载进系统剪贴板，随时可能粘贴。条数超限是攒出来的慢问题，
+     ///   剪贴板失效是下一秒就撞上的快问题，本轮跳过，下一轮再收。
++    /// 选出**当前账号**可修剪的会话。
++    ///
++    /// 账号条件要加在**两处**，漏掉第二处的后果反直觉，所以单独说明：
++    ///
++    /// 1. 外层 `WHERE` —— 圈定本账号的可删候选；
++    /// 2. `NOT IN` 保留窗口子查询 —— 「最新 N 条」的窗口本身。
++    ///
++    /// 只加第一处的话，保留窗口仍是全局的：另一个账号的新行占满窗口名额后，
++    /// 本账号的修剪会把**自己**最新 N 条之内的行判成超限删掉。注意失败形态
++    /// 不是「删到别人的行」，而是「删掉自己该留的行」——它违反的是本文件
++    /// 既有测试守护的「候选集与可见前 N 条不得相交」不变量，且只在两个账号
++    /// 的行在时间上交错时才显现（一方全新或全旧时两种写法结果相同）。
++    ///
++    /// 中间那段 `NOT EXISTS` 剪贴板免疫子查询**不需要**账号条件：它已由
++    /// `c.session_id = t.session_id` 与外层关联，外层收窄即自动收窄。
+     pub fn select_prune_candidates(
+         conn: &Connection,
++        account_id: &str,
+         limit: u32,
+     ) -> Result<Vec<PruneCandidate>, rusqlite::Error> {
+         if limit == 0 {
+@@ -205,7 +247,8 @@ impl HistoryRepo {
+         let mut stmt = conn.prepare(
+             "SELECT t.session_id
+              FROM transfer_tasks t
+-             WHERE t.status IN ('COMPLETED', 'FAILED', 'CANCELLED')
++             WHERE t.account_id = ?3
++               AND t.status IN ('COMPLETED', 'FAILED', 'CANCELLED')
+                AND NOT EXISTS (
+                    SELECT 1 FROM cache_entries c
+                    WHERE c.session_id = t.session_id
+@@ -214,13 +257,14 @@ impl HistoryRepo {
+                )
+                AND t.session_id NOT IN (
+                    SELECT session_id FROM transfer_tasks
++                   WHERE account_id = ?3
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?1
+                )",
+         )?;
+ 
+         let session_ids: Vec<String> = stmt
+-            .query_map(rusqlite::params![limit, CLIPBOARD_LOCK_SECS], |row| row.get(0))?
++            .query_map(rusqlite::params![limit, CLIPBOARD_LOCK_SECS, account_id], |row| row.get(0))?
+             .filter_map(Result::ok)
+             .collect();
+         drop(stmt);
+@@ -353,13 +397,13 @@ mod tests {
+     fn test_history_crud() {
+         let conn = test_conn();
+ 
+-        HistoryRepo::record_task(&conn, "s1", "peer-1", "RECEIVE", &sample_offer("s1", "FILES"), "TRANSFERRING").unwrap();
+-        HistoryRepo::record_task(&conn, "s2", "peer-2", "SEND", &sample_offer("s2", "TEXT"), "TRANSFERRING").unwrap();
++        HistoryRepo::record_task(&conn, "acct", "s1", "peer-1", "RECEIVE", &sample_offer("s1", "FILES"), "TRANSFERRING").unwrap();
++        HistoryRepo::record_task(&conn, "acct", "s2", "peer-2", "SEND", &sample_offer("s2", "TEXT"), "TRANSFERRING").unwrap();
+ 
+         HistoryRepo::update_task_status(&conn, "s1", "COMPLETED", None).unwrap();
+         HistoryRepo::update_task_status(&conn, "s2", "FAILED", Some("data connect failed")).unwrap();
+ 
+-        let entries = HistoryRepo::list_history(&conn, 10).unwrap();
++        let entries = HistoryRepo::list_history(&conn, "acct", 10).unwrap();
+         assert_eq!(entries.len(), 2);
+         // newest first: s2 recorded after s1 within the same second, so rely on rowid tiebreak
+         assert_eq!(entries[0].session_id, "s2");
+@@ -377,13 +421,189 @@ mod tests {
+         assert!(HistoryRepo::get_task_brief(&conn, "missing").is_none());
+     }
+ 
++    // ---------- 按账号分区 ----------
++
++    /// 按指定账号与创建时间种一条已完成的行。
++    /// `age_secs` 越大越旧，用来构造两个账号在时间上**交错**的分布。
++    fn seed_for(conn: &Connection, account: &str, sid: &str, age_secs: i64) {
++        HistoryRepo::record_task(conn, account, sid, "peer", "RECEIVE", &sample_offer(sid, "FILES"), "TRANSFERRING")
++            .unwrap();
++        HistoryRepo::update_task_status(conn, sid, "COMPLETED", None).unwrap();
++        conn.execute(
++            "UPDATE transfer_tasks SET created_at = datetime('now', ?2) WHERE session_id = ?1",
++            rusqlite::params![sid, format!("-{} seconds", age_secs)],
++        )
++        .unwrap();
++    }
++
++    /// 删掉 list_history 的账号过滤，这条立刻红 —— 那正是「切账号后
++    /// 历史面板列出上一个账号的文件名」的形态。
++    #[test]
++    fn list_history_only_returns_current_account() {
++        let conn = test_conn();
++        seed_for(&conn, "alice", "a1", 10);
++        seed_for(&conn, "alice", "a2", 20);
++        seed_for(&conn, "bob", "b1", 15);
++
++        let alice = HistoryRepo::list_history(&conn, "alice", 100).unwrap();
++        assert_eq!(alice.len(), 2, "alice 只应看到自己的两条");
++        assert!(alice.iter().all(|e| e.session_id.starts_with('a')));
++
++        let bob = HistoryRepo::list_history(&conn, "bob", 100).unwrap();
++        assert_eq!(bob.len(), 1, "bob 只应看到自己的一条");
++        assert_eq!(bob[0].session_id, "b1");
++    }
++
++    /// 泄露的具体内容是文件名与预览摘要，单断条数不够。
++    #[test]
++    fn list_history_does_not_leak_other_account_previews() {
++        let conn = test_conn();
++        seed_for(&conn, "alice", "secret-session", 10);
++
++        let bob = HistoryRepo::list_history(&conn, "bob", 100).unwrap();
++        assert!(bob.is_empty(), "bob 不得看到 alice 的任何一条记录");
++    }
++
++    /// **本组最关键的一条。**
++    ///
++    /// 守的是 select_prune_candidates 的**第二处**过滤（NOT IN 保留窗口子查询）。
++    /// 只在外层加账号条件的话，保留窗口仍是全局的：bob 的新行占满窗口名额后，
++    /// alice 的修剪会把 alice **自己**最新 N 条之内的行判成超限删掉。
++    ///
++    /// 注意失败形态不是「删到别人的行」，而是「删掉自己该留的行」——
++    /// 所以下面那条 prune_never_touches_other_account_rows 抓不住它。
++    /// 也必须刻意让两个账号的行在时间上**交错**：bob 的行全新或全旧时，
++    /// 两种写法结果相同，用例就没有鉴别力了。
++    #[test]
++    fn prune_window_is_per_account_when_rows_interleave() {
++        let conn = test_conn();
++        // 时间交错：bob 的两条夹在 alice 的三条中间
++        seed_for(&conn, "alice", "a_new", 10);
++        seed_for(&conn, "bob", "b_1", 20);
++        seed_for(&conn, "alice", "a_mid", 30);
++        seed_for(&conn, "bob", "b_2", 40);
++        seed_for(&conn, "alice", "a_old", 50);
++
++        // alice 保留最新 2 条 => 只有 a_old 该被修剪
++        let candidates = HistoryRepo::select_prune_candidates(&conn, "alice", 2).unwrap();
++        let ids = session_ids(&candidates);
++
++        assert_eq!(
++            ids,
++            vec!["a_old".to_string()],
++            "alice 保留窗口内的 a_new / a_mid 一条都不能进候选；\
++             实得 {:?} —— 多半是 NOT IN 子查询漏了 account_id 过滤，\
++             bob 的新行占掉了 alice 的窗口名额",
++            ids
++        );
++    }
++
++    /// 修剪不得越界删到别人的行。与上一条守的是不同的失败形态。
++    #[test]
++    fn prune_never_touches_other_account_rows() {
++        let conn = test_conn();
++        seed_for(&conn, "alice", "a1", 10);
++        seed_for(&conn, "bob", "b1", 20);
++        seed_for(&conn, "bob", "b2", 30);
++        seed_for(&conn, "bob", "b3", 40);
++
++        // alice 一条都不保留，也只能删到自己那条
++        let candidates = HistoryRepo::select_prune_candidates(&conn, "alice", 0).unwrap();
++        assert!(candidates.is_empty(), "limit=0 表示不限制，不应有候选");
++
++        let candidates = HistoryRepo::select_prune_candidates(&conn, "alice", 1).unwrap();
++        assert!(
++            session_ids(&candidates).iter().all(|id| id.starts_with('a')),
++            "alice 的修剪不得把 bob 的行选进候选：{:?}",
++            session_ids(&candidates)
++        );
++    }
++
++    /// 老库的 NULL 行归给当前账号。
++    #[test]
++    fn claim_assigns_legacy_rows_to_current_account() {
++        let conn = test_conn();
++        HistoryRepo::record_task(&conn, "alice", "legacy", "peer", "RECEIVE", &sample_offer("legacy", "FILES"), "TRANSFERRING").unwrap();
++        // 人为制造老库形态
++        conn.execute("UPDATE transfer_tasks SET account_id = NULL", []).unwrap();
++        assert!(HistoryRepo::list_history(&conn, "alice", 10).unwrap().is_empty());
++
++        let claimed = crate::storage::db::claim_unowned_history(&conn, "alice").unwrap();
++        assert_eq!(claimed, 1);
++        assert_eq!(HistoryRepo::list_history(&conn, "alice", 10).unwrap().len(), 1);
++    }
++
++    /// 认领必须幂等，且**不得改走已有归属的行**。
++    /// 否则每次切账号都会把上一个账号的历史搬过来——认领的全部安全性
++    /// 都建立在「只触 NULL 行」上。
++    #[test]
++    fn claim_is_idempotent_and_does_not_resteal() {
++        let conn = test_conn();
++        seed_for(&conn, "alice", "a1", 10);
++
++        let claimed = crate::storage::db::claim_unowned_history(&conn, "bob").unwrap();
++        assert_eq!(claimed, 0, "已有归属的行不得被 bob 认领走");
++        assert_eq!(HistoryRepo::list_history(&conn, "alice", 10).unwrap().len(), 1);
++        assert!(HistoryRepo::list_history(&conn, "bob", 10).unwrap().is_empty());
++    }
++
++    /// 切账号是「看不见」而不是「被删掉」，切回来必须原样在。
++    #[test]
++    fn switching_account_hides_but_keeps_history() {
++        let conn = test_conn();
++        seed_for(&conn, "alice", "a1", 10);
++
++        assert!(HistoryRepo::list_history(&conn, "bob", 10).unwrap().is_empty());
++        let back = HistoryRepo::list_history(&conn, "alice", 10).unwrap();
++        assert_eq!(back.len(), 1, "切回 alice 后历史必须原样回来");
++        assert_eq!(back[0].session_id, "a1");
++    }
++
++    /// 归属闸门：三个直接读文件的 IPC 命令据此判断。
++    #[test]
++    fn session_ownership_gate_rejects_other_account_and_unclaimed() {
++        let conn = test_conn();
++        seed_for(&conn, "alice", "a1", 10);
++
++        assert!(HistoryRepo::session_belongs_to(&conn, "a1", "alice"));
++        assert!(!HistoryRepo::session_belongs_to(&conn, "a1", "bob"), "跨账号必须拒绝");
++        assert!(!HistoryRepo::session_belongs_to(&conn, "missing", "alice"));
++
++        // 未认领的老库行归属未知，宁可拒绝
++        conn.execute("UPDATE transfer_tasks SET account_id = NULL", []).unwrap();
++        assert!(
++            !HistoryRepo::session_belongs_to(&conn, "a1", "alice"),
++            "归属未知的行不得放行——宁可让用户重启一次完成认领"
++        );
++    }
++
++    /// `reset_stale_in_flight` **刻意保持全局**，这条把那个决策钉成会红的断言。
++    ///
++    /// 按账号过滤的话，上个账号崩溃留下的死行永远不会被复位，
++    /// 会永久占住它的保留额度并在它的历史里显示成「传输中」。
++    #[test]
++    fn reset_stale_in_flight_covers_all_accounts() {
++        let conn = test_conn();
++        HistoryRepo::record_task(&conn, "alice", "a_dead", "peer", "RECEIVE", &sample_offer("a_dead", "FILES"), "TRANSFERRING").unwrap();
++        HistoryRepo::record_task(&conn, "bob", "b_dead", "peer", "RECEIVE", &sample_offer("b_dead", "FILES"), "TRANSFERRING").unwrap();
++
++        let reset = HistoryRepo::reset_stale_in_flight(&conn).unwrap();
++        assert_eq!(reset, 2, "两个账号的死行都必须被复位，不论当前账号是谁");
++
++        for (acct, sid) in [("alice", "a_dead"), ("bob", "b_dead")] {
++            let entries = HistoryRepo::list_history(&conn, acct, 10).unwrap();
++            assert_eq!(entries[0].session_id, sid);
++            assert_eq!(entries[0].status, "FAILED", "{} 的死行应被复位为 FAILED", acct);
++        }
++    }
++
+     // ---------- 修剪（需求 4） ----------
+ 
+     /// 按插入顺序建 n 条已完成的任务：s1 最旧，sN 最新（同秒内靠 rowid 分先后）。
+     fn seed_completed(conn: &Connection, n: usize) {
+         for i in 1..=n {
+             let sid = format!("s{}", i);
+-            HistoryRepo::record_task(conn, &sid, "peer", "RECEIVE", &sample_offer(&sid, "FILES"), "TRANSFERRING")
++            HistoryRepo::record_task(conn, "acct", &sid, "peer", "RECEIVE", &sample_offer(&sid, "FILES"), "TRANSFERRING")
+                 .unwrap();
+             HistoryRepo::update_task_status(conn, &sid, "COMPLETED", None).unwrap();
+         }
+@@ -413,13 +633,13 @@ mod tests {
+         let mut conn = test_conn();
+         seed_completed(&conn, 5);
+ 
+-        let candidates = HistoryRepo::select_prune_candidates(&conn, 3).unwrap();
++        let candidates = HistoryRepo::select_prune_candidates(&conn, "acct", 3).unwrap();
+         assert_eq!(session_ids(&candidates), vec!["s1", "s2"], "应只删最旧的两条");
+ 
+         let ids: Vec<String> = candidates.into_iter().map(|c| c.session_id).collect();
+         assert_eq!(HistoryRepo::delete_sessions(&mut conn, &ids).unwrap(), 2);
+ 
+-        let left = HistoryRepo::list_history(&conn, 10).unwrap();
++        let left = HistoryRepo::list_history(&conn, "acct", 10).unwrap();
+         assert_eq!(left.len(), 3);
+         assert_eq!(left[0].session_id, "s5", "最新的必须还在");
+     }
+@@ -429,7 +649,7 @@ mod tests {
+         let conn = test_conn();
+         seed_completed(&conn, 5);
+         assert!(
+-            HistoryRepo::select_prune_candidates(&conn, 0).unwrap().is_empty(),
++            HistoryRepo::select_prune_candidates(&conn, "acct", 0).unwrap().is_empty(),
+             "0 表示不限制，一条都不该选中"
+         );
+     }
+@@ -439,11 +659,11 @@ mod tests {
+     #[test]
+     fn prune_never_touches_in_flight_tasks() {
+         let conn = test_conn();
+-        HistoryRepo::record_task(&conn, "old-running", "peer", "RECEIVE", &sample_offer("old-running", "FILES"), "TRANSFERRING")
++        HistoryRepo::record_task(&conn, "acct", "old-running", "peer", "RECEIVE", &sample_offer("old-running", "FILES"), "TRANSFERRING")
+             .unwrap();
+         seed_completed(&conn, 4);
+ 
+-        let candidates = HistoryRepo::select_prune_candidates(&conn, 2).unwrap();
++        let candidates = HistoryRepo::select_prune_candidates(&conn, "acct", 2).unwrap();
+         let ids = session_ids(&candidates);
+         assert!(!ids.contains(&"old-running".to_string()), "进行中的任务不得被选为删除候选");
+         assert_eq!(ids, vec!["s1", "s2"]);
+@@ -458,7 +678,7 @@ mod tests {
+         add_cache_entry(&conn, "s1", "/tmp/locked.bin", true);
+         add_cache_entry(&conn, "s2", "/tmp/free.bin", false);
+ 
+-        let ids = session_ids(&HistoryRepo::select_prune_candidates(&conn, 3).unwrap());
++        let ids = session_ids(&HistoryRepo::select_prune_candidates(&conn, "acct", 3).unwrap());
+         assert_eq!(ids, vec!["s2"], "s1 处于免疫窗口内，本轮应跳过");
+     }
+ 
+@@ -467,7 +687,7 @@ mod tests {
+     #[test]
+     fn delete_sessions_clears_all_four_tables() {
+         let mut conn = test_conn();
+-        HistoryRepo::record_task(&conn, "s1", "peer", "RECEIVE", &sample_offer("s1", "FILES"), "TRANSFERRING").unwrap();
++        HistoryRepo::record_task(&conn, "acct", "s1", "peer", "RECEIVE", &sample_offer("s1", "FILES"), "TRANSFERRING").unwrap();
+         HistoryRepo::update_task_status(&conn, "s1", "COMPLETED", None).unwrap();
+         add_cache_entry(&conn, "s1", "/tmp/a.bin", false);
+         conn.execute(
+@@ -493,7 +713,7 @@ mod tests {
+         add_cache_entry(&conn, "s1", "/tmp/one.bin", false);
+         add_cache_entry(&conn, "s1", "/tmp/two.bin", false);
+ 
+-        let candidates = HistoryRepo::select_prune_candidates(&conn, 2).unwrap();
++        let candidates = HistoryRepo::select_prune_candidates(&conn, "acct", 2).unwrap();
+         assert_eq!(candidates.len(), 1);
+         let mut paths = candidates[0].file_paths.clone();
+         paths.sort();
+@@ -507,12 +727,12 @@ mod tests {
+         let conn = test_conn();
+         seed_completed(&conn, 6);
+ 
+-        let visible: Vec<String> = HistoryRepo::list_history(&conn, 4)
++        let visible: Vec<String> = HistoryRepo::list_history(&conn, "acct", 4)
+             .unwrap()
+             .into_iter()
+             .map(|e| e.session_id)
+             .collect();
+-        let candidates = session_ids(&HistoryRepo::select_prune_candidates(&conn, 4).unwrap());
++        let candidates = session_ids(&HistoryRepo::select_prune_candidates(&conn, "acct", 4).unwrap());
+ 
+         for id in &candidates {
+             assert!(!visible.contains(id), "{} 同时出现在保留窗口与删除候选中", id);
+@@ -546,10 +766,10 @@ mod tests {
+     #[test]
+     fn reset_stale_in_flight_converts_only_unfinished_rows() {
+         let conn = test_conn();
+-        HistoryRepo::record_task(&conn, "running", "peer", "RECEIVE", &sample_offer("running", "FILES"), "TRANSFERRING")
++        HistoryRepo::record_task(&conn, "acct", "running", "peer", "RECEIVE", &sample_offer("running", "FILES"), "TRANSFERRING")
+             .unwrap();
+-        HistoryRepo::record_task(&conn, "pending", "peer", "SEND", &sample_offer("pending", "TEXT"), "PENDING").unwrap();
+-        HistoryRepo::record_task(&conn, "done", "peer", "SEND", &sample_offer("done", "TEXT"), "TRANSFERRING").unwrap();
++        HistoryRepo::record_task(&conn, "acct", "pending", "peer", "SEND", &sample_offer("pending", "TEXT"), "PENDING").unwrap();
++        HistoryRepo::record_task(&conn, "acct", "done", "peer", "SEND", &sample_offer("done", "TEXT"), "TRANSFERRING").unwrap();
+         HistoryRepo::update_task_status(&conn, "done", "COMPLETED", None).unwrap();
+ 
+         assert_eq!(HistoryRepo::reset_stale_in_flight(&conn).unwrap(), 2);
+@@ -567,17 +787,17 @@ mod tests {
+     #[test]
+     fn reset_then_prune_reclaims_dead_rows() {
+         let mut conn = test_conn();
+-        HistoryRepo::record_task(&conn, "dead", "peer", "RECEIVE", &sample_offer("dead", "FILES"), "TRANSFERRING")
++        HistoryRepo::record_task(&conn, "acct", "dead", "peer", "RECEIVE", &sample_offer("dead", "FILES"), "TRANSFERRING")
+             .unwrap();
+         seed_completed(&conn, 3);
+ 
+         assert!(
+-            HistoryRepo::select_prune_candidates(&conn, 2).unwrap().iter().all(|c| c.session_id != "dead"),
++            HistoryRepo::select_prune_candidates(&conn, "acct", 2).unwrap().iter().all(|c| c.session_id != "dead"),
+             "复位前，死行受约束 A 保护"
+         );
+ 
+         HistoryRepo::reset_stale_in_flight(&conn).unwrap();
+-        let ids: Vec<String> = HistoryRepo::select_prune_candidates(&conn, 2)
++        let ids: Vec<String> = HistoryRepo::select_prune_candidates(&conn, "acct", 2)
+             .unwrap()
+             .into_iter()
+             .map(|c| c.session_id)
+@@ -585,6 +805,6 @@ mod tests {
+         assert!(ids.contains(&"dead".to_string()), "复位后死行应可被回收");
+ 
+         HistoryRepo::delete_sessions(&mut conn, &ids).unwrap();
+-        assert_eq!(HistoryRepo::list_history(&conn, 10).unwrap().len(), 2);
++        assert_eq!(HistoryRepo::list_history(&conn, "acct", 10).unwrap().len(), 2);
+     }
+ }
+diff --git a/client/src/components/HistoryPanel.test.tsx b/client/src/components/HistoryPanel.test.tsx
+index 21dce02..7228643 100644
+--- a/client/src/components/HistoryPanel.test.tsx
++++ b/client/src/components/HistoryPanel.test.tsx
+@@ -82,16 +82,42 @@ describe("历史面板的刷新链路", () => {
+     expect(countInvokes("cmd_list_history")).toBe(1);
+   });
+ 
+-  it("卸载时两个监听都解绑", async () => {
++  it("卸载时三个监听都解绑", async () => {
+     const { unmount } = await renderPanel([]);
+     expect(listenerCount("history-pruned")).toBe(1);
+     expect(listenerCount("transfer-progress")).toBe(1);
++    expect(listenerCount("account-changed")).toBe(1);
+ 
+     unmount();
+ 
+     await waitFor(() => {
+       expect(listenerCount("history-pruned")).toBe(0);
+       expect(listenerCount("transfer-progress")).toBe(0);
++      expect(listenerCount("account-changed")).toBe(0);
++    });
++  });
++
++  // 上一轮的 tls-cert-failed 就是「事件发了没人接」，这条防同类问题。
++  // 监听必须落在 HistoryPanel——它才是真正拉 cmd_list_history 的地方；
++  // 放在 App 里看着也通，但 fetchInitialData 根本不拉历史。
++  it("注册了 account-changed 监听", async () => {
++    await renderPanel([]);
++    expect(listenerCount("account-changed")).toBe(1);
++  });
++
++  // 切账号后不重拉，列表会继续显示上一个账号的卡片，
++  // 而卡片上的装载 / 另存为 / 定位三个按钮都会真的去读文件。
++  // 不能指望 history-pruned 代劳：切账号时通常一条都不用修剪，那个事件不会来。
++  it("收到 account-changed 后重新拉取历史", async () => {
++    await renderPanel([entry("s1")]);
++    const before = countInvokes("cmd_list_history");
++
++    await act(async () => {
++      emitEvent("account-changed", undefined);
++    });
++
++    await waitFor(() => {
++      expect(countInvokes("cmd_list_history")).toBeGreaterThan(before);
+     });
+   });
+ });
+diff --git a/client/src/components/HistoryPanel.tsx b/client/src/components/HistoryPanel.tsx
+index 2734e64..27b1cc9 100644
+--- a/client/src/components/HistoryPanel.tsx
++++ b/client/src/components/HistoryPanel.tsx
+@@ -48,9 +48,20 @@ export const HistoryPanel: React.FC<HistoryPanelProps> = ({ onNotify }) => {
+     const unlistenPrunedPromise = listen<number>("history-pruned", () => {
+       refresh(true);
+     });
++    // 切账号后必须重拉：列表是按账号过滤的，不重拉就会继续显示上一个账号的
++    // 卡片——而卡片上的装载 / 另存为 / 定位三个按钮都会真的去读文件。
++    // 后端有归属闸门兜底（ensure_session_owned），但让用户点到一个必然报错的
++    // 按钮本身就是缺陷。
++    //
++    // 不复用 history-pruned：那是「修剪删掉了东西」的语义，而切账号时通常
++    // 一条都不用删，`prune_and_notify` 在 Ok(0) 时根本不广播。
++    const unlistenAccountPromise = listen("account-changed", () => {
++      refresh(true);
++    });
+     return () => {
+       unlistenPromise.then((unlisten) => unlisten());
+       unlistenPrunedPromise.then((unlisten) => unlisten());
++      unlistenAccountPromise.then((unlisten) => unlisten());
+     };
+   }, [refresh]);
+ 
+diff --git a/docs/USER_GUIDE.md b/docs/USER_GUIDE.md
+index d91331f..d472f74 100644
+--- a/docs/USER_GUIDE.md
++++ b/docs/USER_GUIDE.md
+@@ -56,9 +56,19 @@ UniDrop 与传统文件传输工具（如网盘、微信文件传输助手、隔
+      不支持中文与空格——服务端按字节匹配账号，而同一个中文名在不同系统上
+      可能产生不同的字节形式，看起来一样却会被分进两个互不相通的工作区。
+    * 填错时不会静默失败：客户端顶部会出现红色横幅，写明具体的格式规则。
+-3. **预共享密钥 (PSK Secret Key)**：
++3. **多账号下的保留策略**（若这台机器上会切换多个账号）：
++   * **传输历史保留条数是「每账号」上限**，不是全库总数。两个账号各留 100 条时，
++     库内会有 200 条——这样一个账号频繁传输才不会把另一个账号的历史挤光。
++   * **缓存的保留时长与容量上限是「全局」的**：磁盘是共享的物理资源，
++     给每个账号各配一份容量就等于超卖。容量触顶时按全局最久未用淘汰，
++     被淘汰的只是缓存**文件**，历史记录会保留并显示「缓存已清理」。
++   * 切换账号后，上一个账号的历史**不会被删除**，只是看不到；切回去就还在。
++   * 从旧版本升级时，此前的历史没有账号归属，会被归给**升级后首次启动时的
++     那个账号**。这些记录原本就是混在一起的，无从判断真正的归属。
++     若首次启动时账号栏是空的或填了非法值，认领会推迟到下次填了合法账号再进行。
++4. **预共享密钥 (PSK Secret Key)**：
+    * 填入中继服务器预设的高强度密钥字符串。
+-4. **允许不安全连接**（默认关闭，**请尽量保持关闭**）：
++5. **允许不安全连接**（默认关闭，**请尽量保持关闭**）：
+    * 关闭时，客户端会校验服务器的 TLS 证书，确认连上的确实是目标服务器。
+    * 需要勾选的情况有三类：服务端使用**自签证书**、直接用 **IP 地址**连接
+      （证书上没有对应的名字）、或证书由**企业内部 CA** 签发（公共根证书库里没有它）。
+@@ -67,9 +77,25 @@ UniDrop 与传统文件传输工具（如网盘、微信文件传输助手、隔
+      但**加密的对端是谁不再有保证**。
+    * 若升级后突然连不上，且界面提示「无法验证服务器证书」，说明你的部署属于
+      上述三类之一。首选做法是给服务器换一张受信任的证书，其次才是勾选此项。
+-5. **静默自动装载剪贴板**（强烈推荐勾选）：
++   * **自签证书必须是 X.509 v3**——这一条勾选与否都绕不过：客户端在**解析**
++     阶段就会拒绝 v1 证书，那一步早于任何校验逻辑，所以勾选本项也救不回来。
++     实测报错为 `invalid peer certificate: ... UnsupportedCertVersion`。
++   * **SAN（主机名）只有不勾选本项时才需要**：它服务于主机名校验，而勾选后
++     客户端根本不查名称。不过下面这条命令一次把两个条件都满足，两种情况都适用。
++   * macOS 自带的 LibreSSL 用 `openssl req -x509` 默认生成的正是 v1，需要显式加
++     扩展：
++
++     ```bash
++     openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem \
++       -days 365 -nodes -subj "/CN=your.host" \
++       -addext "subjectAltName=DNS:your.host,IP:1.2.3.4"
++     ```
++
++     用 `openssl x509 -in cert.pem -noout -text | grep Version` 确认输出是
++     `Version: 3 (0x2)`。
++6. **静默自动装载剪贴板**（强烈推荐勾选）：
+    * 开启后，远端传来的文件一经下载核验完成，无需手动点击，直接写入本地系统剪贴板。
+-6. 点击 **“保存配置”**，客户端将即时热更新配置并自动重新建立安全连接，无需重启客户端。
++7. 点击 **“保存配置”**，客户端将即时热更新配置并自动重新建立安全连接，无需重启客户端。
+ 
+ > [!TIP]
+ > 如果顶部出现红色横幅提示 **“鉴权失败: signature mismatch / timestamp expired”**，说明密钥填写有误或本机系统时间与服务器误差超过 60 秒，请点击“检查密钥”重新校对。
+diff --git a/docs/需求.md b/docs/需求.md
+index ac883ce..9640cea 100644
+--- a/docs/需求.md
++++ b/docs/需求.md
+@@ -73,6 +73,12 @@
+    两条硬约束：进行中的任务不删；文件仍处于 2 小时剪贴板免疫窗口内的会话本轮跳过。
+    触发点为任务落终态后、保存设置后、启动时（启动先把崩溃残留的非终态行复位为 FAILED，
+    否则死行会永久占住保留额度）。列表**显示**上限与**淘汰**上限解耦，前者是防御性常量。
++   — **补充**（2026-09-13，local-store-account-scope）：该上限自本轮起是**每账号**
++   语义而非全库总数。两个账号各留 100 条时库内会有 200 条——这是分区的必然结果，
++   否则一个账号频繁传输就会把另一个账号的历史挤光。与之相对，缓存的 TTL 与容量
++   上限（第 8 条）保持**全局**：磁盘是共享的物理资源，按账号各配一份就是超卖。
++   启动复位（`reset_stale_in_flight`）同样保持全局，否则上个账号崩溃留下的死行
++   永远无人复位。
+ 5. 可以设置传输任务完成后在界面中保持多久，一段时间后自动在界面中消失。
+    — **已实现**（2026-09-13）。新增 `AppSettings.transfer_card_retain_secs`，默认 30 秒，
+    `0` = 不自动消失。**只作用于 COMPLETED 卡片**：失败卡片始终保留到手动关闭，
+@@ -99,8 +105,10 @@
+    结束时被判成未授权拆除，且账号在途计数归零使容量拒绝退化到数据面。
+    **凭据模型保持不变**：仍是单把全局 PSK，`account_id` 仍由客户端自报，
+    账号仍是便利分区而非安全边界。per-account 凭据与 JWT 未做。
+-   遗留：本地历史与磁盘缓存四张表仍无 `account_id` 列，同一台机器上切换
+-   账号会看到彼此的传输历史，留待下一轮。
++   遗留项**已解决**（2026-09-13，local-store-account-scope）：`transfer_tasks`
++   已加 `account_id` 列，历史列表与修剪按账号分区；三个直接读缓存文件的 IPC
++   命令（装载剪贴板 / 另存为 / 在文件管理器中显示）加了归属闸门；切账号时
++   广播 `account-changed` 让界面重拉，避免残留卡片被点开。
+ 7. 全程加密。
+    — **部分实现**（2026-09-13）。本轮只做了传输层：客户端此前**无条件**跳过
+    TLS 服务器证书校验（`verify_server_cert` 直接返回成功，控制面与数据面
+@@ -108,6 +116,16 @@
+    证书校验，跳过校验改为设置项 `allow_insecure_tls`（默认关闭），
+    供自签证书 / IP 直连 / 非公共 CA 三类部署显式选择；证书失败会单独提示，
+    而不是让用户看着它反复重连。
++   **已实机验证**（2026-09-13）：默认档对 self-signed / expired / wrong-host
++   （badssl.com）与本地自签四种无效证书全部拒绝，服务端侧可见
++   `TLSV1_ALERT_UNKNOWN_CA`；勾选后同一张自签证书握手成功（TLSv1.3）。
++   连带发现一个会让人查很久的坑：**自签证书必须是 X.509 v3 且带 SAN**，
++   否则勾选开关也连不上——rustls 在解析阶段就拒绝 v1，早于「是否校验签发者」
++   的判断，而 macOS 自带 LibreSSL 的 `openssl req -x509` 默认生成的正是 v1。
++   已写进 USER_GUIDE。
++   **E2EE 仍未实现**，属 Phase 3：协议位（`FLAG_ENCRYPTED`、`encrypted`
++   字段）是占位，客户端所有构造点硬编码 `false`，仓库无任何密码学依赖。
++   本地 SQLite 与缓存文件也仍是明文。
+ 8. 磁盘缓存文件要定时删除。
+    — **已实现**（2026-09-13）。核验发现定时清理早已存在（每小时一次，24h TTL +
+    10GB LRU），本轮是把写死的策略参数开放为配置项，而非新建第二套清理：
