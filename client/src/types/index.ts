@@ -18,6 +18,12 @@ export interface AppSettings {
   history_max_entries: number;
   /** 传输**完成**的卡片在界面保持的秒数；0 = 不自动消失。失败卡片不受此设置影响。 */
   transfer_card_retain_secs: number;
+  /** 磁盘缓存文件保留小时数；0 = 不按时间清理。 */
+  cache_ttl_hours: number;
+  /** 磁盘缓存总量上限（MB）；0 = 不限容量。 */
+  cache_max_size_mb: number;
+  /** 后台清理间隔（分钟），最小 1。 */
+  cache_sweep_interval_minutes: number;
 }
 
 export interface ActiveTransfer {

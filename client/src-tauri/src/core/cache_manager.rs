@@ -1,14 +1,11 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use rusqlite::Connection;
 use tokio::sync::Mutex;
 
-pub const DEFAULT_TTL: Duration = Duration::from_secs(24 * 3600); // 24 hours
-pub const CLIPBOARD_LOCK_DURATION: Duration = Duration::from_secs(2 * 3600); // 2 hours
-pub const MAX_CACHE_SIZE_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
-pub const SAFE_LOW_WATERMARK_BYTES: u64 = 8 * 1024 * 1024 * 1024; // 8 GB
+use crate::core::retention::{RetentionPolicy, CLIPBOARD_LOCK_SECS};
 
 #[derive(Clone)]
 pub struct CacheManager {
@@ -109,7 +106,7 @@ impl CacheManager {
     ///    会把整条信令链路一起堵住；
     /// 3. 删行（重新取锁，单事务）。
     ///
-    /// **先删文件后删行**，与 `sweep_expired_and_lru` 同序。反过来先删行的话，
+    /// **先删文件后删行**，与 `sweep` 同序。反过来先删行的话，
     /// 一旦 `remove_file` 失败，文件就脱离了 `cache_entries` 索引，而全部清理逻辑
     /// 都以表行为遍历源 ⇒ 永远扫不到它，成为不可回收的磁盘孤儿。
     /// 反向留下的「行在、文件没了」则可自愈：下轮修剪会重试，且另存为/打开位置
@@ -168,68 +165,166 @@ impl CacheManager {
         crate::storage::HistoryRepo::delete_sessions(&mut conn, &safe).map_err(|e| e.to_string())
     }
 
-    /// Scans cache, purging expired files (>24h) and enforcing LRU quota (<10GB) while respecting 2h clipboard lock (P1-9, P3-3).
-    pub async fn sweep_expired_and_lru(&self) -> Result<usize, String> {
-        let conn = self.db_conn.lock().await;
+    /// 按保留策略清理缓存：TTL 淘汰 + 容量配额（LRU），返回删除的条目数。
+    ///
+    /// 与 `prune_history` 相同的三段式，**磁盘 IO 段不持 `db_conn` 锁**：
+    /// 改造前本函数从取锁起一路持有到函数尾，`fs::remove_file` 循环就在锁内；
+    /// 容量上限开放到 1 TB 后，单轮可能删数千个文件，持锁停顿会把整条信令链路
+    /// 一起堵住。`history_pruner` 的模块头注已把这条锁纪律写成总纲，
+    /// 这里必须对齐，否则那条纪律形同虚设。
+    ///
+    /// 两段都尊重剪贴板免疫窗口；`policy` 的任一段为 0 表示关闭该段，
+    /// **不是**「阈值为 0 立刻删光」——后者是能造成数据丢失的反向语义。
+    pub async fn sweep(&self, policy: RetentionPolicy) -> Result<usize, String> {
+        let mut victims: Vec<String> = Vec::new();
+        // TTL 段即将释放的体积，容量段要先扣掉它再判断是否仍超限
+        let mut ttl_freed: u64 = 0;
 
-        // 1. Query files eligible for TTL eviction (>24h and no active clipboard lock)
-        let mut stmt = conn.prepare(
-            "SELECT file_path FROM cache_entries
-             WHERE (strftime('%s', 'now') - strftime('%s', created_at)) > 86400
-               AND (clipboard_injected_at IS NULL OR (strftime('%s', 'now') - strftime('%s', clipboard_injected_at)) > 7200)"
-        ).map_err(|e| e.to_string())?;
+        // ---- 第 1 段：选取（持锁），取完即释放 ----
+        {
+            let conn = self.db_conn.lock().await;
 
-        let expired_files: Vec<String> = stmt
-            .query_map([], |row| row.get(0))
-            .map_err(|e| e.to_string())?
-            .filter_map(Result::ok)
-            .collect();
-        drop(stmt);
+            if policy.ttl_enabled() {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT file_path, file_size FROM cache_entries
+                         WHERE (strftime('%s', 'now') - strftime('%s', created_at)) > ?1
+                           AND (clipboard_injected_at IS NULL
+                                OR (strftime('%s', 'now') - strftime('%s', clipboard_injected_at)) > ?2)",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let expired: Vec<(String, u64)> = stmt
+                    .query_map(rusqlite::params![policy.ttl_seconds(), CLIPBOARD_LOCK_SECS], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })
+                    .map_err(|e| e.to_string())?
+                    .filter_map(Result::ok)
+                    .collect();
+                drop(stmt);
+                for (path, size) in expired {
+                    ttl_freed = ttl_freed.saturating_add(size);
+                    victims.push(path);
+                }
+            }
 
-        let mut purged_count = 0;
-        for path_str in &expired_files {
-            let p = PathBuf::from(path_str);
+            if policy.quota_enabled() {
+                let total: u64 = conn
+                    .query_row("SELECT COALESCE(SUM(file_size), 0) FROM cache_entries", [], |row| row.get(0))
+                    .unwrap_or(0);
+
+                // 先扣掉 TTL 段即将释放的体积，再判断是否仍然超限。
+                //
+                // 少了这一步就会**过度删除**：candidates 按 last_accessed_at 排序，
+                // 这个顺序与「是否过期」毫无关系，于是一个未过期但很久没访问的活跃
+                // 文件会排在已过期文件前面被选中——哪怕只删那些过期文件就已经降到
+                // 低水位。默认配置（24h + 10240MB）两段都开，正是最常见的形态。
+                let mut remaining = total.saturating_sub(ttl_freed);
+                let low = policy.low_watermark_bytes();
+
+                if remaining > low {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT file_path, file_size FROM cache_entries
+                             WHERE (clipboard_injected_at IS NULL
+                                    OR (strftime('%s', 'now') - strftime('%s', clipboard_injected_at)) > ?1)
+                             ORDER BY last_accessed_at ASC",
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let candidates: Vec<(String, u64)> = stmt
+                        .query_map(rusqlite::params![CLIPBOARD_LOCK_SECS], |row| Ok((row.get(0)?, row.get(1)?)))
+                        .map_err(|e| e.to_string())?
+                        .filter_map(Result::ok)
+                        .collect();
+                    drop(stmt);
+
+                    // 成员判断用 HashSet：victims 会持续增长，对它做线性扫描是
+                    // O(n²) 字符串比较，而这段就在持锁区间内——三段式的全部意义
+                    // 就是不让长耗时操作卡在锁里，不能自己又把它放回去。
+                    let mut chosen: HashSet<String> = victims.iter().cloned().collect();
+                    for (path, size) in candidates {
+                        if remaining <= low {
+                            break;
+                        }
+                        // TTL 段已选中的体积在上面扣过了，这里跳过以免重复计入
+                        if chosen.contains(&path) {
+                            continue;
+                        }
+                        remaining = remaining.saturating_sub(size);
+                        chosen.insert(path.clone());
+                        victims.push(path);
+                    }
+                }
+            }
+        } // 锁在此释放
+
+        if victims.is_empty() {
+            return Ok(0);
+        }
+
+        // ---- 第 2 段：删文件（不持锁）----
+        // 删不掉的保留其数据库行，留到下轮重试：只删行会让文件脱离 cache_entries
+        // 索引，而所有清理逻辑都以表行为遍历源 ⇒ 成为永远扫不到的磁盘孤儿。
+        let mut removed: Vec<String> = Vec::with_capacity(victims.len());
+        for path_str in victims {
+            let p = PathBuf::from(&path_str);
             if p.exists() {
-                let _ = fs::remove_file(&p);
+                if let Err(e) = fs::remove_file(&p) {
+                    log::warn!("Failed to remove cached file {} during sweep: {}", p.display(), e);
+                    continue;
+                }
             }
-            conn.execute("DELETE FROM cache_entries WHERE file_path = ?1", [path_str]).ok();
-            purged_count += 1;
+            removed.push(path_str);
+        }
+        if removed.is_empty() {
+            return Ok(0);
         }
 
-        // 2. Enforce LRU quota: if total cache size > 10GB, evict oldest accessed files down to 8GB
-        let mut total_size_stmt = conn.prepare("SELECT COALESCE(SUM(file_size), 0) FROM cache_entries").map_err(|e| e.to_string())?;
-        let mut current_total: u64 = total_size_stmt.query_row([], |row| row.get(0)).unwrap_or(0);
-        drop(total_size_stmt);
+        // ---- 第 3 段：删行（重新取锁，先复核免疫状态，单事务）----
+        //
+        // 复核是必要的：第 2 段不持锁，用户可能正好在那段时间点了「装载」，
+        // `mark_clipboard_injected` 需要同一把锁，因此标记会落在第 1 段选取之后。
+        // 与 `prune_history` 的第 3 段对齐。
+        //
+        // **但它只挡得住行被删**：文件在第 2 段就已经删掉了，救不回来。
+        // 它把「行和文件都没了」降级成「行在、文件没了」——后者是既有代码已处理的
+        // 可自愈状态（另存为/打开位置都会提示缓存已清理），且用户刚碰过的条目不会
+        // 凭空消失。要彻底关掉这个窗口就得持锁做磁盘 IO，那正是三段式要避免的。
+        let mut conn = self.db_conn.lock().await;
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        let mut deleted = 0usize;
+        {
+            let mut lock_stmt = tx
+                .prepare(
+                    "SELECT 1 FROM cache_entries
+                     WHERE file_path = ?1
+                       AND clipboard_injected_at IS NOT NULL
+                       AND (strftime('%s', 'now') - strftime('%s', clipboard_injected_at)) <= ?2
+                     LIMIT 1",
+                )
+                .map_err(|e| e.to_string())?;
+            // 同在持锁区间内，复用 prepared statement 而不是每条都重新 prepare
+            let mut del_stmt = tx
+                .prepare("DELETE FROM cache_entries WHERE file_path = ?1")
+                .map_err(|e| e.to_string())?;
 
-        if current_total > MAX_CACHE_SIZE_BYTES {
-            let mut lru_stmt = conn.prepare(
-                "SELECT file_path, file_size FROM cache_entries
-                 WHERE (clipboard_injected_at IS NULL OR (strftime('%s', 'now') - strftime('%s', clipboard_injected_at)) > 7200)
-                 ORDER BY last_accessed_at ASC"
-            ).map_err(|e| e.to_string())?;
-
-            let lru_entries: Vec<(String, u64)> = lru_stmt
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .map_err(|e| e.to_string())?
-                .filter_map(Result::ok)
-                .collect();
-            drop(lru_stmt);
-
-            for (path_str, size) in lru_entries {
-                if current_total <= SAFE_LOW_WATERMARK_BYTES {
-                    break;
+            for path_str in &removed {
+                let just_injected = lock_stmt
+                    .exists(rusqlite::params![path_str, CLIPBOARD_LOCK_SECS])
+                    .map_err(|e| e.to_string())?;
+                if just_injected {
+                    log::info!(
+                        "Cache entry {} was injected into clipboard during the sweep window, keeping its row",
+                        path_str
+                    );
+                    continue;
                 }
-                let p = PathBuf::from(&path_str);
-                if p.exists() {
-                    let _ = fs::remove_file(&p);
-                }
-                conn.execute("DELETE FROM cache_entries WHERE file_path = ?1", [&path_str]).ok();
-                current_total = current_total.saturating_sub(size);
-                purged_count += 1;
+                del_stmt.execute([path_str]).map_err(|e| e.to_string())?;
+                deleted += 1;
             }
         }
+        tx.commit().map_err(|e| e.to_string())?;
 
-        Ok(purged_count)
+        Ok(deleted)
     }
 }
 
@@ -377,6 +472,183 @@ mod tests {
         assert_eq!(pruned, 0, "已装载进剪贴板的会话不应被删");
         assert!(task_exists(&db, "s_old").await, "刚被用户装载的历史条目不能消失");
         assert!(f1.exists(), "免疫期内文件也不该被删，否则剪贴板里的引用会失效");
+    }
+
+    // ---------- sweep：TTL 与容量清理（需求 9） ----------
+
+    /// 写入一个缓存条目，`age_secs` 指定它已存在多久（用于跨过 TTL 阈值）。
+    async fn seed_cache_file(
+        db: &Arc<Mutex<Connection>>,
+        path: &Path,
+        size: i64,
+        age_secs: i64,
+        injected: bool,
+    ) {
+        fs::write(path, vec![0u8; size.max(1) as usize]).unwrap();
+        let conn = db.lock().await;
+        conn.execute(
+            "INSERT INTO cache_entries (file_path, session_id, file_size, created_at, last_accessed_at, clipboard_injected_at)
+             VALUES (?1, 'sess', ?2, datetime('now', ?3), datetime('now', ?4), CASE WHEN ?5 THEN CURRENT_TIMESTAMP ELSE NULL END)",
+            rusqlite::params![
+                path.to_str().unwrap(),
+                size,
+                format!("-{} seconds", age_secs),
+                format!("-{} seconds", age_secs),
+                injected
+            ],
+        )
+        .unwrap();
+    }
+
+    async fn cache_row_count(db: &Arc<Mutex<Connection>>) -> i64 {
+        let conn = db.lock().await;
+        conn.query_row("SELECT COUNT(*) FROM cache_entries", [], |r| r.get(0)).unwrap()
+    }
+
+    fn policy(ttl_hours: u32, max_mb: u64) -> RetentionPolicy {
+        RetentionPolicy { ttl_hours, max_size_bytes: max_mb * 1024 * 1024 }
+    }
+
+    #[tokio::test]
+    async fn sweep_removes_files_past_ttl() {
+        let tmp = TempDir::new();
+        let (mgr, db) = manager_with_memory_db();
+        let old = tmp.path().join("old.bin");
+        let fresh = tmp.path().join("fresh.bin");
+        seed_cache_file(&db, &old, 10, 90_000, false).await;   // 25 小时前
+        seed_cache_file(&db, &fresh, 10, 60, false).await;     // 1 分钟前
+
+        assert_eq!(mgr.sweep(policy(24, 0)).await.unwrap(), 1);
+        assert!(!old.exists(), "超期文件应被删除");
+        assert!(fresh.exists(), "未超期文件必须保留");
+        assert_eq!(cache_row_count(&db).await, 1);
+    }
+
+    /// ttl_hours == 0 表示「不按时间清理」，绝不能被当成「阈值 0 秒 ⇒ 全删」。
+    /// 这条守的是一个会造成数据丢失的反向语义。
+    #[tokio::test]
+    async fn sweep_with_zero_ttl_deletes_nothing() {
+        let tmp = TempDir::new();
+        let (mgr, db) = manager_with_memory_db();
+        let ancient = tmp.path().join("ancient.bin");
+        seed_cache_file(&db, &ancient, 10, 9_000_000, false).await; // 100 天前
+
+        assert_eq!(mgr.sweep(policy(0, 0)).await.unwrap(), 0);
+        assert!(ancient.exists(), "TTL 关闭时再老的文件也不该删");
+        assert_eq!(cache_row_count(&db).await, 1);
+    }
+
+    /// 剪贴板免疫窗口内的文件，即使早已超期也不删。
+    #[tokio::test]
+    async fn sweep_respects_clipboard_lock() {
+        let tmp = TempDir::new();
+        let (mgr, db) = manager_with_memory_db();
+        let locked = tmp.path().join("locked.bin");
+        seed_cache_file(&db, &locked, 10, 90_000, true).await;
+
+        assert_eq!(mgr.sweep(policy(24, 0)).await.unwrap(), 0);
+        assert!(locked.exists(), "剪贴板引用中的文件不得被 TTL 删掉");
+    }
+
+    #[tokio::test]
+    async fn sweep_enforces_quota_down_to_low_watermark() {
+        let tmp = TempDir::new();
+        let (mgr, db) = manager_with_memory_db();
+        // 上限 10MB → 低水位 8MB；放 5 个 3MB，共 15MB
+        let mb = 1024 * 1024;
+        for i in 0..5 {
+            let p = tmp.path().join(format!("f{}.bin", i));
+            // 越早注册的 last_accessed_at 越老，先被 LRU 淘汰
+            seed_cache_file(&db, &p, 3 * mb, (5 - i) as i64 * 100, false).await;
+        }
+
+        let purged = mgr.sweep(policy(0, 10)).await.unwrap();
+        assert!(purged >= 3, "15MB 降到 8MB 以下至少要删 3 个 3MB 文件，实际删了 {}", purged);
+
+        let conn = db.lock().await;
+        let total: i64 = conn
+            .query_row("SELECT COALESCE(SUM(file_size),0) FROM cache_entries", [], |r| r.get(0))
+            .unwrap();
+        assert!(total as u64 <= policy(0, 10).low_watermark_bytes(), "应降到低水位以下");
+    }
+
+    /// TTL 与容量**同时启用**时不得过度删除。
+    ///
+    /// 这是 code 阶段审查抓到的唯一 major：容量段的 candidates 按 last_accessed_at
+    /// 排序，与「是否过期」毫无关系；若 remaining 从未扣除 TTL 已选体积的总量起算，
+    /// 一个未过期但很久没访问的活跃文件就会排在过期文件前面被选中——哪怕只删那些
+    /// 过期文件就已经降到低水位。
+    ///
+    /// 此前两条 sweep 测试各把另一段关成 0，从未覆盖两段同开，而默认配置
+    /// （24h + 10240MB）恰恰两段都开。
+    #[tokio::test]
+    async fn sweep_does_not_over_evict_when_ttl_already_frees_enough() {
+        let tmp = TempDir::new();
+        let (mgr, db) = manager_with_memory_db();
+        let mb = 1024 * 1024;
+
+        // active：未过期，但最后访问时间最老 → 在 LRU 候选中排第一
+        let active = tmp.path().join("active.bin");
+        seed_cache_file(&db, &active, 6 * mb, 60, false).await;
+        {
+            let conn = db.lock().await;
+            conn.execute(
+                "UPDATE cache_entries SET last_accessed_at = datetime('now', '-99999 seconds') WHERE file_path = ?1",
+                [active.to_str().unwrap()],
+            )
+            .unwrap();
+        }
+
+        // expired：已过期（TTL 会选中），最后访问时间较新
+        let expired = tmp.path().join("expired.bin");
+        seed_cache_file(&db, &expired, 6 * mb, 90_000, false).await;
+
+        // 上限 10MB → 低水位 8MB；总量 12MB 超限，但删掉 expired 后剩 6MB 已达标
+        let purged = mgr.sweep(policy(24, 10)).await.unwrap();
+
+        assert_eq!(purged, 1, "只该删过期的那一个");
+        assert!(!expired.exists(), "过期文件应被删除");
+        assert!(
+            active.exists(),
+            "未过期的活跃文件不得被误删——TTL 释放的体积已足够降到低水位"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_with_zero_quota_skips_lru() {
+        let tmp = TempDir::new();
+        let (mgr, db) = manager_with_memory_db();
+        let mb = 1024 * 1024;
+        for i in 0..3 {
+            seed_cache_file(&db, &tmp.path().join(format!("g{}.bin", i)), 5 * mb, 60, false).await;
+        }
+
+        assert_eq!(mgr.sweep(policy(0, 0)).await.unwrap(), 0, "两段都关闭时不该删任何东西");
+        assert_eq!(cache_row_count(&db).await, 3);
+    }
+
+    /// 第 2 段删文件失败时保留该条目的行，留到下轮重试——只删行会让文件
+    /// 脱离索引，而清理逻辑都以表行为遍历源，成为永远扫不到的孤儿。
+    #[tokio::test]
+    async fn sweep_keeps_row_when_file_cannot_be_removed() {
+        let tmp = TempDir::new();
+        let (mgr, db) = manager_with_memory_db();
+
+        let bad = tmp.path().join("undeletable-dir");
+        fs::create_dir_all(&bad).unwrap();
+        {
+            let conn = db.lock().await;
+            conn.execute(
+                "INSERT INTO cache_entries (file_path, session_id, file_size, created_at, last_accessed_at)
+                 VALUES (?1, 'sess', 10, datetime('now', '-90000 seconds'), datetime('now', '-90000 seconds'))",
+                [bad.to_str().unwrap()],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(mgr.sweep(policy(24, 0)).await.unwrap(), 0, "删不掉的不计入");
+        assert_eq!(cache_row_count(&db).await, 1, "行必须保留以便下轮重试");
+        assert!(bad.exists());
     }
 
     #[tokio::test]

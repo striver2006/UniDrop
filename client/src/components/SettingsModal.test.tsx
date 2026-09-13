@@ -18,6 +18,9 @@ const baseSettings: AppSettings = {
   start_minimized: false,
   history_max_entries: 100,
   transfer_card_retain_secs: 30,
+  cache_ttl_hours: 24,
+  cache_max_size_mb: 10240,
+  cache_sweep_interval_minutes: 60,
 };
 
 function setup(settings: Partial<AppSettings> = {}) {
@@ -35,6 +38,9 @@ function setup(settings: Partial<AppSettings> = {}) {
 }
 
 const retainInput = () => screen.getByLabelText("完成任务在界面保持秒数");
+const ttlInput = () => screen.getByLabelText("缓存保留小时数");
+const sizeInput = () => screen.getByLabelText("缓存容量上限 (MB)");
+const intervalInput = () => screen.getByLabelText("清理间隔 (分钟)");
 const historyInput = () => screen.getByLabelText("传输历史保留条数");
 const submit = () => screen.getByRole("button", { name: /保存配置/ });
 
@@ -115,6 +121,88 @@ describe("设置面板的数值校验", () => {
 
     expect(onSave).not.toHaveBeenCalled();
     expect(screen.getByText(/超出上限 4294967295/)).toBeInTheDocument();
+  });
+
+  // ---------- 磁盘缓存清理（需求 9） ----------
+
+  it("三个缓存字段正常提交", async () => {
+    const { onSave, user } = setup();
+
+    await user.clear(ttlInput());
+    await user.type(ttlInput(), "48");
+    await user.clear(sizeInput());
+    await user.type(sizeInput(), "2048");
+    await user.clear(intervalInput());
+    await user.type(intervalInput(), "15");
+    await user.click(submit());
+
+    expect(onSave).toHaveBeenCalledTimes(1);
+    expect(onSave.mock.calls[0][0]).toMatchObject({
+      cache_ttl_hours: 48,
+      cache_max_size_mb: 2048,
+      cache_sweep_interval_minutes: 15,
+    });
+  });
+
+  it("TTL 与容量的 0 是合法值（关闭该段清理）", async () => {
+    const { onSave, user } = setup();
+
+    await user.clear(ttlInput());
+    await user.type(ttlInput(), "0");
+    await user.clear(sizeInput());
+    await user.type(sizeInput(), "0");
+    await user.click(submit());
+
+    expect(onSave.mock.calls[0][0]).toMatchObject({
+      cache_ttl_hours: 0,
+      cache_max_size_mb: 0,
+    });
+  });
+
+  /// 间隔是三个字段里唯一不能为 0 的：零间隔会让后台清理循环退化成忙等。
+  it("清理间隔为 0 被拦下——它不能像另两个字段那样表示「关闭」", async () => {
+    const { onSave, user } = setup();
+
+    await user.clear(intervalInput());
+    await user.type(intervalInput(), "0");
+    await user.click(submit());
+
+    expect(onSave).not.toHaveBeenCalled();
+    expect(screen.getByText(/不能小于 1/)).toBeInTheDocument();
+  });
+
+  it("间隔字段清空时的提示不会引导用户填 0", async () => {
+    const { onSave, user } = setup();
+
+    await user.clear(intervalInput());
+    await user.click(submit());
+
+    expect(onSave).not.toHaveBeenCalled();
+    expect(screen.getByText(/不能为空（最小 1）/)).toBeInTheDocument();
+    // 这条提示只属于 min>0 的字段，不能是那句「不限制请填 0」
+    expect(screen.queryByText(/不限制请填 0/)).not.toBeInTheDocument();
+  });
+
+  it("容量上限超过 1TB 被拦下", async () => {
+    const { onSave, user } = setup();
+
+    await user.clear(sizeInput());
+    await user.type(sizeInput(), "2000000");
+    await user.click(submit());
+
+    expect(onSave).not.toHaveBeenCalled();
+    expect(screen.getByText(/超出上限 1048576/)).toBeInTheDocument();
+  });
+
+  it("保留小时数超过 1 年被拦下", async () => {
+    const { onSave, user } = setup();
+
+    await user.clear(ttlInput());
+    await user.type(ttlInput(), "99999");
+    await user.click(submit());
+
+    expect(onSave).not.toHaveBeenCalled();
+    expect(screen.getByText(/超出上限 8760/)).toBeInTheDocument();
   });
 
   it("小数被拦下——后端 u32 反序列化会整单失败且只返回笼统错误", async () => {

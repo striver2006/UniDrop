@@ -36,6 +36,25 @@ pub struct AppSettings {
     /// 同样需要自定义 default，理由见 `history_max_entries`。
     #[serde(default = "default_transfer_card_retain_secs")]
     pub transfer_card_retain_secs: u32,
+
+    /// 磁盘缓存文件保留小时数；`0` = 不按时间清理。
+    ///
+    /// 同样必须用自定义 default：`0` 在这里是「不清理」，裸 `#[serde(default)]`
+    /// 会让老库升级后静默变成永不按时间清理，磁盘被无声占满。
+    #[serde(default = "default_cache_ttl_hours")]
+    pub cache_ttl_hours: u32,
+
+    /// 磁盘缓存总量上限（MB）；`0` = 不限容量。
+    #[serde(default = "default_cache_max_size_mb")]
+    pub cache_max_size_mb: u32,
+
+    /// 后台清理间隔（分钟），最小 1。
+    ///
+    /// 这个字段的裸 `#[serde(default)]` 后果最严重：`0` 会让调度循环拿到
+    /// `Duration::ZERO` 而退化成忙等。取值经 `effective_sweep_interval` 钳制，
+    /// 保存时也会规范化，但 default 仍必须给出合法值而非 0。
+    #[serde(default = "default_cache_sweep_interval_minutes")]
+    pub cache_sweep_interval_minutes: u32,
 }
 
 /// 历史保留条数的默认值。沿用改造前 `cmd_list_history` 硬编码的 100，
@@ -54,6 +73,18 @@ fn default_transfer_card_retain_secs() -> u32 {
     DEFAULT_TRANSFER_CARD_RETAIN_SECS
 }
 
+fn default_cache_ttl_hours() -> u32 {
+    crate::core::retention::DEFAULT_CACHE_TTL_HOURS
+}
+
+fn default_cache_max_size_mb() -> u32 {
+    crate::core::retention::DEFAULT_CACHE_MAX_SIZE_MB
+}
+
+fn default_cache_sweep_interval_minutes() -> u32 {
+    crate::core::retention::DEFAULT_SWEEP_INTERVAL_MINUTES
+}
+
 impl AppSettings {
     /// 首次启动与反序列化失败时的兜底配置（唯一定义点，避免多处字面量漏改）
     pub fn default_config() -> Self {
@@ -66,6 +97,9 @@ impl AppSettings {
             start_minimized: false,
             history_max_entries: DEFAULT_HISTORY_MAX_ENTRIES,
             transfer_card_retain_secs: DEFAULT_TRANSFER_CARD_RETAIN_SECS,
+            cache_ttl_hours: crate::core::retention::DEFAULT_CACHE_TTL_HOURS,
+            cache_max_size_mb: crate::core::retention::DEFAULT_CACHE_MAX_SIZE_MB,
+            cache_sweep_interval_minutes: crate::core::retention::DEFAULT_SWEEP_INTERVAL_MINUTES,
         }
     }
 }
@@ -96,6 +130,12 @@ pub async fn cmd_save_settings(
     {
         clean_settings.server_url = format!("wss://{}", clean_settings.server_url);
     }
+
+    // 间隔落库前规范化：非法值（尤其 0）不该被持久化，否则 cmd_get_settings
+    // 会把它原样返回给前端，界面显示的和实际生效的对不上。
+    // 与调度循环共用同一个函数，「前后端各校验一次」才名实相符。
+    clean_settings.cache_sweep_interval_minutes =
+        crate::core::retention::effective_sweep_interval_minutes(&clean_settings);
 
     let json_str = serde_json::to_string(&clean_settings).map_err(|e| e.to_string())?;
     {
@@ -240,6 +280,25 @@ mod tests {
             parsed.transfer_card_retain_secs, DEFAULT_TRANSFER_CARD_RETAIN_SECS,
             "老库缺字段时必须取 30，不能是 u32 的 Default 0（那表示不自动消失）"
         );
+
+        // 三个缓存清理字段同理。retention.rs 的单测都经 default_config() 构造，
+        // 走不到 serde 缺字段这条路径，所以这道闸只能建在这里。
+        // 间隔那条后果最严重：0 会让调度循环拿到零间隔而退化成忙等。
+        assert_eq!(
+            parsed.cache_ttl_hours,
+            crate::core::retention::DEFAULT_CACHE_TTL_HOURS,
+            "老库缺字段时必须取 24，0 表示永不按时间清理、磁盘会被无声占满"
+        );
+        assert_eq!(
+            parsed.cache_max_size_mb,
+            crate::core::retention::DEFAULT_CACHE_MAX_SIZE_MB,
+            "老库缺字段时必须取 10240，0 表示不限容量"
+        );
+        assert_eq!(
+            parsed.cache_sweep_interval_minutes,
+            crate::core::retention::DEFAULT_SWEEP_INTERVAL_MINUTES,
+            "老库缺字段时必须取 60，0 会让清理循环退化成忙等"
+        );
     }
 
     /// 0 是合法取值（不限制 / 不自动消失），不能被 default 逻辑改写成 100 / 30。
@@ -261,6 +320,30 @@ mod tests {
         assert_eq!(parsed.transfer_card_retain_secs, 0);
     }
 
+    /// TTL 与容量的显式 0（= 关闭该段清理）同样不能被 default 改写。
+    /// 间隔不在此列：0 对它非法，由 effective_sweep_interval 钳制。
+    #[test]
+    fn explicit_zero_cache_policy_is_preserved() {
+        let json = r#"{
+            "server_url": "wss://relay.example.com:58921",
+            "account_id": "alice",
+            "psk_secret": "s",
+            "auto_inject": false,
+            "rate_limit_mb": 10,
+            "start_minimized": false,
+            "history_max_entries": 100,
+            "transfer_card_retain_secs": 30,
+            "cache_ttl_hours": 0,
+            "cache_max_size_mb": 0,
+            "cache_sweep_interval_minutes": 5
+        }"#;
+
+        let parsed: AppSettings = serde_json::from_str(json).expect("反序列化失败");
+        assert_eq!(parsed.cache_ttl_hours, 0, "0 = 不按时间清理，不得被 default 覆写成 24");
+        assert_eq!(parsed.cache_max_size_mb, 0, "0 = 不限容量，不得被 default 覆写成 10240");
+        assert_eq!(parsed.cache_sweep_interval_minutes, 5);
+    }
+
     #[test]
     fn current_settings_json_round_trips() {
         let settings = AppSettings {
@@ -278,6 +361,9 @@ mod tests {
         assert!(parsed.start_minimized);
         assert_eq!(parsed.history_max_entries, settings.history_max_entries);
         assert_eq!(parsed.transfer_card_retain_secs, settings.transfer_card_retain_secs);
+        assert_eq!(parsed.cache_ttl_hours, settings.cache_ttl_hours);
+        assert_eq!(parsed.cache_max_size_mb, settings.cache_max_size_mb);
+        assert_eq!(parsed.cache_sweep_interval_minutes, settings.cache_sweep_interval_minutes);
     }
 
     #[test]

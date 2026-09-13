@@ -28,6 +28,9 @@ const baseSettings: AppSettings = {
   start_minimized: false,
   history_max_entries: 100,
   transfer_card_retain_secs: 30,
+  cache_ttl_hours: 24,
+  cache_max_size_mb: 10240,
+  cache_sweep_interval_minutes: 60,
 };
 
 function transfer(overrides: Partial<ActiveTransfer> = {}): ActiveTransfer {

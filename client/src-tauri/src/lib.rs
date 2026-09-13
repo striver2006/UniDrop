@@ -341,16 +341,40 @@ pub fn run() {
             });
 
             // 4. Background periodic cache sweep worker (P1-9)
+            //
+            // 结构是**先 sweep 后 sleep**，不能反过来。改造前用的是
+            // tokio::time::interval，它的首跳立即返回，因此启动时会先扫一次；
+            // 若改成先 sleep，这个「启动即扫」会静默消失——默认间隔下启动后一小时
+            // 内不清理，而用户若把间隔设成 1440 分钟又每天关机，sleep 永远睡不满，
+            // sweep 可能一次都不执行。
+            //
+            // 每轮都重新读设置，所以间隔与策略都是可变的；代价是改动间隔要等
+            // 当前这一轮睡完才生效（重启则立即生效），这一点写在设置项说明里。
             let cache_sweep_mgr = cache_manager_ref.clone();
+            let sweep_settings = settings_ref.clone();
             tauri::async_runtime::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
                 loop {
-                    interval.tick().await;
-                    if let Ok(purged) = cache_sweep_mgr.sweep_expired_and_lru().await {
-                        if purged > 0 {
-                            log::info!("Cache cleaner purged {} expired or LRU entries", purged);
+                    let (policy, interval) = {
+                        let s = sweep_settings.lock().await;
+                        (
+                            core::retention::RetentionPolicy::from_settings(&s),
+                            core::retention::effective_sweep_interval(&s),
+                        )
+                    }; // guard 必须在 sweep 之前释放：sweep 内部要取 db_conn 锁，
+                       // 而这里持有的是 settings 锁，两者不同但没必要交叠持有
+
+                    // Err 必须留痕：后台清理的唯一职责就是防磁盘占满，若持续失败
+                    // 而外部零信号，故障呈现形态恰是这个功能本身要防的那件事。
+                    // 与 prune_and_notify 的处理对齐。
+                    match cache_sweep_mgr.sweep(policy).await {
+                        Ok(purged) if purged > 0 => {
+                            log::info!("Cache cleaner purged {} expired or LRU entries", purged)
                         }
+                        Ok(_) => {}
+                        Err(e) => log::warn!("Cache sweep failed: {}", e),
                     }
+
+                    tokio::time::sleep(interval).await;
                 }
             });
 

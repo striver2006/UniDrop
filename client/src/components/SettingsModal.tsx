@@ -16,23 +16,44 @@ const U32_MAX = 4294967295;
  */
 const MAX_RETAIN_SECS = 86400;
 
-// 注意：上限只由下面的 parseU32 把关，**不**写成 input 的 max 属性。
-// 带 max 的 number input 会触发浏览器原生表单校验，在 submit 事件之前就拦下提交，
-// 于是 handleSubmit 根本不跑，用户看到的是原生气泡（样式不可控、文案非中文），
+// 注意：数字输入一律**不设** min / max / step 属性，边界只由 parseU32 把关。
+// 这些属性会触发浏览器原生表单校验，在 submit 事件之前就拦下提交，于是
+// handleSubmit 根本不跑：用户看到的是原生气泡（样式不可控、文案非中文），
 // 而填字母时看到的却是我们的红字提示——同一个输入框两套错误呈现。
+// step 默认就是 1，去掉它不影响上下箭头的步进。
 
-/// 把输入框里的字符串解析成 u32。空串、负数、小数、超上限一律判错。
-const parseU32 = (raw: string, max: number = U32_MAX): { value: number } | { error: string } => {
+/// 把输入框里的字符串解析成 u32。空串、负数、小数、越界一律判错。
+///
+/// `min` 默认 0。**空串提示必须随 min 变化**：固定写「不限制请填 0」的话，
+/// 用在 min=1 的清理间隔上就成了主动引导用户填一个非法值。
+const parseU32 = (
+  raw: string,
+  max: number = U32_MAX,
+  min: number = 0
+): { value: number } | { error: string } => {
   const trimmed = raw.trim();
-  if (trimmed === "") return { error: "不能为空（不限制请填 0）" };
+  if (trimmed === "") {
+    return { error: min > 0 ? `不能为空（最小 ${min}）` : "不能为空（不限制请填 0）" };
+  }
   // 只认纯数字，顺带排除了 "-1"、"2.5"、"1e3" 与 Number("") === 0 这个坑
-  if (!/^\d+$/.test(trimmed)) return { error: `只能填 0 到 ${max} 的整数` };
+  if (!/^\d+$/.test(trimmed)) return { error: `只能填 ${min} 到 ${max} 的整数` };
   const value = Number(trimmed);
   if (!Number.isSafeInteger(value) || value > max) {
     return { error: `数值超出上限 ${max}` };
   }
+  if (value < min) {
+    return { error: `不能小于 ${min}` };
+  }
   return { value };
 };
+
+/** 缓存保留小时数上限：1 年 */
+const MAX_CACHE_TTL_HOURS = 8760;
+/** 缓存容量上限：1 TB（MB 计） */
+const MAX_CACHE_SIZE_MB = 1048576;
+/** 清理间隔上限 1 天、下限 1 分钟。下限不可为 0：调度循环拿到零间隔会退化成忙等。 */
+const MAX_SWEEP_INTERVAL_MINUTES = 1440;
+const MIN_SWEEP_INTERVAL_MINUTES = 1;
 
 interface SettingsModalProps {
   settings: AppSettings;
@@ -50,7 +71,18 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
   // 变成 0，而 0 在这里是**有意义的取值**（不限制 / 不自动消失），不能与空输入混淆。
   const [historyLimitInput, setHistoryLimitInput] = useState(String(settings.history_max_entries));
   const [retainSecsInput, setRetainSecsInput] = useState(String(settings.transfer_card_retain_secs));
-  const [fieldErrors, setFieldErrors] = useState<{ history?: string; retain?: string }>({});
+  const [cacheTtlInput, setCacheTtlInput] = useState(String(settings.cache_ttl_hours));
+  const [cacheSizeInput, setCacheSizeInput] = useState(String(settings.cache_max_size_mb));
+  const [sweepIntervalInput, setSweepIntervalInput] = useState(
+    String(settings.cache_sweep_interval_minutes)
+  );
+  const [fieldErrors, setFieldErrors] = useState<{
+    history?: string;
+    retain?: string;
+    ttl?: string;
+    size?: string;
+    interval?: string;
+  }>({});
 
   // 开机自启不属于 AppSettings：它的事实源是操作系统，本地不留副本，
   // 因此独立拉取、独立写入，与表单保存的失败域互不污染。
@@ -63,6 +95,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
     setError(null);
     setHistoryLimitInput(String(settings.history_max_entries));
     setRetainSecsInput(String(settings.transfer_card_retain_secs));
+    setCacheTtlInput(String(settings.cache_ttl_hours));
+    setCacheSizeInput(String(settings.cache_max_size_mb));
+    setSweepIntervalInput(String(settings.cache_sweep_interval_minutes));
     setFieldErrors({});
   }, [settings, isOpen]);
 
@@ -125,11 +160,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
     const history = parseU32(historyLimitInput);
     // 保持秒数额外受 setTimeout 的 32 位上限约束，不能放行到 u32::MAX
     const retain = parseU32(retainSecsInput, MAX_RETAIN_SECS);
+    const ttl = parseU32(cacheTtlInput, MAX_CACHE_TTL_HOURS);
+    const size = parseU32(cacheSizeInput, MAX_CACHE_SIZE_MB);
+    // 间隔下限 1：零间隔会让后台清理循环退化成忙等
+    const interval = parseU32(
+      sweepIntervalInput,
+      MAX_SWEEP_INTERVAL_MINUTES,
+      MIN_SWEEP_INTERVAL_MINUTES
+    );
     const nextFieldErrors = {
       history: "error" in history ? history.error : undefined,
       retain: "error" in retain ? retain.error : undefined,
+      ttl: "error" in ttl ? ttl.error : undefined,
+      size: "error" in size ? size.error : undefined,
+      interval: "error" in interval ? interval.error : undefined,
     };
-    if (nextFieldErrors.history || nextFieldErrors.retain) {
+    if (Object.values(nextFieldErrors).some(Boolean)) {
       setFieldErrors(nextFieldErrors);
       return;
     }
@@ -150,6 +196,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
         psk_secret: form.psk_secret.trim(),
         history_max_entries: (history as { value: number }).value,
         transfer_card_retain_secs: (retain as { value: number }).value,
+        cache_ttl_hours: (ttl as { value: number }).value,
+        cache_max_size_mb: (size as { value: number }).value,
+        cache_sweep_interval_minutes: (interval as { value: number }).value,
       });
       onClose(); // 只有保存成功才关窗，失败时保留用户已填内容
     } catch (err: any) {
@@ -264,8 +313,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
             <input
               id="history-max-entries"
               type="number"
-              min={0}
-              step={1}
               value={historyLimitInput}
               onChange={(e) => setHistoryLimitInput(e.target.value)}
               className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-teal-500"
@@ -288,8 +335,6 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
             <input
               id="transfer-card-retain-secs"
               type="number"
-              min={0}
-              step={1}
               value={retainSecsInput}
               onChange={(e) => setRetainSecsInput(e.target.value)}
               className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-teal-500"
@@ -306,6 +351,76 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
             )}
           </div>
 
+
+          <div className="pt-1 border-t border-slate-800/60">
+            <p className="text-[11px] font-medium text-slate-300 pt-2">磁盘缓存清理</p>
+          </div>
+
+          <div>
+            <label htmlFor="cache-ttl-hours" className="block text-slate-400 mb-1">
+              缓存保留小时数
+            </label>
+            <input
+              id="cache-ttl-hours"
+              type="number"
+              value={cacheTtlInput}
+              onChange={(e) => setCacheTtlInput(e.target.value)}
+              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-teal-500"
+            />
+            <p className="text-[11px] text-slate-500 mt-1">
+              超过该时长的缓存文件会被清理；填 0 表示不按时间清理，最大 {MAX_CACHE_TTL_HOURS} 小时（1 年）
+            </p>
+            {fieldErrors.ttl && (
+              <div className="flex items-start space-x-1.5 text-[11px] text-rose-400 mt-1">
+                <AlertCircle className="w-3.5 h-3.5 mt-px shrink-0" />
+                <span>{fieldErrors.ttl}</span>
+              </div>
+            )}
+          </div>
+
+          <div>
+            <label htmlFor="cache-max-size-mb" className="block text-slate-400 mb-1">
+              缓存容量上限 (MB)
+            </label>
+            <input
+              id="cache-max-size-mb"
+              type="number"
+              value={cacheSizeInput}
+              onChange={(e) => setCacheSizeInput(e.target.value)}
+              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-teal-500"
+            />
+            <p className="text-[11px] text-slate-500 mt-1">
+              超出后按最近最少使用清理到上限的 80%；填 0 表示不限容量。10240 MB = 10 GB
+            </p>
+            {fieldErrors.size && (
+              <div className="flex items-start space-x-1.5 text-[11px] text-rose-400 mt-1">
+                <AlertCircle className="w-3.5 h-3.5 mt-px shrink-0" />
+                <span>{fieldErrors.size}</span>
+              </div>
+            )}
+          </div>
+
+          <div>
+            <label htmlFor="cache-sweep-interval" className="block text-slate-400 mb-1">
+              清理间隔 (分钟)
+            </label>
+            <input
+              id="cache-sweep-interval"
+              type="number"
+              value={sweepIntervalInput}
+              onChange={(e) => setSweepIntervalInput(e.target.value)}
+              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-teal-500"
+            />
+            <p className="text-[11px] text-slate-500 mt-1">
+              后台多久清理一次，最小 1 分钟。修改后在下一轮生效，重启应用立即生效
+            </p>
+            {fieldErrors.interval && (
+              <div className="flex items-start space-x-1.5 text-[11px] text-rose-400 mt-1">
+                <AlertCircle className="w-3.5 h-3.5 mt-px shrink-0" />
+                <span>{fieldErrors.interval}</span>
+              </div>
+            )}
+          </div>
           </div>
 
           <div className="shrink-0 px-5 py-4 border-t border-slate-800 space-y-3">

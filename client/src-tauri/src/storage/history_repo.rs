@@ -40,9 +40,9 @@ pub struct PruneCandidate {
     pub file_paths: Vec<String>,
 }
 
-/// 剪贴板免疫窗口（秒）。与 `CacheManager` 的 TTL/LRU 清理保持同一判据，
-/// 不是本模块另立的规则。
-const CLIPBOARD_LOCK_SECS: i64 = 7200;
+/// 剪贴板免疫窗口（秒）。从 `core::retention` 引入，全仓仅此一处定义——
+/// 改造前同一个 7200 散落在死常量、两处 SQL 字面量和本模块共四处。
+use crate::core::retention::CLIPBOARD_LOCK_SECS;
 
 impl HistoryRepo {
     /// Inserts (or replaces) a task row together with its items. Used when a
