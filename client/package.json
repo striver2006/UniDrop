@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "tauri:build": "if [ -f .env ]; then set -a; . ./.env; set +a; fi; tauri build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
