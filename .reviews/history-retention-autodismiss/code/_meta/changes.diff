@@ -1,0 +1,1059 @@
+# trivium changes.diff
+# run_id: 20260913T002939Z
+# base: HEAD
+# head: d4d1cf11cc02cb55cbcf048676334ef351e80ba2
+# files: 14
+#   client/src-tauri/src/commands/history_cmd.rs
+#   client/src-tauri/src/commands/settings_cmd.rs
+#   client/src-tauri/src/core/cache_manager.rs
+#   client/src-tauri/src/core/history_pruner.rs
+#   client/src-tauri/src/core/mod.rs
+#   client/src-tauri/src/core/transfer_engine.rs
+#   client/src-tauri/src/lib.rs
+#   client/src-tauri/src/storage/history_repo.rs
+#   client/src/App.tsx
+#   client/src/components/HistoryPanel.tsx
+#   client/src/components/SettingsModal.tsx
+#   client/src/types/index.ts
+#   docs/design/DESIGN.md
+#   docs/需求.md
+diff --git a/client/src-tauri/src/commands/history_cmd.rs b/client/src-tauri/src/commands/history_cmd.rs
+index f7524d3..44e904d 100644
+--- a/client/src-tauri/src/commands/history_cmd.rs
++++ b/client/src-tauri/src/commands/history_cmd.rs
+@@ -6,10 +6,18 @@ use tauri_plugin_dialog::DialogExt;
+ use crate::app_state::AppState;
+ use crate::storage::{HistoryRepo, TransferHistoryEntry};
+ 
++/// 列表**显示**上限，与 `AppSettings::history_max_entries` 的**淘汰**上限是两回事。
++///
++/// 不做成设置项：它是防御性兜底，不是用户偏好。历史面板没有虚拟滚动，
++/// 全量渲染 DOM；用户把保留条数设成 `0`（不限制）后若让查询也跟着不限制，
++/// 列表迟早会把界面拖死。另外免疫锁会让库内条数短暂超过保留上限，
++/// 显示上限留出余量才不会把用户刚装载过的那条挡在外面。
++const HISTORY_DISPLAY_CAP: u32 = 200;
++
+ #[tauri::command]
+ pub async fn cmd_list_history(state: State<'_, AppState>) -> Result<Vec<TransferHistoryEntry>, String> {
+     let conn = state.db_conn.lock().await;
+-    HistoryRepo::list_history(&conn, 100).map_err(|e| e.to_string())
++    HistoryRepo::list_history(&conn, HISTORY_DISPLAY_CAP).map_err(|e| e.to_string())
+ }
+ 
+ /// Opens a native folder picker and copies all cached files of a session into it.
+diff --git a/client/src-tauri/src/commands/settings_cmd.rs b/client/src-tauri/src/commands/settings_cmd.rs
+index 02ec66c..0221478 100644
+--- a/client/src-tauri/src/commands/settings_cmd.rs
++++ b/client/src-tauri/src/commands/settings_cmd.rs
+@@ -18,6 +18,40 @@ pub struct AppSettings {
+     /// 把用户已配置的 server_url / account_id / psk_secret 一起冲掉。
+     #[serde(default)]
+     pub start_minimized: bool,
++
++    /// 传输历史最多保留的条数，超出的最旧记录连同缓存文件一起删除；`0` = 不限制。
++    ///
++    /// **不能只写 `#[serde(default)]`**：`u32` 的 `Default` 是 `0`，而 `0` 在这里
++    /// 被定义成「不限制」。老库的 JSON 没有本字段，裸 default 会让升级后的用户
++    /// 静默变成「历史无上限」——恰好是需求没生效的形态，而设置面板里显示的 `0`
++    /// 看起来又像是用户自己设的，无从分辨。
++    #[serde(default = "default_history_max_entries")]
++    pub history_max_entries: u32,
++
++    /// 传输**完成**的卡片在界面上保持的秒数；`0` = 不自动消失。
++    ///
++    /// 只管 COMPLETED。FAILED 卡片永不自动消失——失败原因的 toast 只显示 4 秒，
++    /// 卡片再自动消失就没有任何入口能看到为什么失败了。
++    ///
++    /// 同样需要自定义 default，理由见 `history_max_entries`。
++    #[serde(default = "default_transfer_card_retain_secs")]
++    pub transfer_card_retain_secs: u32,
++}
++
++/// 历史保留条数的默认值。沿用改造前 `cmd_list_history` 硬编码的 100，
++/// 使未改过设置的老用户看到的列表长度保持不变。
++pub const DEFAULT_HISTORY_MAX_ENTRIES: u32 = 100;
++
++/// 完成卡片保持秒数的默认值。既有 toast 是 4 秒，够读完但不够点卡片上的
++/// 「重新复制 / 装载」按钮；30 秒是「看完并来得及点」的下限。
++pub const DEFAULT_TRANSFER_CARD_RETAIN_SECS: u32 = 30;
++
++fn default_history_max_entries() -> u32 {
++    DEFAULT_HISTORY_MAX_ENTRIES
++}
++
++fn default_transfer_card_retain_secs() -> u32 {
++    DEFAULT_TRANSFER_CARD_RETAIN_SECS
+ }
+ 
+ impl AppSettings {
+@@ -30,6 +64,8 @@ impl AppSettings {
+             auto_inject: false,
+             rate_limit_mb: 10,
+             start_minimized: false,
++            history_max_entries: DEFAULT_HISTORY_MAX_ENTRIES,
++            transfer_card_retain_secs: DEFAULT_TRANSFER_CARD_RETAIN_SECS,
+         }
+     }
+ }
+@@ -92,6 +128,11 @@ pub async fn cmd_save_settings(
+     state.reconnect_notify.notify_waiters();
+     log::info!("Settings saved and reconnected immediately with new config");
+ 
++    // 5. 立刻按新上限修剪历史：用户把条数调小后必须当场见效，
++    //    否则要等到下次传输才生效，看起来就像设置没保存。
++    //    此处已在上面各锁的作用域之外，取 db_conn 锁是安全的。
++    crate::core::history_pruner::prune_and_notify(&app).await;
++
+     Ok(())
+ }
+ 
+@@ -186,6 +227,38 @@ mod tests {
+         assert!(parsed.auto_inject);
+         assert_eq!(parsed.rate_limit_mb, 42);
+         assert!(!parsed.start_minimized, "缺失的新字段应取默认值 false");
++
++        // 这两条守护的是 #[serde(default = "...")] 而不是裸 #[serde(default)]：
++        // u32 的 Default 是 0，而 0 在本功能里表示「不限制 / 不自动消失」。
++        // 换成裸 default 后这里会得到 0，两个需求对老用户静默失效，且面板上
++        // 显示的 0 看起来像是用户自己设的，无从分辨。
++        assert_eq!(
++            parsed.history_max_entries, DEFAULT_HISTORY_MAX_ENTRIES,
++            "老库缺字段时必须取 100，不能是 u32 的 Default 0（那表示不限制）"
++        );
++        assert_eq!(
++            parsed.transfer_card_retain_secs, DEFAULT_TRANSFER_CARD_RETAIN_SECS,
++            "老库缺字段时必须取 30，不能是 u32 的 Default 0（那表示不自动消失）"
++        );
++    }
++
++    /// 0 是合法取值（不限制 / 不自动消失），不能被 default 逻辑改写成 100 / 30。
++    #[test]
++    fn explicit_zero_is_preserved_not_defaulted() {
++        let json = r#"{
++            "server_url": "wss://relay.example.com:58921",
++            "account_id": "alice",
++            "psk_secret": "s",
++            "auto_inject": false,
++            "rate_limit_mb": 10,
++            "start_minimized": false,
++            "history_max_entries": 0,
++            "transfer_card_retain_secs": 0
++        }"#;
++
++        let parsed: AppSettings = serde_json::from_str(json).expect("反序列化失败");
++        assert_eq!(parsed.history_max_entries, 0);
++        assert_eq!(parsed.transfer_card_retain_secs, 0);
+     }
+ 
+     #[test]
+@@ -203,6 +276,8 @@ mod tests {
+         assert_eq!(parsed.auto_inject, settings.auto_inject);
+         assert_eq!(parsed.rate_limit_mb, settings.rate_limit_mb);
+         assert!(parsed.start_minimized);
++        assert_eq!(parsed.history_max_entries, settings.history_max_entries);
++        assert_eq!(parsed.transfer_card_retain_secs, settings.transfer_card_retain_secs);
+     }
+ 
+     #[test]
+diff --git a/client/src-tauri/src/core/cache_manager.rs b/client/src-tauri/src/core/cache_manager.rs
+index 6675757..5f01c35 100644
+--- a/client/src-tauri/src/core/cache_manager.rs
++++ b/client/src-tauri/src/core/cache_manager.rs
+@@ -100,6 +100,63 @@ impl CacheManager {
+         Ok(())
+     }
+ 
++    /// 按「最新 N 条」修剪传输历史，返回实际删除的条数（需求 4）。
++    ///
++    /// 分三段执行，**磁盘 IO 段不持有 `db_conn` 锁**：
++    ///
++    /// 1. 选取（持锁）：`select_prune_candidates` 取出可删会话及其文件路径，随即释放锁；
++    /// 2. 删文件（不持锁）：逐个 `remove_file`。同步文件 IO 若在持锁状态下做，
++    ///    会把整条信令链路一起堵住；
++    /// 3. 删行（重新取锁，单事务）。
++    ///
++    /// **先删文件后删行**，与 `sweep_expired_and_lru` 同序。反过来先删行的话，
++    /// 一旦 `remove_file` 失败，文件就脱离了 `cache_entries` 索引，而全部清理逻辑
++    /// 都以表行为遍历源 ⇒ 永远扫不到它，成为不可回收的磁盘孤儿。
++    /// 反向留下的「行在、文件没了」则可自愈：下轮修剪会重试，且另存为/打开位置
++    /// 本就处理了文件缺失。
++    pub async fn prune_history(&self, limit: u32) -> Result<usize, String> {
++        // 1. 选取段：取完即释放锁
++        let candidates = {
++            let conn = self.db_conn.lock().await;
++            crate::storage::HistoryRepo::select_prune_candidates(&conn, limit)
++                .map_err(|e| e.to_string())?
++        };
++        if candidates.is_empty() {
++            return Ok(0);
++        }
++
++        // 2. 删文件段：不持锁。单个文件删不掉就把整个会话留到下轮重试——
++        //    保留行比留下无人回收的孤儿文件安全。
++        let mut deletable = Vec::with_capacity(candidates.len());
++        for candidate in candidates {
++            let mut all_removed = true;
++            for path_str in &candidate.file_paths {
++                let p = PathBuf::from(path_str);
++                if !p.exists() {
++                    continue;
++                }
++                if let Err(e) = fs::remove_file(&p) {
++                    log::warn!(
++                        "Failed to remove cached file {} while pruning history: {}",
++                        p.display(),
++                        e
++                    );
++                    all_removed = false;
++                }
++            }
++            if all_removed {
++                deletable.push(candidate.session_id);
++            }
++        }
++        if deletable.is_empty() {
++            return Ok(0);
++        }
++
++        // 3. 删行段：重新取锁，单事务
++        let mut conn = self.db_conn.lock().await;
++        crate::storage::HistoryRepo::delete_sessions(&mut conn, &deletable).map_err(|e| e.to_string())
++    }
++
+     /// Scans cache, purging expired files (>24h) and enforcing LRU quota (<10GB) while respecting 2h clipboard lock (P1-9, P3-3).
+     pub async fn sweep_expired_and_lru(&self) -> Result<usize, String> {
+         let conn = self.db_conn.lock().await;
+diff --git a/client/src-tauri/src/core/mod.rs b/client/src-tauri/src/core/mod.rs
+index 6d6cfaa..390cfbe 100644
+--- a/client/src-tauri/src/core/mod.rs
++++ b/client/src-tauri/src/core/mod.rs
+@@ -1,5 +1,6 @@
+ pub mod cache_manager;
+ pub mod connection_actor;
++pub mod history_pruner;
+ pub mod path_guard;
+ pub mod sliding_window;
+ pub mod startup;
+@@ -7,6 +8,7 @@ pub mod transfer_engine;
+ 
+ pub use cache_manager::*;
+ pub use connection_actor::*;
++pub use history_pruner::*;
+ pub use path_guard::*;
+ pub use sliding_window::*;
+ pub use startup::*;
+diff --git a/client/src-tauri/src/core/transfer_engine.rs b/client/src-tauri/src/core/transfer_engine.rs
+index 1a5b2fd..c035a51 100644
+--- a/client/src-tauri/src/core/transfer_engine.rs
++++ b/client/src-tauri/src/core/transfer_engine.rs
+@@ -48,6 +48,10 @@ pub enum TransferSource {
+ }
+ 
+ /// Best-effort history status update; failures are logged only.
++///
++/// 注意 `conn` guard 的作用域**就是本函数体**。任何需要再次取 `db_conn` 锁的动作
++/// （例如修剪历史）都不能写进这里——`tokio::sync::Mutex` 不可重入，会永久死锁。
++/// 终态请改用 `finalize_history_status`。
+ async fn update_history_status(app_handle: &AppHandle, session_id: &str, status: &str, error: Option<&str>) {
+     let state = app_handle.state::<AppState>();
+     let conn = state.db_conn.lock().await;
+@@ -56,6 +60,22 @@ async fn update_history_status(app_handle: &AppHandle, session_id: &str, status:
+     }
+ }
+ 
++/// 写入**终态**并随即按保留上限修剪历史（需求 4）。
++///
++/// 单独封一层，是为了把「修剪必须发生在锁释放之后」这条约束固定在一个地方：
++/// 上面那次 `.await` 返回时 `db_conn` 锁已经释放，这里再取锁才是安全的。
++/// 六个终态调用点若各自手写两行，早晚有人把修剪塞进 `update_history_status`
++/// 内部——那是静默死锁，整个应用卡住且不报任何错。
++async fn finalize_history_status(
++    app_handle: &AppHandle,
++    session_id: &str,
++    status: &str,
++    error: Option<&str>,
++) {
++    update_history_status(app_handle, session_id, status, error).await;
++    crate::core::history_pruner::prune_and_notify(app_handle).await;
++}
++
+ pub struct TransferEngine {
+     pub cache_manager: CacheManager,
+ }
+@@ -255,7 +275,7 @@ impl TransferEngine {
+                     status: "FAILED".to_string(),
+                     data_type: offer.data_type.clone(),
+                 });
+-                update_history_status(&app_handle, &session_id, "FAILED", Some(&format!("数据通道连接失败: {}", e))).await;
++                finalize_history_status(&app_handle, &session_id, "FAILED", Some(&format!("数据通道连接失败: {}", e))).await;
+                 let fail_env = ControlEnvelope {
+                     version: 1,
+                     trace_id: Uuid::new_v4().to_string(),
+@@ -503,7 +523,7 @@ impl TransferEngine {
+                 status: "COMPLETED".to_string(),
+                 data_type: offer.data_type.clone(),
+             });
+-            update_history_status(&app_handle, &session_id, "COMPLETED", None).await;
++            finalize_history_status(&app_handle, &session_id, "COMPLETED", None).await;
+         } else {
+             // N4: Emit FAILED status and send TRANSFER_FAILURE on interrupted/aborted transfer
+             log::error!("Sender transfer failed or was interrupted for session {}", session_id);
+@@ -517,7 +537,7 @@ impl TransferEngine {
+                 status: "FAILED".to_string(),
+                 data_type: offer.data_type.clone(),
+             });
+-            update_history_status(&app_handle, &session_id, "FAILED", Some("传输中断或超出重试上限")).await;
++            finalize_history_status(&app_handle, &session_id, "FAILED", Some("传输中断或超出重试上限")).await;
+ 
+             let fail_env = ControlEnvelope {
+                 version: 1,
+@@ -587,7 +607,7 @@ impl TransferEngine {
+                     data_type: offer.data_type.clone(),
+                 });
+                 let _ = show_transfer_notification(&app_handle, "UniDrop 接收失败", "数据通道连接失败，请检查服务器地址与证书配置");
+-                update_history_status(&app_handle, &session_id, "FAILED", Some(&format!("数据通道连接失败: {}", e))).await;
++                finalize_history_status(&app_handle, &session_id, "FAILED", Some(&format!("数据通道连接失败: {}", e))).await;
+                 let fail_env = ControlEnvelope {
+                     version: 1,
+                     trace_id: Uuid::new_v4().to_string(),
+@@ -816,7 +836,7 @@ impl TransferEngine {
+                             }
+                         }
+                     }
+-                    update_history_status(&app_handle, &session_id, "COMPLETED", None).await;
++                    finalize_history_status(&app_handle, &session_id, "COMPLETED", None).await;
+                 } else {
+                     let fail_env = ControlEnvelope {
+                         version: 1,
+@@ -852,7 +872,7 @@ impl TransferEngine {
+                 status: "FAILED".to_string(),
+                 data_type: offer.data_type.clone(),
+             });
+-            update_history_status(&app_handle, &session_id, "FAILED", Some("接收连接中断或校验失败")).await;
++            finalize_history_status(&app_handle, &session_id, "FAILED", Some("接收连接中断或校验失败")).await;
+ 
+             let fail_env = ControlEnvelope {
+                 version: 1,
+diff --git a/client/src-tauri/src/lib.rs b/client/src-tauri/src/lib.rs
+index 0100fc0..aeab435 100644
+--- a/client/src-tauri/src/lib.rs
++++ b/client/src-tauri/src/lib.rs
+@@ -293,6 +293,11 @@ pub fn run() {
+                                     status: "FAILED".to_string(),
+                                     data_type,
+                                 });
++
++                                // 对端报告失败同样是终态写入点，也要修剪历史。
++                                // 这里已经在上面取 conn 的 { } 块之外——那个 guard
++                                // 随块结束释放，此处再取锁才不会死锁。
++                                crate::core::history_pruner::prune_and_notify(&app_handle).await;
+                             }
+                         }
+                         ActionType::TRANSFER_COMPLETE => {
+@@ -317,6 +322,24 @@ pub fn run() {
+                 }
+             });
+ 
++            // 3.5 启动收敛：先把崩溃残留的非终态行复位，再修剪一次历史（需求 4）
++            //
++            // 顺序不能反：修剪按约束 A 跳过非终态行，不先复位的话，上次被杀掉的
++            // 进程留下的 TRANSFERRING 死行会永久占住保留额度，谁也清不掉。
++            let app_handle_for_prune = app_handle.clone();
++            tauri::async_runtime::spawn(async move {
++                {
++                    let state = app_handle_for_prune.state::<AppState>();
++                    let conn = state.db_conn.lock().await;
++                    match HistoryRepo::reset_stale_in_flight(&conn) {
++                        Ok(0) => {}
++                        Ok(n) => log::info!("Reset {} stale in-flight transfer(s) to FAILED on startup", n),
++                        Err(e) => log::warn!("Failed to reset stale in-flight transfers: {}", e),
++                    }
++                } // conn guard 必须在此释放，下一行会重新取同一把锁
++                crate::core::history_pruner::prune_and_notify(&app_handle_for_prune).await;
++            });
++
+             // 4. Background periodic cache sweep worker (P1-9)
+             let cache_sweep_mgr = cache_manager_ref.clone();
+             tauri::async_runtime::spawn(async move {
+diff --git a/client/src-tauri/src/storage/history_repo.rs b/client/src-tauri/src/storage/history_repo.rs
+index 3b6a38c..069acea 100644
+--- a/client/src-tauri/src/storage/history_repo.rs
++++ b/client/src-tauri/src/storage/history_repo.rs
+@@ -30,6 +30,20 @@ pub struct TaskBrief {
+     pub total_size: i64,
+ }
+ 
++/// 一个待修剪的会话，连同它在缓存中登记的文件路径。
++///
++/// 路径在这里只是**取出来**，删除动作由 `CacheManager` 执行：本模块是纯 SQL 层，
++/// 全文不做文件 IO，测试才能全部跑在 `Connection::open_in_memory()` 上。
++#[derive(Debug, Clone)]
++pub struct PruneCandidate {
++    pub session_id: String,
++    pub file_paths: Vec<String>,
++}
++
++/// 剪贴板免疫窗口（秒）。与 `CacheManager` 的 TTL/LRU 清理保持同一判据，
++/// 不是本模块另立的规则。
++const CLIPBOARD_LOCK_SECS: i64 = 7200;
++
+ impl HistoryRepo {
+     /// Inserts (or replaces) a task row together with its items. Used when a
+     /// transfer is first observed (outgoing send / incoming offer).
+@@ -144,6 +158,119 @@ impl HistoryRepo {
+         }
+         Ok(entries)
+     }
++
++    /// 把残留的非终态行复位为 FAILED，返回复位条数。
++    ///
++    /// 历史行在任务**开始**时就以 TRANSFERRING 落库（`lib.rs` 收、`clipboard_cmd.rs` 发），
++    /// 进程被杀或崩溃时它永远停在那里。而修剪按约束 A 每轮都跳过非终态行，
++    /// 这类死行会永久占住「最新 N 条」的额度——正是需求 4 要收敛的对象。
++    ///
++    /// 复位是安全的：本仓库没有续传路径（`BitmapRepo` / `chunk_bitmaps` 除建表语句外
++    /// 无任何生产引用），不存在会被这一下丢掉的在途状态。**只在启动时调用**，
++    /// 那时也不可能有真正在传的任务。
++    pub fn reset_stale_in_flight(conn: &Connection) -> Result<usize, rusqlite::Error> {
++        let affected = conn.execute(
++            "UPDATE transfer_tasks
++             SET status = 'FAILED',
++                 error_message = COALESCE(error_message, '进程异常退出'),
++                 completed_at = CURRENT_TIMESTAMP
++             WHERE status IN ('PENDING', 'TRANSFERRING')",
++            [],
++        )?;
++        Ok(affected)
++    }
++
++    /// 选出超出保留上限、且可以安全删除的会话（修剪三段式的第 1 段）。
++    ///
++    /// `limit == 0` 表示不限制，直接返回空。
++    ///
++    /// 保留集是**全部行**按 `created_at DESC, rowid DESC` 排序后的前 `limit` 名——
++    /// 排序键与 `list_history` 逐字一致，否则「列表里看得到的第 N 条」与
++    /// 「被删的第 N 条」会错位。进行中的任务也参与排序占位（用户说的「最新 N 条」
++    /// 包含它们），但**不会**被选为删除候选：
++    ///
++    /// - 约束 A：只有终态（COMPLETED / FAILED / CANCELLED）才可删。删掉进行中的行会让
++    ///   `update_task_status` 的 UPDATE 影响 0 行且**不报错**，故障极难追查。
++    /// - 约束 B：会话中只要还有一个文件处在 2 小时剪贴板免疫窗口内就整体跳过——
++    ///   用户刚把它装载进系统剪贴板，随时可能粘贴。条数超限是攒出来的慢问题，
++    ///   剪贴板失效是下一秒就撞上的快问题，本轮跳过，下一轮再收。
++    pub fn select_prune_candidates(
++        conn: &Connection,
++        limit: u32,
++    ) -> Result<Vec<PruneCandidate>, rusqlite::Error> {
++        if limit == 0 {
++            return Ok(Vec::new());
++        }
++
++        let mut stmt = conn.prepare(
++            "SELECT t.session_id
++             FROM transfer_tasks t
++             WHERE t.status IN ('COMPLETED', 'FAILED', 'CANCELLED')
++               AND NOT EXISTS (
++                   SELECT 1 FROM cache_entries c
++                   WHERE c.session_id = t.session_id
++                     AND c.clipboard_injected_at IS NOT NULL
++                     AND (strftime('%s', 'now') - strftime('%s', c.clipboard_injected_at)) <= ?2
++               )
++               AND t.session_id NOT IN (
++                   SELECT session_id FROM transfer_tasks
++                   ORDER BY created_at DESC, rowid DESC
++                   LIMIT ?1
++               )",
++        )?;
++
++        let session_ids: Vec<String> = stmt
++            .query_map(rusqlite::params![limit, CLIPBOARD_LOCK_SECS], |row| row.get(0))?
++            .filter_map(Result::ok)
++            .collect();
++        drop(stmt);
++
++        let mut candidates = Vec::with_capacity(session_ids.len());
++        for session_id in session_ids {
++            let mut files_stmt =
++                conn.prepare("SELECT file_path FROM cache_entries WHERE session_id = ?1")?;
++            let file_paths: Vec<String> = files_stmt
++                .query_map([&session_id], |row| row.get(0))?
++                .filter_map(Result::ok)
++                .collect();
++            drop(files_stmt);
++
++            candidates.push(PruneCandidate {
++                session_id,
++                file_paths,
++            });
++        }
++        Ok(candidates)
++    }
++
++    /// 在单个事务内删除这些会话的全部数据库痕迹（修剪三段式的第 3 段）。
++    ///
++    /// 四张表必须**逐一显式删除**，不能指望级联：`transfer_items` 虽然声明了
++    /// `ON DELETE CASCADE`，但 `init_database` 从未开启 `PRAGMA foreign_keys`，
++    /// SQLite 默认关闭外键 ⇒ 级联不会发生；`chunk_bitmaps` 与 `cache_entries`
++    /// 连外键声明都没有。
++    ///
++    /// 表间顺序先子后父：中途失败留下的是「父在、子少」的可恢复状态，
++    /// 而不是「父没了、子成孤儿」的不可追溯状态。
++    pub fn delete_sessions(
++        conn: &mut Connection,
++        session_ids: &[String],
++    ) -> Result<usize, rusqlite::Error> {
++        if session_ids.is_empty() {
++            return Ok(0);
++        }
++
++        let tx = conn.transaction()?;
++        let mut deleted = 0usize;
++        for session_id in session_ids {
++            tx.execute("DELETE FROM cache_entries WHERE session_id = ?1", [session_id])?;
++            tx.execute("DELETE FROM chunk_bitmaps WHERE session_id = ?1", [session_id])?;
++            tx.execute("DELETE FROM transfer_items WHERE session_id = ?1", [session_id])?;
++            deleted += tx.execute("DELETE FROM transfer_tasks WHERE session_id = ?1", [session_id])?;
++        }
++        tx.commit()?;
++        Ok(deleted)
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -204,4 +331,194 @@ mod tests {
+ 
+         assert!(HistoryRepo::get_task_brief(&conn, "missing").is_none());
+     }
++
++    // ---------- 修剪（需求 4） ----------
++
++    /// 按插入顺序建 n 条已完成的任务：s1 最旧，sN 最新（同秒内靠 rowid 分先后）。
++    fn seed_completed(conn: &Connection, n: usize) {
++        for i in 1..=n {
++            let sid = format!("s{}", i);
++            HistoryRepo::record_task(conn, &sid, "peer", "RECEIVE", &sample_offer(&sid, "FILES"), "TRANSFERRING")
++                .unwrap();
++            HistoryRepo::update_task_status(conn, &sid, "COMPLETED", None).unwrap();
++        }
++    }
++
++    fn add_cache_entry(conn: &Connection, session_id: &str, path: &str, injected_now: bool) {
++        let injected = if injected_now { "CURRENT_TIMESTAMP" } else { "NULL" };
++        conn.execute(
++            &format!(
++                "INSERT INTO cache_entries (file_path, session_id, file_size, clipboard_injected_at)
++                 VALUES (?1, ?2, 10, {})",
++                injected
++            ),
++            (path, session_id),
++        )
++        .unwrap();
++    }
++
++    fn session_ids(candidates: &[PruneCandidate]) -> Vec<String> {
++        let mut v: Vec<String> = candidates.iter().map(|c| c.session_id.clone()).collect();
++        v.sort();
++        v
++    }
++
++    #[test]
++    fn prune_keeps_newest_and_drops_oldest() {
++        let mut conn = test_conn();
++        seed_completed(&conn, 5);
++
++        let candidates = HistoryRepo::select_prune_candidates(&conn, 3).unwrap();
++        assert_eq!(session_ids(&candidates), vec!["s1", "s2"], "应只删最旧的两条");
++
++        let ids: Vec<String> = candidates.into_iter().map(|c| c.session_id).collect();
++        assert_eq!(HistoryRepo::delete_sessions(&mut conn, &ids).unwrap(), 2);
++
++        let left = HistoryRepo::list_history(&conn, 10).unwrap();
++        assert_eq!(left.len(), 3);
++        assert_eq!(left[0].session_id, "s5", "最新的必须还在");
++    }
++
++    #[test]
++    fn prune_limit_zero_means_unlimited() {
++        let conn = test_conn();
++        seed_completed(&conn, 5);
++        assert!(
++            HistoryRepo::select_prune_candidates(&conn, 0).unwrap().is_empty(),
++            "0 表示不限制，一条都不该选中"
++        );
++    }
++
++    /// 约束 A：进行中的任务即使排在保留窗口之外也不能删——删掉会让后续的
++    /// update_task_status 静默影响 0 行，故障无从追查。
++    #[test]
++    fn prune_never_touches_in_flight_tasks() {
++        let conn = test_conn();
++        HistoryRepo::record_task(&conn, "old-running", "peer", "RECEIVE", &sample_offer("old-running", "FILES"), "TRANSFERRING")
++            .unwrap();
++        seed_completed(&conn, 4);
++
++        let candidates = HistoryRepo::select_prune_candidates(&conn, 2).unwrap();
++        let ids = session_ids(&candidates);
++        assert!(!ids.contains(&"old-running".to_string()), "进行中的任务不得被选为删除候选");
++        assert_eq!(ids, vec!["s1", "s2"]);
++    }
++
++    /// 约束 B：文件还在 2 小时剪贴板免疫窗口内的会话本轮跳过，
++    /// 否则用户刚装载进剪贴板、下一秒 Ctrl+V 就粘不出来。
++    #[test]
++    fn prune_respects_clipboard_immunity_lock() {
++        let conn = test_conn();
++        seed_completed(&conn, 5);
++        add_cache_entry(&conn, "s1", "/tmp/locked.bin", true);
++        add_cache_entry(&conn, "s2", "/tmp/free.bin", false);
++
++        let ids = session_ids(&HistoryRepo::select_prune_candidates(&conn, 3).unwrap());
++        assert_eq!(ids, vec!["s2"], "s1 处于免疫窗口内，本轮应跳过");
++    }
++
++    /// 外键默认关闭（init_database 从未开启 PRAGMA foreign_keys），级联不会发生。
++    /// 这条测试守护「四张表逐一显式删除」——漏掉任何一张都会留下孤儿行。
++    #[test]
++    fn delete_sessions_clears_all_four_tables() {
++        let mut conn = test_conn();
++        HistoryRepo::record_task(&conn, "s1", "peer", "RECEIVE", &sample_offer("s1", "FILES"), "TRANSFERRING").unwrap();
++        HistoryRepo::update_task_status(&conn, "s1", "COMPLETED", None).unwrap();
++        add_cache_entry(&conn, "s1", "/tmp/a.bin", false);
++        conn.execute(
++            "INSERT INTO chunk_bitmaps (session_id, item_index, chunk_index, checksum) VALUES ('s1', 0, 0, 1)",
++            [],
++        )
++        .unwrap();
++
++        HistoryRepo::delete_sessions(&mut conn, &["s1".to_string()]).unwrap();
++
++        for table in ["transfer_tasks", "transfer_items", "chunk_bitmaps", "cache_entries"] {
++            let n: i64 = conn
++                .query_row(&format!("SELECT COUNT(*) FROM {} WHERE session_id = 's1'", table), [], |r| r.get(0))
++                .unwrap();
++            assert_eq!(n, 0, "{} 仍残留 s1 的行", table);
++        }
++    }
++
++    #[test]
++    fn prune_candidates_carry_their_cached_file_paths() {
++        let conn = test_conn();
++        seed_completed(&conn, 3);
++        add_cache_entry(&conn, "s1", "/tmp/one.bin", false);
++        add_cache_entry(&conn, "s1", "/tmp/two.bin", false);
++
++        let candidates = HistoryRepo::select_prune_candidates(&conn, 2).unwrap();
++        assert_eq!(candidates.len(), 1);
++        let mut paths = candidates[0].file_paths.clone();
++        paths.sort();
++        assert_eq!(paths, vec!["/tmp/one.bin", "/tmp/two.bin"]);
++    }
++
++    /// 候选集与 list_history 看得到的前 N 条必须无交集。两处排序键一旦不一致，
++    /// 「界面上看到的第 N 条」和「被删的第 N 条」就会错位。
++    #[test]
++    fn prune_candidates_never_overlap_visible_head() {
++        let conn = test_conn();
++        seed_completed(&conn, 6);
++
++        let visible: Vec<String> = HistoryRepo::list_history(&conn, 4)
++            .unwrap()
++            .into_iter()
++            .map(|e| e.session_id)
++            .collect();
++        let candidates = session_ids(&HistoryRepo::select_prune_candidates(&conn, 4).unwrap());
++
++        for id in &candidates {
++            assert!(!visible.contains(id), "{} 同时出现在保留窗口与删除候选中", id);
++        }
++        assert_eq!(candidates.len(), 2);
++    }
++
++    // ---------- 启动期复位（需求 4 的前置） ----------
++
++    #[test]
++    fn reset_stale_in_flight_converts_only_unfinished_rows() {
++        let conn = test_conn();
++        HistoryRepo::record_task(&conn, "running", "peer", "RECEIVE", &sample_offer("running", "FILES"), "TRANSFERRING")
++            .unwrap();
++        HistoryRepo::record_task(&conn, "pending", "peer", "SEND", &sample_offer("pending", "TEXT"), "PENDING").unwrap();
++        HistoryRepo::record_task(&conn, "done", "peer", "SEND", &sample_offer("done", "TEXT"), "TRANSFERRING").unwrap();
++        HistoryRepo::update_task_status(&conn, "done", "COMPLETED", None).unwrap();
++
++        assert_eq!(HistoryRepo::reset_stale_in_flight(&conn).unwrap(), 2);
++
++        let status_of = |sid: &str| -> String {
++            conn.query_row("SELECT status FROM transfer_tasks WHERE session_id = ?1", [sid], |r| r.get(0))
++                .unwrap()
++        };
++        assert_eq!(status_of("running"), "FAILED");
++        assert_eq!(status_of("pending"), "FAILED");
++        assert_eq!(status_of("done"), "COMPLETED", "既有终态不得被改写");
++    }
++
++    /// 复位之后那些死行才能被修剪回收——这正是加复位的理由。
++    #[test]
++    fn reset_then_prune_reclaims_dead_rows() {
++        let mut conn = test_conn();
++        HistoryRepo::record_task(&conn, "dead", "peer", "RECEIVE", &sample_offer("dead", "FILES"), "TRANSFERRING")
++            .unwrap();
++        seed_completed(&conn, 3);
++
++        assert!(
++            HistoryRepo::select_prune_candidates(&conn, 2).unwrap().iter().all(|c| c.session_id != "dead"),
++            "复位前，死行受约束 A 保护"
++        );
++
++        HistoryRepo::reset_stale_in_flight(&conn).unwrap();
++        let ids: Vec<String> = HistoryRepo::select_prune_candidates(&conn, 2)
++            .unwrap()
++            .into_iter()
++            .map(|c| c.session_id)
++            .collect();
++        assert!(ids.contains(&"dead".to_string()), "复位后死行应可被回收");
++
++        HistoryRepo::delete_sessions(&mut conn, &ids).unwrap();
++        assert_eq!(HistoryRepo::list_history(&conn, 10).unwrap().len(), 2);
++    }
+ }
+diff --git a/client/src/App.tsx b/client/src/App.tsx
+index 116bd8e..1493a95 100644
+--- a/client/src/App.tsx
++++ b/client/src/App.tsx
+@@ -1,4 +1,4 @@
+-import React, { useState, useEffect } from "react";
++import React, { useState, useEffect, useRef } from "react";
+ import { invoke } from "@tauri-apps/api/core";
+ import { listen } from "@tauri-apps/api/event";
+ import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+@@ -26,6 +26,9 @@ const defaultSettings: AppSettings = {
+   auto_inject: false,
+   rate_limit_mb: 10,
+   start_minimized: false,
++  // 与 Rust 侧 AppSettings::default_config() 必须保持一致（两份独立字面量）
++  history_max_entries: 100,
++  transfer_card_retain_secs: 30,
+ };
+ 
+ export const App: React.FC = () => {
+@@ -49,6 +52,38 @@ export const App: React.FC = () => {
+     }, 4000);
+   };
+ 
++  // 下面那个监听用的 useEffect 依赖数组是 []，它的闭包永远看到**首次渲染**的
++  // settings，也就是 defaultSettings——真实配置要等 fetchInitialData 拉回来才有。
++  // 所以定时器秒数必须经 ref 读取，直接读 settings 会永远拿到默认值。
++  const settingsRef = useRef<AppSettings>(defaultSettings);
++  useEffect(() => {
++    settingsRef.current = settings;
++  }, [settings]);
++
++  // 按 session_id 记账：transfer-progress 对同一会话会反复到达，终态事件也可能
++  // 重复送达，不记账就会给同一张卡片堆积多个定时器。
++  const dismissTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
++
++  const clearDismissTimer = (sessionId: string) => {
++    const timer = dismissTimersRef.current.get(sessionId);
++    if (timer !== undefined) {
++      clearTimeout(timer);
++      dismissTimersRef.current.delete(sessionId);
++    }
++  };
++
++  /// 只给**完成**的卡片排自动消失。秒数取事件到达时的配置，不追溯已在计时的卡片。
++  const scheduleAutoDismiss = (sessionId: string) => {
++    clearDismissTimer(sessionId);
++    const secs = settingsRef.current.transfer_card_retain_secs;
++    if (!secs || secs <= 0) return; // 0 = 不自动消失
++    const timer = setTimeout(() => {
++      dismissTimersRef.current.delete(sessionId);
++      setTransfers((prev) => prev.filter((t) => t.session_id !== sessionId));
++    }, secs * 1000);
++    dismissTimersRef.current.set(sessionId, timer);
++  };
++
+   const fetchInitialData = async () => {
+     setIsRefreshing(true);
+     try {
+@@ -116,8 +151,11 @@ export const App: React.FC = () => {
+ 
+       if (update.status === "COMPLETED") {
+         showNotification(`传输完成: ${update.preview_summary}`, "success");
++        scheduleAutoDismiss(update.session_id);
+       } else if (update.status === "FAILED") {
+         showNotification(`传输失败: ${update.preview_summary}`, "error");
++        // 失败卡片**不**自动消失：错误 toast 只显示 4 秒，卡片再自动消失之后
++        // 就没有任何醒目入口能看到这次为什么失败了。只能由用户手动点 X 移除。
+       }
+     });
+ 
+@@ -145,6 +183,10 @@ export const App: React.FC = () => {
+       unlistenProgressPromise.then((unlisten) => unlisten());
+       unlistenOfferPromise.then((unlisten) => unlisten());
+       unlistenSettingsPromise.then((unlisten) => unlisten());
++      // 卸载后定时器若仍触发就会对已卸载的组件 setState。StrictMode 下开发期
++      // 会 mount→unmount→mount，不清会稳定复现重复定时器。
++      dismissTimersRef.current.forEach((timer) => clearTimeout(timer));
++      dismissTimersRef.current.clear();
+     };
+   }, []);
+ 
+@@ -174,6 +216,8 @@ export const App: React.FC = () => {
+   };
+ 
+   const handleDismissTransfer = (sessionId: string) => {
++    // 同时清掉定时器，否则它会留到超时才空转一次，期间还持有已移除会话的闭包
++    clearDismissTimer(sessionId);
+     setTransfers((prev) => prev.filter((t) => t.session_id !== sessionId));
+   };
+ 
+diff --git a/client/src/components/HistoryPanel.tsx b/client/src/components/HistoryPanel.tsx
+index 172b15f..2734e64 100644
+--- a/client/src/components/HistoryPanel.tsx
++++ b/client/src/components/HistoryPanel.tsx
+@@ -43,8 +43,14 @@ export const HistoryPanel: React.FC<HistoryPanelProps> = ({ onNotify }) => {
+         refresh(true);
+       }
+     });
++    // 后端修剪历史后必须重拉：否则把「保留条数」调小并保存后，记录已经删了，
++    // 列表却还显示旧长度，要等下次传输或手动点刷新才变短——看起来像设置没生效。
++    const unlistenPrunedPromise = listen<number>("history-pruned", () => {
++      refresh(true);
++    });
+     return () => {
+       unlistenPromise.then((unlisten) => unlisten());
++      unlistenPrunedPromise.then((unlisten) => unlisten());
+     };
+   }, [refresh]);
+ 
+diff --git a/client/src/components/SettingsModal.tsx b/client/src/components/SettingsModal.tsx
+index 4d6baec..454b953 100644
+--- a/client/src/components/SettingsModal.tsx
++++ b/client/src/components/SettingsModal.tsx
+@@ -3,6 +3,22 @@ import { invoke } from "@tauri-apps/api/core";
+ import { X, Save, Shield, AlertCircle } from "lucide-react";
+ import { AppSettings } from "../types";
+ 
++/** Rust 侧两个字段都是 u32，超出这个范围反序列化会整单失败 */
++const U32_MAX = 4294967295;
++
++/// 把输入框里的字符串解析成 u32。空串、负数、小数、超上限一律判错。
++const parseU32 = (raw: string): { value: number } | { error: string } => {
++  const trimmed = raw.trim();
++  if (trimmed === "") return { error: "不能为空（不限制请填 0）" };
++  // 只认纯数字，顺带排除了 "-1"、"2.5"、"1e3" 与 Number("") === 0 这个坑
++  if (!/^\d+$/.test(trimmed)) return { error: "只能填 0 到 4294967295 的整数" };
++  const value = Number(trimmed);
++  if (!Number.isSafeInteger(value) || value > U32_MAX) {
++    return { error: "数值超出上限 4294967295" };
++  }
++  return { value };
++};
++
+ interface SettingsModalProps {
+   settings: AppSettings;
+   isOpen: boolean;
+@@ -15,6 +31,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen,
+   const [saving, setSaving] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+ 
++  // 两个数字字段用字符串暂存输入：直接绑 number 的话，用户清空重填的中间态会
++  // 变成 0，而 0 在这里是**有意义的取值**（不限制 / 不自动消失），不能与空输入混淆。
++  const [historyLimitInput, setHistoryLimitInput] = useState(String(settings.history_max_entries));
++  const [retainSecsInput, setRetainSecsInput] = useState(String(settings.transfer_card_retain_secs));
++  const [fieldErrors, setFieldErrors] = useState<{ history?: string; retain?: string }>({});
++
+   // 开机自启不属于 AppSettings：它的事实源是操作系统，本地不留副本，
+   // 因此独立拉取、独立写入，与表单保存的失败域互不污染。
+   const [autostart, setAutostart] = useState(false);
+@@ -24,6 +46,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen,
+   useEffect(() => {
+     setForm(settings);
+     setError(null);
++    setHistoryLimitInput(String(settings.history_max_entries));
++    setRetainSecsInput(String(settings.transfer_card_retain_secs));
++    setFieldErrors({});
+   }, [settings, isOpen]);
+ 
+   useEffect(() => {
+@@ -80,6 +105,20 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen,
+     e.preventDefault();
+     if (saving) return;
+ 
++    // 先做字段级校验再提交。后端 u32 反序列化失败只会返回笼统的「保存设置失败」，
++    // 用户看不出是哪个字段的问题，所以小数、负数、超上限都必须在这里拦住。
++    const history = parseU32(historyLimitInput);
++    const retain = parseU32(retainSecsInput);
++    const nextFieldErrors = {
++      history: "error" in history ? history.error : undefined,
++      retain: "error" in retain ? retain.error : undefined,
++    };
++    if (nextFieldErrors.history || nextFieldErrors.retain) {
++      setFieldErrors(nextFieldErrors);
++      return;
++    }
++    setFieldErrors({});
++
+     let cleanUrl = form.server_url.replace(/\s+/g, "");
+     if (cleanUrl && !cleanUrl.startsWith("ws://") && !cleanUrl.startsWith("wss://")) {
+       cleanUrl = `wss://${cleanUrl}`;
+@@ -93,6 +132,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen,
+         server_url: cleanUrl,
+         account_id: form.account_id.trim(),
+         psk_secret: form.psk_secret.trim(),
++        history_max_entries: (history as { value: number }).value,
++        transfer_card_retain_secs: (retain as { value: number }).value,
+       });
+       onClose(); // 只有保存成功才关窗，失败时保留用户已填内容
+     } catch (err: any) {
+@@ -197,6 +238,48 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen,
+             />
+           </div>
+ 
++          <div className="pt-2">
++            <label className="block text-slate-400 mb-1">传输历史保留条数</label>
++            <input
++              type="number"
++              min={0}
++              step={1}
++              value={historyLimitInput}
++              onChange={(e) => setHistoryLimitInput(e.target.value)}
++              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-teal-500"
++            />
++            <p className="text-[11px] text-slate-500 mt-1">
++              超出的最旧记录连同缓存文件一起删除；填 0 表示不限制
++            </p>
++            {fieldErrors.history && (
++              <div className="flex items-start space-x-1.5 text-[11px] text-rose-400 mt-1">
++                <AlertCircle className="w-3.5 h-3.5 mt-px shrink-0" />
++                <span>{fieldErrors.history}</span>
++              </div>
++            )}
++          </div>
++
++          <div>
++            <label className="block text-slate-400 mb-1">完成任务在界面保持秒数</label>
++            <input
++              type="number"
++              min={0}
++              step={1}
++              value={retainSecsInput}
++              onChange={(e) => setRetainSecsInput(e.target.value)}
++              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-teal-500"
++            />
++            <p className="text-[11px] text-slate-500 mt-1">
++              传输完成的卡片到点自动消失；填 0 表示不自动消失。失败的卡片不受影响，始终保留到手动关闭
++            </p>
++            {fieldErrors.retain && (
++              <div className="flex items-start space-x-1.5 text-[11px] text-rose-400 mt-1">
++                <AlertCircle className="w-3.5 h-3.5 mt-px shrink-0" />
++                <span>{fieldErrors.retain}</span>
++              </div>
++            )}
++          </div>
++
+           {error && (
+             <div className="flex items-start space-x-1.5 text-[11px] text-rose-400">
+               <AlertCircle className="w-3.5 h-3.5 mt-px shrink-0" />
+diff --git a/client/src/types/index.ts b/client/src/types/index.ts
+index b1d5ce9..53446bf 100644
+--- a/client/src/types/index.ts
++++ b/client/src/types/index.ts
+@@ -14,6 +14,10 @@ export interface AppSettings {
+   rate_limit_mb: number;
+   /** 启动时不弹出主窗口，仅托盘常驻。对手动启动与开机自启同样生效。 */
+   start_minimized: boolean;
++  /** 传输历史最多保留的条数，超出的最旧记录连同缓存文件一起删除；0 = 不限制。 */
++  history_max_entries: number;
++  /** 传输**完成**的卡片在界面保持的秒数；0 = 不自动消失。失败卡片不受此设置影响。 */
++  transfer_card_retain_secs: number;
+ }
+ 
+ export interface ActiveTransfer {
+diff --git a/docs/design/DESIGN.md b/docs/design/DESIGN.md
+index 5dc507b..07f08de 100644
+--- a/docs/design/DESIGN.md
++++ b/docs/design/DESIGN.md
+@@ -1279,7 +1279,8 @@ unidrop-client/
+         │   ├── TrayMenu.tsx         # 托盘菜单面板
+         │   ├── DeviceCard.tsx       # 在线设备状态卡片
+         │   ├── TransferToast.tsx    # 传输进度浮动悬浮窗
+-        │   └── SettingsModal.tsx    # 连接/密钥、自动装载、开机自启与启动最小化偏好设置
++        │   └── SettingsModal.tsx    # 连接/密钥、自动装载、开机自启与启动最小化、
++        │                               # 历史保留条数与完成卡片保持秒数偏好设置
+         └── hooks/                   # Tauri 事件总线订阅 Hooks
+ ```
+ 
+diff --git a/docs/需求.md b/docs/需求.md
+index 61790d0..6f6db1f 100644
+--- a/docs/需求.md
++++ b/docs/需求.md
+@@ -11,7 +11,16 @@
+    「启动时最小化到托盘」（`AppSettings.start_minimized`，对手动启动与开机自启同样生效）。
+ 3. 服务端可以设置最大可以传输的文件或者剪贴板内容最大多大。
+ 4. 可以设置传输历史保存最新的多少条，超出的删除（界面提醒和缓存的内容）。
++   — **已实现**（2026-09-13）。新增 `AppSettings.history_max_entries`，默认 100，`0` = 不限制。
++   超出的最旧记录连同其数据库行（四张表）与磁盘缓存文件一并删除。
++   两条硬约束：进行中的任务不删；文件仍处于 2 小时剪贴板免疫窗口内的会话本轮跳过。
++   触发点为任务落终态后、保存设置后、启动时（启动先把崩溃残留的非终态行复位为 FAILED，
++   否则死行会永久占住保留额度）。列表**显示**上限与**淘汰**上限解耦，前者是防御性常量。
+ 5. 可以设置传输任务完成后在界面中保持多久，一段时间后自动在界面中消失。
++   — **已实现**（2026-09-13）。新增 `AppSettings.transfer_card_retain_secs`，默认 30 秒，
++   `0` = 不自动消失。**只作用于 COMPLETED 卡片**：失败卡片始终保留到手动关闭，
++   因为错误 toast 仅 4 秒，卡片再自动消失就没有入口能看到失败原因了。
++   仅影响界面卡片，不删历史记录与缓存。
+ 6. 客户端可以设置服务端的一些参数（如最大传输的单个文件大小，同时传输的并发数等）。
+ 7. 是否同时支持好多个用户。
+ 8. 是否全程加密。
+diff --git a/client/src-tauri/src/core/history_pruner.rs b/client/src-tauri/src/core/history_pruner.rs
+new file mode 100644
+index 0000000..972f7fa
+--- /dev/null
++++ b/client/src-tauri/src/core/history_pruner.rs
+@@ -0,0 +1,47 @@
++//! 传输历史修剪的统一触发入口（需求 4）
++//!
++//! # 必须在释放 `db_conn` 锁之后调用
++//!
++//! 本函数内部会 `state.db_conn.lock().await`。`tokio::sync::Mutex` **不可重入**，
++//! 在任何仍持有该锁的作用域里调用它 = 进程永久死锁，且没有任何报错，
++//! 表现为整个应用静默卡死。
++//!
++//! 具体到既有代码，这些地方的锁 **guard 活到哪里**：
++//!
++//! - `transfer_engine::update_history_status`：guard 的作用域就是那个函数体。
++//!   所以只能在 `update_history_status(...).await` **返回之后**调用，
++//!   **绝不能**把调用写进它的函数体内。
++//! - `lib.rs` 的 TRANSFER_FAILURE 分支：guard 在一个显式 `{ }` 块内，
++//!   只能在那个块**之后**调用。
++//! - `cmd_save_settings`：落库与内存更新各自在独立块内，块后调用安全。
++
++use tauri::{AppHandle, Emitter, Manager};
++
++use crate::app_state::AppState;
++
++/// 按当前设置修剪历史；确有删除时广播 `history-pruned` 事件。
++///
++/// 失败只记日志：修剪是后台维护动作，不该让一次传输或一次保存设置因此失败。
++pub async fn prune_and_notify(app: &AppHandle) {
++    let state = app.state::<AppState>();
++
++    // 单独取一次 settings 锁并立刻释放，避免与下面的 db_conn 锁交叠持有
++    let limit = {
++        let settings = state.settings.lock().await;
++        settings.history_max_entries
++    };
++    if limit == 0 {
++        return; // 0 = 不限制
++    }
++
++    match state.cache_manager.prune_history(limit).await {
++        Ok(0) => {}
++        Ok(pruned) => {
++            log::info!("Pruned {} transfer history entries (limit {})", pruned, limit);
++            // 前端 HistoryPanel 只在挂载 / 收到终态事件 / 手动点刷新时重拉，
++            // 不广播的话「保存设置后列表立刻变短」就实现不了。
++            let _ = app.emit("history-pruned", pruned);
++        }
++        Err(e) => log::warn!("Failed to prune transfer history: {}", e),
++    }
++}

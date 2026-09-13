@@ -1,0 +1,147 @@
+{
+  "schema": "trivium.run.v1",
+  "run_id": "20260913T002939Z",
+  "topic": "history-retention-autodismiss",
+  "stage": "code",
+  "rerun_index": 1,
+  "command": "trivium review --start --stage code",
+  "prompt_hint": "重点核实修剪的锁时序、删除顺序、FAILED 卡片豁免与前端刷新链路是否按裁决落地",
+  "task_goal": "传输历史条数上限 + 完成卡片自动消失 — 实施计划",
+  "entry": "C",
+  "snapshot": {
+    "git_head": "d4d1cf11cc02cb55cbcf048676334ef351e80ba2",
+    "tree_hash": "4dec4a1612eb2b7c7771e84e3bb0cea9139b7c76",
+    "dirty": true,
+    "subject_sha256": "84298a27d52ec42a7e70cc95302eb61fbcaa46b8076a180bfccb162b8facb6ff",
+    "drift": {
+      "changed": false,
+      "files": [],
+      "policy": "warn"
+    }
+  },
+  "started_at": "2026-09-13T00:29:40.414Z",
+  "finished_at": "2026-09-13T00:39:50.758Z",
+  "review_mode": "dual",
+  "degraded_reason": null,
+  "critics": {
+    "gemini": {
+      "vendor": "antigravity",
+      "cli_version": "1.2.2",
+      "model_requested": "gemini-3.8-flash-high",
+      "model_effective": "gemini-3.8-flash-high",
+      "model_effective_source": "envelope",
+      "effort": "high",
+      "status": "ok",
+      "exit_code": 0,
+      "duration_s": 158.42,
+      "tool_calls": {
+        "read": 27,
+        "grep": 7,
+        "glob": 0,
+        "run_command": 0,
+        "project_reads": 19
+      },
+      "evidence_ok": true,
+      "usage": {
+        "input_tokens": 309051,
+        "output_tokens": 33983,
+        "thinking_tokens": 27724,
+        "cache_read_tokens": 2334977,
+        "total_tokens": 343034
+      },
+      "heterogeneous": true,
+      "fail_reason": null,
+      "empty_review": false,
+      "parse_fallback": false,
+      "session_id": "57a089a3-a710-4b45-84b2-2fb2a0463cb5",
+      "peer_deny_applied": false
+    },
+    "glm": {
+      "vendor": "zcode",
+      "cli_version": "0.16.5",
+      "model_requested": "GLM-5.3-Flash",
+      "model_effective": "bigmodel-coding-plan/GLM-5.3-Flash",
+      "model_effective_source": "trace",
+      "model_route": "config_copy",
+      "status": "ok",
+      "exit_code": 0,
+      "duration_s": 610.18,
+      "tool_calls": {
+        "read": 21,
+        "grep": 1,
+        "glob": 0,
+        "run_command": 0,
+        "project_reads": 19
+      },
+      "evidence_ok": true,
+      "usage": {
+        "source": "provider",
+        "modelRequestCount": 9,
+        "inputTokens": 704161,
+        "outputTokens": 24388,
+        "totalTokens": 728549,
+        "cacheReadTokens": 598336,
+        "cacheWriteTokens": 0,
+        "reasoningTokens": 0,
+        "webFetchRequests": 0,
+        "webSearchRequests": 0
+      },
+      "heterogeneous": true,
+      "fail_reason": null,
+      "empty_review": false,
+      "parse_fallback": false,
+      "session_id": "sess_62e4c799-1723-45f2-bdcd-70366e7ac3e4",
+      "peer_deny_applied": false
+    }
+  },
+  "deny_paths": [
+    ".reviews/autostart-single-instance/code/2026-09-13-autostart-single-instance-glm.md",
+    ".reviews/autostart-single-instance/plan/2026-09-13-autostart-single-instance-glm.md",
+    ".reviews/history-retention-autodismiss/plan/2026-09-13-history-retention-autodismiss-glm.md"
+  ],
+  "guard": {
+    "readonly_breach": false,
+    "peer_artifact_read": false,
+    "peer_deny_applied": {
+      "gemini": false,
+      "glm": false
+    },
+    "forged_role_file": false,
+    "breached_files": []
+  },
+  "artifacts": [
+    {
+      "path": "history-retention-autodismiss/code/_meta/changes-20260913T002939Z.diff",
+      "sha256": "84298a27d52ec42a7e70cc95302eb61fbcaa46b8076a180bfccb162b8facb6ff"
+    },
+    {
+      "path": "history-retention-autodismiss/code/_meta/brief-gemini-20260913T002939Z.md",
+      "sha256": "d9a979b34f397627402e508ca9a31fc3a4186a6195cfe7dc8ed06bcdbd3c4d05"
+    },
+    {
+      "path": "history-retention-autodismiss/code/_meta/brief-glm-20260913T002939Z.md",
+      "sha256": "f303ba06e0e70f88b898577e0e71e321fd398cb253faa7ce5738ecfd98746d66"
+    },
+    {
+      "path": "history-retention-autodismiss/code/_meta/review-gemini-20260913T002939Z.json",
+      "sha256": "6b09d1cc514071add0d6c39de62651550600b234ebbb1bc5aae7dec9c03d9366"
+    },
+    {
+      "path": "history-retention-autodismiss/code/_meta/review-glm-20260913T002939Z.json",
+      "sha256": "ad095238926078b0ff62a1cb7de991fb63344fa239d1000d1dfbd4f25ef86b40"
+    },
+    {
+      "path": "history-retention-autodismiss/code/2026-09-13-history-retention-autodismiss-gemini.md",
+      "sha256": "a35e82b94fb3902c850bcb946af91f6dbeccbc19fbf19c588988ca543c884b8b"
+    },
+    {
+      "path": "history-retention-autodismiss/code/2026-09-13-history-retention-autodismiss-glm.md",
+      "sha256": "63b3f4506791b5f8805fcb93bf97c598e57d62a7f3d6aa8590818616c10b62d3"
+    }
+  ],
+  "gate": {
+    "adjudication_complete": false,
+    "state": "review_done_awaiting_disposition"
+  },
+  "status": "success"
+}
