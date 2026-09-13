@@ -18,6 +18,40 @@ pub struct AppSettings {
     /// 把用户已配置的 server_url / account_id / psk_secret 一起冲掉。
     #[serde(default)]
     pub start_minimized: bool,
+
+    /// 传输历史最多保留的条数，超出的最旧记录连同缓存文件一起删除；`0` = 不限制。
+    ///
+    /// **不能只写 `#[serde(default)]`**：`u32` 的 `Default` 是 `0`，而 `0` 在这里
+    /// 被定义成「不限制」。老库的 JSON 没有本字段，裸 default 会让升级后的用户
+    /// 静默变成「历史无上限」——恰好是需求没生效的形态，而设置面板里显示的 `0`
+    /// 看起来又像是用户自己设的，无从分辨。
+    #[serde(default = "default_history_max_entries")]
+    pub history_max_entries: u32,
+
+    /// 传输**完成**的卡片在界面上保持的秒数；`0` = 不自动消失。
+    ///
+    /// 只管 COMPLETED。FAILED 卡片永不自动消失——失败原因的 toast 只显示 4 秒，
+    /// 卡片再自动消失就没有任何入口能看到为什么失败了。
+    ///
+    /// 同样需要自定义 default，理由见 `history_max_entries`。
+    #[serde(default = "default_transfer_card_retain_secs")]
+    pub transfer_card_retain_secs: u32,
+}
+
+/// 历史保留条数的默认值。沿用改造前 `cmd_list_history` 硬编码的 100，
+/// 使未改过设置的老用户看到的列表长度保持不变。
+pub const DEFAULT_HISTORY_MAX_ENTRIES: u32 = 100;
+
+/// 完成卡片保持秒数的默认值。既有 toast 是 4 秒，够读完但不够点卡片上的
+/// 「重新复制 / 装载」按钮；30 秒是「看完并来得及点」的下限。
+pub const DEFAULT_TRANSFER_CARD_RETAIN_SECS: u32 = 30;
+
+fn default_history_max_entries() -> u32 {
+    DEFAULT_HISTORY_MAX_ENTRIES
+}
+
+fn default_transfer_card_retain_secs() -> u32 {
+    DEFAULT_TRANSFER_CARD_RETAIN_SECS
 }
 
 impl AppSettings {
@@ -30,6 +64,8 @@ impl AppSettings {
             auto_inject: false,
             rate_limit_mb: 10,
             start_minimized: false,
+            history_max_entries: DEFAULT_HISTORY_MAX_ENTRIES,
+            transfer_card_retain_secs: DEFAULT_TRANSFER_CARD_RETAIN_SECS,
         }
     }
 }
@@ -91,6 +127,11 @@ pub async fn cmd_save_settings(
     // 4. Trigger immediate actor reconnection with new configuration
     state.reconnect_notify.notify_waiters();
     log::info!("Settings saved and reconnected immediately with new config");
+
+    // 5. 立刻按新上限修剪历史：用户把条数调小后必须当场见效，
+    //    否则要等到下次传输才生效，看起来就像设置没保存。
+    //    此处已在上面各锁的作用域之外，取 db_conn 锁是安全的。
+    crate::core::history_pruner::prune_and_notify(&app).await;
 
     Ok(())
 }
@@ -186,6 +227,38 @@ mod tests {
         assert!(parsed.auto_inject);
         assert_eq!(parsed.rate_limit_mb, 42);
         assert!(!parsed.start_minimized, "缺失的新字段应取默认值 false");
+
+        // 这两条守护的是 #[serde(default = "...")] 而不是裸 #[serde(default)]：
+        // u32 的 Default 是 0，而 0 在本功能里表示「不限制 / 不自动消失」。
+        // 换成裸 default 后这里会得到 0，两个需求对老用户静默失效，且面板上
+        // 显示的 0 看起来像是用户自己设的，无从分辨。
+        assert_eq!(
+            parsed.history_max_entries, DEFAULT_HISTORY_MAX_ENTRIES,
+            "老库缺字段时必须取 100，不能是 u32 的 Default 0（那表示不限制）"
+        );
+        assert_eq!(
+            parsed.transfer_card_retain_secs, DEFAULT_TRANSFER_CARD_RETAIN_SECS,
+            "老库缺字段时必须取 30，不能是 u32 的 Default 0（那表示不自动消失）"
+        );
+    }
+
+    /// 0 是合法取值（不限制 / 不自动消失），不能被 default 逻辑改写成 100 / 30。
+    #[test]
+    fn explicit_zero_is_preserved_not_defaulted() {
+        let json = r#"{
+            "server_url": "wss://relay.example.com:58921",
+            "account_id": "alice",
+            "psk_secret": "s",
+            "auto_inject": false,
+            "rate_limit_mb": 10,
+            "start_minimized": false,
+            "history_max_entries": 0,
+            "transfer_card_retain_secs": 0
+        }"#;
+
+        let parsed: AppSettings = serde_json::from_str(json).expect("反序列化失败");
+        assert_eq!(parsed.history_max_entries, 0);
+        assert_eq!(parsed.transfer_card_retain_secs, 0);
     }
 
     #[test]
@@ -203,6 +276,8 @@ mod tests {
         assert_eq!(parsed.auto_inject, settings.auto_inject);
         assert_eq!(parsed.rate_limit_mb, settings.rate_limit_mb);
         assert!(parsed.start_minimized);
+        assert_eq!(parsed.history_max_entries, settings.history_max_entries);
+        assert_eq!(parsed.transfer_card_retain_secs, settings.transfer_card_retain_secs);
     }
 
     #[test]

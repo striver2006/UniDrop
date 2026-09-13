@@ -48,12 +48,32 @@ pub enum TransferSource {
 }
 
 /// Best-effort history status update; failures are logged only.
+///
+/// 注意 `conn` guard 的作用域**就是本函数体**。任何需要再次取 `db_conn` 锁的动作
+/// （例如修剪历史）都不能写进这里——`tokio::sync::Mutex` 不可重入，会永久死锁。
+/// 终态请改用 `finalize_history_status`。
 async fn update_history_status(app_handle: &AppHandle, session_id: &str, status: &str, error: Option<&str>) {
     let state = app_handle.state::<AppState>();
     let conn = state.db_conn.lock().await;
     if let Err(e) = HistoryRepo::update_task_status(&conn, session_id, status, error) {
         log::warn!("Failed to update history status for {}: {}", session_id, e);
     }
+}
+
+/// 写入**终态**并随即按保留上限修剪历史（需求 4）。
+///
+/// 单独封一层，是为了把「修剪必须发生在锁释放之后」这条约束固定在一个地方：
+/// 上面那次 `.await` 返回时 `db_conn` 锁已经释放，这里再取锁才是安全的。
+/// 六个终态调用点若各自手写两行，早晚有人把修剪塞进 `update_history_status`
+/// 内部——那是静默死锁，整个应用卡住且不报任何错。
+async fn finalize_history_status(
+    app_handle: &AppHandle,
+    session_id: &str,
+    status: &str,
+    error: Option<&str>,
+) {
+    update_history_status(app_handle, session_id, status, error).await;
+    crate::core::history_pruner::prune_and_notify(app_handle).await;
 }
 
 pub struct TransferEngine {
@@ -255,7 +275,7 @@ impl TransferEngine {
                     status: "FAILED".to_string(),
                     data_type: offer.data_type.clone(),
                 });
-                update_history_status(&app_handle, &session_id, "FAILED", Some(&format!("数据通道连接失败: {}", e))).await;
+                finalize_history_status(&app_handle, &session_id, "FAILED", Some(&format!("数据通道连接失败: {}", e))).await;
                 let fail_env = ControlEnvelope {
                     version: 1,
                     trace_id: Uuid::new_v4().to_string(),
@@ -503,7 +523,7 @@ impl TransferEngine {
                 status: "COMPLETED".to_string(),
                 data_type: offer.data_type.clone(),
             });
-            update_history_status(&app_handle, &session_id, "COMPLETED", None).await;
+            finalize_history_status(&app_handle, &session_id, "COMPLETED", None).await;
         } else {
             // N4: Emit FAILED status and send TRANSFER_FAILURE on interrupted/aborted transfer
             log::error!("Sender transfer failed or was interrupted for session {}", session_id);
@@ -517,7 +537,7 @@ impl TransferEngine {
                 status: "FAILED".to_string(),
                 data_type: offer.data_type.clone(),
             });
-            update_history_status(&app_handle, &session_id, "FAILED", Some("传输中断或超出重试上限")).await;
+            finalize_history_status(&app_handle, &session_id, "FAILED", Some("传输中断或超出重试上限")).await;
 
             let fail_env = ControlEnvelope {
                 version: 1,
@@ -587,7 +607,7 @@ impl TransferEngine {
                     data_type: offer.data_type.clone(),
                 });
                 let _ = show_transfer_notification(&app_handle, "UniDrop 接收失败", "数据通道连接失败，请检查服务器地址与证书配置");
-                update_history_status(&app_handle, &session_id, "FAILED", Some(&format!("数据通道连接失败: {}", e))).await;
+                finalize_history_status(&app_handle, &session_id, "FAILED", Some(&format!("数据通道连接失败: {}", e))).await;
                 let fail_env = ControlEnvelope {
                     version: 1,
                     trace_id: Uuid::new_v4().to_string(),
@@ -816,7 +836,7 @@ impl TransferEngine {
                             }
                         }
                     }
-                    update_history_status(&app_handle, &session_id, "COMPLETED", None).await;
+                    finalize_history_status(&app_handle, &session_id, "COMPLETED", None).await;
                 } else {
                     let fail_env = ControlEnvelope {
                         version: 1,
@@ -852,7 +872,7 @@ impl TransferEngine {
                 status: "FAILED".to_string(),
                 data_type: offer.data_type.clone(),
             });
-            update_history_status(&app_handle, &session_id, "FAILED", Some("接收连接中断或校验失败")).await;
+            finalize_history_status(&app_handle, &session_id, "FAILED", Some("接收连接中断或校验失败")).await;
 
             let fail_env = ControlEnvelope {
                 version: 1,

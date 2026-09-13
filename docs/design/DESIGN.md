@@ -1279,7 +1279,8 @@ unidrop-client/
         │   ├── TrayMenu.tsx         # 托盘菜单面板
         │   ├── DeviceCard.tsx       # 在线设备状态卡片
         │   ├── TransferToast.tsx    # 传输进度浮动悬浮窗
-        │   └── SettingsModal.tsx    # 连接/密钥、自动装载、开机自启与启动最小化偏好设置
+        │   └── SettingsModal.tsx    # 连接/密钥、自动装载、开机自启与启动最小化、
+        │                               # 历史保留条数与完成卡片保持秒数偏好设置
         └── hooks/                   # Tauri 事件总线订阅 Hooks
 ```
 

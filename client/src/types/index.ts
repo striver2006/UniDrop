@@ -14,6 +14,10 @@ export interface AppSettings {
   rate_limit_mb: number;
   /** 启动时不弹出主窗口，仅托盘常驻。对手动启动与开机自启同样生效。 */
   start_minimized: boolean;
+  /** 传输历史最多保留的条数，超出的最旧记录连同缓存文件一起删除；0 = 不限制。 */
+  history_max_entries: number;
+  /** 传输**完成**的卡片在界面保持的秒数；0 = 不自动消失。失败卡片不受此设置影响。 */
+  transfer_card_retain_secs: number;
 }
 
 export interface ActiveTransfer {

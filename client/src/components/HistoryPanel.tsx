@@ -43,8 +43,14 @@ export const HistoryPanel: React.FC<HistoryPanelProps> = ({ onNotify }) => {
         refresh(true);
       }
     });
+    // 后端修剪历史后必须重拉：否则把「保留条数」调小并保存后，记录已经删了，
+    // 列表却还显示旧长度，要等下次传输或手动点刷新才变短——看起来像设置没生效。
+    const unlistenPrunedPromise = listen<number>("history-pruned", () => {
+      refresh(true);
+    });
     return () => {
       unlistenPromise.then((unlisten) => unlisten());
+      unlistenPrunedPromise.then((unlisten) => unlisten());
     };
   }, [refresh]);
 

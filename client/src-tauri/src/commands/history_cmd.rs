@@ -6,10 +6,18 @@ use tauri_plugin_dialog::DialogExt;
 use crate::app_state::AppState;
 use crate::storage::{HistoryRepo, TransferHistoryEntry};
 
+/// 列表**显示**上限，与 `AppSettings::history_max_entries` 的**淘汰**上限是两回事。
+///
+/// 不做成设置项：它是防御性兜底，不是用户偏好。历史面板没有虚拟滚动，
+/// 全量渲染 DOM；用户把保留条数设成 `0`（不限制）后若让查询也跟着不限制，
+/// 列表迟早会把界面拖死。另外免疫锁会让库内条数短暂超过保留上限，
+/// 显示上限留出余量才不会把用户刚装载过的那条挡在外面。
+const HISTORY_DISPLAY_CAP: u32 = 200;
+
 #[tauri::command]
 pub async fn cmd_list_history(state: State<'_, AppState>) -> Result<Vec<TransferHistoryEntry>, String> {
     let conn = state.db_conn.lock().await;
-    HistoryRepo::list_history(&conn, 100).map_err(|e| e.to_string())
+    HistoryRepo::list_history(&conn, HISTORY_DISPLAY_CAP).map_err(|e| e.to_string())
 }
 
 /// Opens a native folder picker and copies all cached files of a session into it.

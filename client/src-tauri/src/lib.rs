@@ -293,6 +293,11 @@ pub fn run() {
                                     status: "FAILED".to_string(),
                                     data_type,
                                 });
+
+                                // 对端报告失败同样是终态写入点，也要修剪历史。
+                                // 这里已经在上面取 conn 的 { } 块之外——那个 guard
+                                // 随块结束释放，此处再取锁才不会死锁。
+                                crate::core::history_pruner::prune_and_notify(&app_handle).await;
                             }
                         }
                         ActionType::TRANSFER_COMPLETE => {
@@ -315,6 +320,24 @@ pub fn run() {
                         _ => {}
                     }
                 }
+            });
+
+            // 3.5 启动收敛：先把崩溃残留的非终态行复位，再修剪一次历史（需求 4）
+            //
+            // 顺序不能反：修剪按约束 A 跳过非终态行，不先复位的话，上次被杀掉的
+            // 进程留下的 TRANSFERRING 死行会永久占住保留额度，谁也清不掉。
+            let app_handle_for_prune = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                {
+                    let state = app_handle_for_prune.state::<AppState>();
+                    let conn = state.db_conn.lock().await;
+                    match HistoryRepo::reset_stale_in_flight(&conn) {
+                        Ok(0) => {}
+                        Ok(n) => log::info!("Reset {} stale in-flight transfer(s) to FAILED on startup", n),
+                        Err(e) => log::warn!("Failed to reset stale in-flight transfers: {}", e),
+                    }
+                } // conn guard 必须在此释放，下一行会重新取同一把锁
+                crate::core::history_pruner::prune_and_notify(&app_handle_for_prune).await;
             });
 
             // 4. Background periodic cache sweep worker (P1-9)

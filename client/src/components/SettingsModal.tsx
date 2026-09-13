@@ -3,6 +3,37 @@ import { invoke } from "@tauri-apps/api/core";
 import { X, Save, Shield, AlertCircle } from "lucide-react";
 import { AppSettings } from "../types";
 
+/** Rust 侧两个字段都是 u32，超出这个范围反序列化会整单失败 */
+const U32_MAX = 4294967295;
+
+/**
+ * 保持秒数的业务上限：24 小时。
+ *
+ * 不只是「合理范围」的问题——setTimeout 的延迟以 32 位有符号整数存储，上限
+ * 2147483647 ms（约 24.86 天）。秒数再大，secs * 1000 就会溢出并被降级成 1ms，
+ * 卡片在出现的瞬间消失：用户想要「留久一点」，得到的却是「立刻消失」，
+ * 语义完全反转且没有任何报错。
+ */
+const MAX_RETAIN_SECS = 86400;
+
+// 注意：上限只由下面的 parseU32 把关，**不**写成 input 的 max 属性。
+// 带 max 的 number input 会触发浏览器原生表单校验，在 submit 事件之前就拦下提交，
+// 于是 handleSubmit 根本不跑，用户看到的是原生气泡（样式不可控、文案非中文），
+// 而填字母时看到的却是我们的红字提示——同一个输入框两套错误呈现。
+
+/// 把输入框里的字符串解析成 u32。空串、负数、小数、超上限一律判错。
+const parseU32 = (raw: string, max: number = U32_MAX): { value: number } | { error: string } => {
+  const trimmed = raw.trim();
+  if (trimmed === "") return { error: "不能为空（不限制请填 0）" };
+  // 只认纯数字，顺带排除了 "-1"、"2.5"、"1e3" 与 Number("") === 0 这个坑
+  if (!/^\d+$/.test(trimmed)) return { error: `只能填 0 到 ${max} 的整数` };
+  const value = Number(trimmed);
+  if (!Number.isSafeInteger(value) || value > max) {
+    return { error: `数值超出上限 ${max}` };
+  }
+  return { value };
+};
+
 interface SettingsModalProps {
   settings: AppSettings;
   isOpen: boolean;
@@ -15,6 +46,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // 两个数字字段用字符串暂存输入：直接绑 number 的话，用户清空重填的中间态会
+  // 变成 0，而 0 在这里是**有意义的取值**（不限制 / 不自动消失），不能与空输入混淆。
+  const [historyLimitInput, setHistoryLimitInput] = useState(String(settings.history_max_entries));
+  const [retainSecsInput, setRetainSecsInput] = useState(String(settings.transfer_card_retain_secs));
+  const [fieldErrors, setFieldErrors] = useState<{ history?: string; retain?: string }>({});
+
   // 开机自启不属于 AppSettings：它的事实源是操作系统，本地不留副本，
   // 因此独立拉取、独立写入，与表单保存的失败域互不污染。
   const [autostart, setAutostart] = useState(false);
@@ -24,6 +61,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
   useEffect(() => {
     setForm(settings);
     setError(null);
+    setHistoryLimitInput(String(settings.history_max_entries));
+    setRetainSecsInput(String(settings.transfer_card_retain_secs));
+    setFieldErrors({});
   }, [settings, isOpen]);
 
   useEffect(() => {
@@ -80,6 +120,21 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
     e.preventDefault();
     if (saving) return;
 
+    // 先做字段级校验再提交。后端 u32 反序列化失败只会返回笼统的「保存设置失败」，
+    // 用户看不出是哪个字段的问题，所以小数、负数、超上限都必须在这里拦住。
+    const history = parseU32(historyLimitInput);
+    // 保持秒数额外受 setTimeout 的 32 位上限约束，不能放行到 u32::MAX
+    const retain = parseU32(retainSecsInput, MAX_RETAIN_SECS);
+    const nextFieldErrors = {
+      history: "error" in history ? history.error : undefined,
+      retain: "error" in retain ? retain.error : undefined,
+    };
+    if (nextFieldErrors.history || nextFieldErrors.retain) {
+      setFieldErrors(nextFieldErrors);
+      return;
+    }
+    setFieldErrors({});
+
     let cleanUrl = form.server_url.replace(/\s+/g, "");
     if (cleanUrl && !cleanUrl.startsWith("ws://") && !cleanUrl.startsWith("wss://")) {
       cleanUrl = `wss://${cleanUrl}`;
@@ -93,6 +148,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
         server_url: cleanUrl,
         account_id: form.account_id.trim(),
         psk_secret: form.psk_secret.trim(),
+        history_max_entries: (history as { value: number }).value,
+        transfer_card_retain_secs: (retain as { value: number }).value,
       });
       onClose(); // 只有保存成功才关窗，失败时保留用户已填内容
     } catch (err: any) {
@@ -195,6 +252,55 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({ settings, isOpen, 
               onChange={(e) => setForm({ ...form, start_minimized: e.target.checked })}
               className="w-4 h-4 rounded text-teal-500 focus:ring-teal-400 bg-slate-800 border-slate-700"
             />
+          </div>
+
+          <div className="pt-2">
+            <label htmlFor="history-max-entries" className="block text-slate-400 mb-1">
+              传输历史保留条数
+            </label>
+            <input
+              id="history-max-entries"
+              type="number"
+              min={0}
+              step={1}
+              value={historyLimitInput}
+              onChange={(e) => setHistoryLimitInput(e.target.value)}
+              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-teal-500"
+            />
+            <p className="text-[11px] text-slate-500 mt-1">
+              超出的最旧记录连同缓存文件一起删除；填 0 表示不限制
+            </p>
+            {fieldErrors.history && (
+              <div className="flex items-start space-x-1.5 text-[11px] text-rose-400 mt-1">
+                <AlertCircle className="w-3.5 h-3.5 mt-px shrink-0" />
+                <span>{fieldErrors.history}</span>
+              </div>
+            )}
+          </div>
+
+          <div>
+            <label htmlFor="transfer-card-retain-secs" className="block text-slate-400 mb-1">
+              完成任务在界面保持秒数
+            </label>
+            <input
+              id="transfer-card-retain-secs"
+              type="number"
+              min={0}
+              step={1}
+              value={retainSecsInput}
+              onChange={(e) => setRetainSecsInput(e.target.value)}
+              className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-teal-500"
+            />
+            <p className="text-[11px] text-slate-500 mt-1">
+              传输完成的卡片到点自动消失；填 0 表示不自动消失，最大 {MAX_RETAIN_SECS} 秒（24 小时）。
+              失败的卡片不受影响，始终保留到手动关闭
+            </p>
+            {fieldErrors.retain && (
+              <div className="flex items-start space-x-1.5 text-[11px] text-rose-400 mt-1">
+                <AlertCircle className="w-3.5 h-3.5 mt-px shrink-0" />
+                <span>{fieldErrors.retain}</span>
+              </div>
+            )}
           </div>
 
           {error && (

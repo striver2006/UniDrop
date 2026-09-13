@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -26,6 +26,9 @@ const defaultSettings: AppSettings = {
   auto_inject: false,
   rate_limit_mb: 10,
   start_minimized: false,
+  // 与 Rust 侧 AppSettings::default_config() 必须保持一致（两份独立字面量）
+  history_max_entries: 100,
+  transfer_card_retain_secs: 30,
 };
 
 export const App: React.FC = () => {
@@ -47,6 +50,42 @@ export const App: React.FC = () => {
     setTimeout(() => {
       setNotification((curr) => (curr?.text === text ? null : curr));
     }, 4000);
+  };
+
+  // 下面那个监听用的 useEffect 依赖数组是 []，它的闭包永远看到**首次渲染**的
+  // settings，也就是 defaultSettings——真实配置要等 fetchInitialData 拉回来才有。
+  // 所以定时器秒数必须经 ref 读取，直接读 settings 会永远拿到默认值。
+  const settingsRef = useRef<AppSettings>(defaultSettings);
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+
+  // 按 session_id 记账：transfer-progress 对同一会话会反复到达，终态事件也可能
+  // 重复送达，不记账就会给同一张卡片堆积多个定时器。
+  const dismissTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  const clearDismissTimer = (sessionId: string) => {
+    const timer = dismissTimersRef.current.get(sessionId);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      dismissTimersRef.current.delete(sessionId);
+    }
+  };
+
+  /// 只给**完成**的卡片排自动消失。秒数取事件到达时的配置，不追溯已在计时的卡片。
+  const scheduleAutoDismiss = (sessionId: string) => {
+    clearDismissTimer(sessionId);
+    const secs = settingsRef.current.transfer_card_retain_secs;
+    if (!secs || secs <= 0) return; // 0 = 不自动消失
+    // setTimeout 的延迟以 32 位有符号整数存储，超过 2147483647ms 会溢出并被降级
+    // 成 1ms——卡片当场闪退，恰好是这个设置项语义的反面。SettingsModal 已把上限
+    // 卡在 86400 秒，这里再截断一次作兜底，防止日后有人绕开表单写入更大的值。
+    const delayMs = Math.min(secs * 1000, 2147483647);
+    const timer = setTimeout(() => {
+      dismissTimersRef.current.delete(sessionId);
+      setTransfers((prev) => prev.filter((t) => t.session_id !== sessionId));
+    }, delayMs);
+    dismissTimersRef.current.set(sessionId, timer);
   };
 
   const fetchInitialData = async () => {
@@ -116,8 +155,11 @@ export const App: React.FC = () => {
 
       if (update.status === "COMPLETED") {
         showNotification(`传输完成: ${update.preview_summary}`, "success");
+        scheduleAutoDismiss(update.session_id);
       } else if (update.status === "FAILED") {
         showNotification(`传输失败: ${update.preview_summary}`, "error");
+        // 失败卡片**不**自动消失：错误 toast 只显示 4 秒，卡片再自动消失之后
+        // 就没有任何醒目入口能看到这次为什么失败了。只能由用户手动点 X 移除。
       }
     });
 
@@ -145,6 +187,10 @@ export const App: React.FC = () => {
       unlistenProgressPromise.then((unlisten) => unlisten());
       unlistenOfferPromise.then((unlisten) => unlisten());
       unlistenSettingsPromise.then((unlisten) => unlisten());
+      // 卸载后定时器若仍触发就会对已卸载的组件 setState。StrictMode 下开发期
+      // 会 mount→unmount→mount，不清会稳定复现重复定时器。
+      dismissTimersRef.current.forEach((timer) => clearTimeout(timer));
+      dismissTimersRef.current.clear();
     };
   }, []);
 
@@ -174,6 +220,8 @@ export const App: React.FC = () => {
   };
 
   const handleDismissTransfer = (sessionId: string) => {
+    // 同时清掉定时器，否则它会留到超时才空转一次，期间还持有已移除会话的闭包
+    clearDismissTimer(sessionId);
     setTransfers((prev) => prev.filter((t) => t.session_id !== sessionId));
   };
 
