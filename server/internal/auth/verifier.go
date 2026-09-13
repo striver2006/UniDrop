@@ -45,6 +45,11 @@ func BuildCanonicalString(accountID, deviceID, nonce string, timestampMs int64) 
 }
 
 // BuildCanonicalStringWithSalt generates canonical string incorporating challenge NonceSalt.
+//
+// The fields are joined with "\n", which is why identity.go forbids newlines in
+// account_id and device_id: without that rule a client could redraw the field
+// boundaries of the string it is about to sign. Relaxing the grammar there
+// reopens separator injection here.
 func BuildCanonicalStringWithSalt(accountID, deviceID, nonce string, timestampMs int64, nonceSalt string) string {
 	if nonceSalt == "" {
 		return BuildCanonicalString(accountID, deviceID, nonce, timestampMs)

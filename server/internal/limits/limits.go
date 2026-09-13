@@ -49,6 +49,15 @@ const (
 	CodeTooManyItems      = "LIMIT_TOO_MANY_ITEMS"
 	CodeTooManyConcurrent = "LIMIT_TOO_MANY_CONCURRENT"
 	CodeMalformedOffer    = "LIMIT_MALFORMED_OFFER"
+
+	// The next two are not limits in the sense the rest of this file uses the
+	// word — they report that authorizing a transfer failed. They live here
+	// because Violation is the only channel that can tell both peers at once and
+	// still have the failure land on the right transfer card: buildFailure keys
+	// off session_id, and a failure without one is a failure the user never
+	// sees.
+	CodeSessionConflict = "SESSION_ID_CONFLICT"
+	CodeAuthorizeFailed = "AUTHORIZE_FAILED"
 )
 
 // Violation describes a rejected offer. Message is user-facing Chinese text
@@ -282,6 +291,27 @@ func ConcurrencyViolation(l Limits, inFlight int) *Violation {
 		Code: CodeTooManyConcurrent,
 		Message: fmt.Sprintf("最多同时进行 %d 个传输，当前已有 %d 个，请稍后重试",
 			l.MaxConcurrentTransfers, inFlight),
+	}
+}
+
+// SessionConflictViolation reports that the session ID on an answer is already
+// held by a different authorization. The user-facing advice is simply to retry,
+// because a fresh transfer mints a fresh UUID and the collision will not repeat.
+func SessionConflictViolation() *Violation {
+	return &Violation{
+		Code:    CodeSessionConflict,
+		Message: "传输会话标识冲突，请重试",
+	}
+}
+
+// AuthorizeFailedViolation is the catch-all for an authorization failure with no
+// more specific cause — today only a failure of the system RNG while minting a
+// token. It exists so that the ANSWER path has a Violation for *every* error
+// branch and can never fall through to forwarding a token-less answer.
+func AuthorizeFailedViolation() *Violation {
+	return &Violation{
+		Code:    CodeAuthorizeFailed,
+		Message: "服务端无法授权本次传输，请重试",
 	}
 }
 

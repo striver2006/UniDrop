@@ -4,7 +4,6 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
-	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -153,7 +152,7 @@ func (h *DataWSHandler) handleSender(ctx context.Context, ws *websocket.Conn, pi
 		*buf = (*buf)[:len(data)]
 		copy(*buf, data)
 
-		atomic.AddUint64(&Metrics.TotalRelayedBytes, uint64(len(data)))
+		Metrics.TotalRelayedBytes.Add(uint64(len(data)))
 
 		if err := pipe.PushForward(buf, 5*time.Second); err != nil {
 			pool.Put(buf)

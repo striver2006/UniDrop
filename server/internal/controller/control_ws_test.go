@@ -23,7 +23,7 @@ func TestDataWSUnauthorizedAccessRejected(t *testing.T) {
 	psk := "test-secret"
 	verifier, _ := auth.NewVerifier(psk)
 	reg := registry.NewDeviceRegistry()
-	relayMgr := relay.NewRelayManager()
+	relayMgr := relay.NewRelayManager(0)
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, reg, relayMgr, limits.FromEnv()))
@@ -56,7 +56,7 @@ func TestDataWSInvalidMagicFrameDisconnected(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	relayMgr := relay.NewRelayManager()
+	relayMgr := relay.NewRelayManager(0)
 
 	// Pre-authorize a session
 	token, _ := relayMgr.AuthorizeSession("valid-session", "devA", "devB", "user1", 1*time.Minute)

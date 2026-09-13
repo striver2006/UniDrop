@@ -43,7 +43,12 @@ func main() {
 	limits.LogSummary(transferLimits)
 
 	devRegistry := registry.NewDeviceRegistry()
-	relayManager := relay.NewRelayManager()
+	// The per-account pipe cap reuses MaxConcurrentTransfers rather than having
+	// an environment variable of its own: one authorized session corresponds to
+	// exactly one pipe, so both numbers bound the same resource and a second
+	// knob would only raise the question of what a disagreement between them
+	// means. See relay.ValidateAndGetOrCreatePipe.
+	relayManager := relay.NewRelayManager(transferLimits.MaxConcurrentTransfers)
 
 	// Optional STUN service with graceful shutdown support (P2-9)
 	var stunCloser io.Closer

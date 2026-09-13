@@ -46,6 +46,15 @@ type AuthChallengePayload struct {
 	ServerTime int64  `json:"server_time"`
 }
 
+// Error codes carried by AuthResponsePayload.ErrorCode when a handshake is
+// refused. They are a closed set defined here rather than written inline at the
+// rejection sites, so that the wire contract stays greppable from one place.
+const (
+	AuthErrUnauthorized     = "UNAUTHORIZED"
+	AuthErrInvalidAccountID = "INVALID_ACCOUNT_ID"
+	AuthErrInvalidDeviceID  = "INVALID_DEVICE_ID"
+)
+
 // AuthRequestPayload is sent by client to authenticate.
 type AuthRequestPayload struct {
 	AccountID  string `json:"account_id"`

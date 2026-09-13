@@ -30,6 +30,8 @@ const testPSK = "test-psk-for-limits"
 type limitsHarness struct {
 	server   *httptest.Server
 	verifier *auth.Verifier
+	registry *registry.DeviceRegistry
+	relay    *relay.RelayManager
 }
 
 func newLimitsHarness(t *testing.T, lim limits.Limits) *limitsHarness {
@@ -40,7 +42,7 @@ func newLimitsHarness(t *testing.T, lim limits.Limits) *limitsHarness {
 		t.Fatalf("初始化校验器失败: %v", err)
 	}
 	reg := registry.NewDeviceRegistry()
-	relayMgr := relay.NewRelayManager()
+	relayMgr := relay.NewRelayManager(0)
 
 	mux := http.NewServeMux()
 	mux.Handle("GET /ws/control", controller.NewControlWSHandler(verifier, reg, relayMgr, lim))
@@ -48,12 +50,30 @@ func newLimitsHarness(t *testing.T, lim limits.Limits) *limitsHarness {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	return &limitsHarness{server: srv, verifier: verifier}
+	return &limitsHarness{server: srv, verifier: verifier, registry: reg, relay: relayMgr}
 }
 
-// connect 完成 AUTH_CHALLENGE → AUTH_REQUEST → AUTH_RESPONSE，返回已鉴权的连接
-// 与服务端下发的 AUTH_RESPONSE。
+// connect 完成握手并**断言鉴权成功**，返回已鉴权的连接与 AUTH_RESPONSE。
+// 需要检验拒绝路径的用例请用 connectRaw。
 func (h *limitsHarness) connect(t *testing.T, ctx context.Context, accountID, deviceID string) (*websocket.Conn, protocol.AuthResponsePayload) {
+	t.Helper()
+
+	ws, resp := h.connectRaw(t, ctx, accountID, deviceID)
+	if !resp.Success {
+		t.Fatalf("鉴权失败: %s", resp.ErrorMessage)
+	}
+
+	// 紧随其后的 DEVICE_LIST_SYNC 先读掉，免得污染后续断言
+	_, _, _ = ws.Read(ctx)
+
+	return ws, resp
+}
+
+// connectRaw 跑完握手就返回，**不判断 Success、也不消费后续报文**。
+//
+// 从 connect 里拆出来是因为原来那一份在鉴权失败时直接 t.Fatalf，
+// 于是拒绝路径根本无从断言 —— 而本轮新增的两类身份拒绝正需要它。
+func (h *limitsHarness) connectRaw(t *testing.T, ctx context.Context, accountID, deviceID string) (*websocket.Conn, protocol.AuthResponsePayload) {
 	t.Helper()
 
 	wsURL := "ws" + strings.TrimPrefix(h.server.URL, "http")
@@ -108,14 +128,64 @@ func (h *limitsHarness) connect(t *testing.T, ctx context.Context, accountID, de
 	_ = json.Unmarshal(respBytes, &respEnv)
 	var resp protocol.AuthResponsePayload
 	_ = json.Unmarshal(respEnv.Payload, &resp)
-	if !resp.Success {
-		t.Fatalf("鉴权失败: %s", resp.ErrorMessage)
-	}
-
-	// 紧随其后的 DEVICE_LIST_SYNC 先读掉，免得污染后续断言
-	_, _, _ = ws.Read(ctx)
 
 	return ws, resp
+}
+
+// connectRawWithNonce 与 connectRaw 相同，但由调用方指定 nonce，
+// 用于验证「身份格式被拒时不烧 nonce」。
+func (h *limitsHarness) connectRawWithNonce(t *testing.T, ctx context.Context, accountID, deviceID, nonce string) protocol.AuthResponsePayload {
+	t.Helper()
+
+	wsURL := "ws" + strings.TrimPrefix(h.server.URL, "http")
+	ws, _, err := websocket.Dial(ctx, wsURL+"/ws/control", nil)
+	if err != nil {
+		t.Fatalf("连接控制面失败: %v", err)
+	}
+	t.Cleanup(func() { _ = ws.CloseNow() })
+
+	_, challengeBytes, err := ws.Read(ctx)
+	if err != nil {
+		t.Fatalf("读取 challenge 失败: %v", err)
+	}
+	var challengeEnv protocol.ControlEnvelope
+	_ = json.Unmarshal(challengeBytes, &challengeEnv)
+	var challenge protocol.AuthChallengePayload
+	_ = json.Unmarshal(challengeEnv.Payload, &challenge)
+
+	now := time.Now().UnixMilli()
+	sig := h.verifier.GenerateSignatureWithSalt(accountID, deviceID, nonce, now, challenge.NonceSalt)
+
+	reqPayload, _ := json.Marshal(protocol.AuthRequestPayload{
+		AccountID:  accountID,
+		DeviceID:   deviceID,
+		Hostname:   deviceID,
+		OSType:     "macos",
+		AppVersion: "test",
+		Signature:  sig,
+		Nonce:      nonce,
+		Timestamp:  now,
+	})
+	reqEnv, _ := json.Marshal(protocol.ControlEnvelope{
+		Version:   1,
+		TraceID:   uuid.NewString(),
+		Action:    protocol.ActionAuthRequest,
+		Timestamp: now,
+		Payload:   reqPayload,
+	})
+	if err := ws.Write(ctx, websocket.MessageText, reqEnv); err != nil {
+		t.Fatalf("发送 AUTH_REQUEST 失败: %v", err)
+	}
+
+	_, respBytes, err := ws.Read(ctx)
+	if err != nil {
+		t.Fatalf("读取 AUTH_RESPONSE 失败: %v", err)
+	}
+	var respEnv2 protocol.ControlEnvelope
+	_ = json.Unmarshal(respBytes, &respEnv2)
+	var resp2 protocol.AuthResponsePayload
+	_ = json.Unmarshal(respEnv2.Payload, &resp2)
+	return resp2
 }
 
 func sendOffer(t *testing.T, ctx context.Context, ws *websocket.Conn, from, to string, offer protocol.TransferOfferPayload) {

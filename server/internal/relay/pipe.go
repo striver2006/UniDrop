@@ -15,9 +15,15 @@ var (
 
 // RelayPipe provides bidirectional streaming channels between sender and receiver.
 type RelayPipe struct {
-	SessionID    string
-	FromDevice   string
-	ToDevice     string
+	SessionID string
+
+	// AccountID of the authorization this pipe was created from. It is carried
+	// here so that ownership can still be established when the auth entry is
+	// gone, and so that per-account pipe accounting does not need a second
+	// lookup.
+	AccountID  string
+	FromDevice string
+	ToDevice   string
 	ForwardChan  chan *[]byte // Sender -> Receiver (data frames)
 	BackwardChan chan *[]byte // Receiver -> Sender (ACK/NACK frames)
 	DoneChan     chan struct{}
@@ -27,10 +33,11 @@ type RelayPipe struct {
 }
 
 // NewRelayPipe creates a new streaming relay pipe.
-func NewRelayPipe(sessionID, fromDevice, toDevice string) *RelayPipe {
+func NewRelayPipe(sessionID, accountID, fromDevice, toDevice string) *RelayPipe {
 	now := time.Now()
 	return &RelayPipe{
 		SessionID:    sessionID,
+		AccountID:    accountID,
 		FromDevice:   fromDevice,
 		ToDevice:     toDevice,
 		ForwardChan:  make(chan *[]byte, 4),  // Buffered so a sender that dials before the receiver is not immediately congested

@@ -91,24 +91,42 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Step 3: Verify HMAC Signature with challenge NonceSalt (P2-1)
+	// Step 3a: Validate identifier shape BEFORE verifying the signature.
+	//
+	// The order matters and is not interchangeable. VerifyWithSalt burns the
+	// nonce once the signature checks out (see auth.VerifyWithSalt), so a
+	// request whose signature is valid but whose account_id is malformed would,
+	// if validated afterwards, come back on retry as "replay detected" instead
+	// of "your account id is malformed". A client implemented straight from the
+	// canonical-string contract in DESIGN.md may reuse a nonce within the 60s
+	// window, and for those the diagnosis would be permanently wrong. (The
+	// shipped Tauri client mints a fresh nonce per handshake, so it is the
+	// third-party contract — not our own client — that this ordering protects.)
+	//
+	// The second reason is cheapness: this rejects malformed input without
+	// paying for an HMAC, and auth.validIdentifier is allocation-free and
+	// length-bounded precisely because it runs here, on unauthenticated input.
+	if err := auth.ValidateAccountID(authReq.AccountID); err != nil {
+		slog.Warn("auth rejected: malformed account id", "device", authReq.DeviceID)
+		Metrics.AuthRejectedInvalidAccount.Add(1)
+		writeAuthFailure(ctx, ws, authEnv.TraceID, protocol.AuthErrInvalidAccountID,
+			"账号标识不能为空，只能包含字母、数字与 . _ @ -，长度 1-64")
+		return
+	}
+	if err := auth.ValidateDeviceID(authReq.DeviceID); err != nil {
+		slog.Warn("auth rejected: malformed device id", "account", authReq.AccountID)
+		Metrics.AuthRejectedInvalidDevice.Add(1)
+		writeAuthFailure(ctx, ws, authEnv.TraceID, protocol.AuthErrInvalidDeviceID,
+			"设备标识不能为空，只能包含字母、数字与 _ -，长度 1-64")
+		return
+	}
+
+	// Step 3b: Verify HMAC Signature with challenge NonceSalt (P2-1)
 	now := time.Now()
 	if err := h.verifier.VerifyWithSalt(&authReq, now, challengePayloadObj.NonceSalt); err != nil {
 		slog.Warn("auth verification failed", "device", authReq.DeviceID, "error", err)
-		respPayload, _ := json.Marshal(protocol.AuthResponsePayload{
-			Success:      false,
-			ErrorCode:    "UNAUTHORIZED",
-			ErrorMessage: err.Error(),
-		})
-		respEnv, _ := json.Marshal(protocol.ControlEnvelope{
-			Version:   1,
-			TraceID:   authEnv.TraceID,
-			Action:    protocol.ActionAuthResponse,
-			Timestamp: time.Now().UnixMilli(),
-			Payload:   respPayload,
-		})
-		_ = ws.Write(ctx, websocket.MessageText, respEnv)
-		_ = ws.Close(websocket.StatusPolicyViolation, "authentication failed")
+		Metrics.AuthRejectedUnauthorized.Add(1)
+		writeAuthFailure(ctx, ws, authEnv.TraceID, protocol.AuthErrUnauthorized, err.Error())
 		return
 	}
 
@@ -285,7 +303,23 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			// P0-1, P2-7: Authorize session in RelayManager when receiver accepts offer
 			var answer protocol.TransferAnswerPayload
-			if err := json.Unmarshal(env.Payload, &answer); err == nil && answer.Accepted && h.relayManager != nil {
+			answerOK := json.Unmarshal(env.Payload, &answer) == nil
+
+			// session_id 必须先过格式校验再进授权：它会成为 authSessions 与
+			// pipes 的 map 键，而这个字段只受控制面 512 KiB 读上限约束。
+			//
+			// 非法时**不转发、也无法回执**：buildFailure 依赖 session_id 匹配
+			// 客户端卡片，空或畸形的 id 本来就没有卡片可落——硬发一条只会
+			// 变成一次到不了任何地方的推送。这里只能记日志并丢弃。
+			if answerOK && h.relayManager != nil {
+				if err := auth.ValidateSessionID(answer.SessionID); err != nil {
+					slog.Warn("transfer answer dropped: malformed session id",
+						"account", session.AccountID, "device", session.DeviceID)
+					continue
+				}
+			}
+
+			if answerOK && answer.Accepted && h.relayManager != nil {
 				// Per-account concurrency is enforced while the token is minted,
 				// not before it: counting first and authorizing afterwards would
 				// let two connections of the same account both see a free slot
@@ -312,27 +346,51 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					5*time.Minute,
 					h.limits.MaxConcurrentTransfers,
 				)
-				if errors.Is(authErr, relay.ErrConcurrencyLimit) {
-					v := limits.ConcurrencyViolation(h.limits, inFlight)
-					slog.Info("transfer answer refused by concurrency limit",
-						"account", session.AccountID, "session", answer.SessionID,
-						"in_flight", inFlight, "code", v.Code)
+				// Every authorization failure — not just the concurrency one —
+				// refuses both peers and stops here. The previous code special
+				// cased ErrConcurrencyLimit and let everything else fall through
+				// to routeToPeer with a token-less answer, which is precisely
+				// the silent-hang shape described above; adding new error kinds
+				// without widening this branch would walk straight back into it.
+				if authErr != nil {
+					var v *limits.Violation
+					switch {
+					case errors.Is(authErr, relay.ErrConcurrencyLimit):
+						v = limits.ConcurrencyViolation(h.limits, inFlight)
+						slog.Info("transfer answer refused by concurrency limit",
+							"account", session.AccountID, "session", answer.SessionID,
+							"in_flight", inFlight, "code", v.Code)
+					case errors.Is(authErr, relay.ErrSessionIDConflict):
+						v = limits.SessionConflictViolation()
+						slog.Warn("transfer answer refused: session id conflict",
+							"account", session.AccountID, "session", answer.SessionID)
+					default:
+						v = limits.AuthorizeFailedViolation()
+						slog.Warn("failed to authorize transfer session",
+							"session", answer.SessionID, "error", authErr)
+					}
+					// ConcurrencyViolation returns nil when the limit is
+					// disabled or unreached. That should not be reachable from
+					// an ErrConcurrencyLimit, but buildFailure dereferences the
+					// violation, so a nil here would turn a refusal into a panic
+					// on the control connection. Fall back rather than trust the
+					// invariant.
+					if v == nil {
+						v = limits.AuthorizeFailedViolation()
+					}
 					h.rejectToSelf(session, answer.SessionID, v)               // 接收方 = 当前连接
 					h.rejectToPeer(session, env.ToDevice, answer.SessionID, v) // 发送方 = ToDevice
 					continue
 				}
-				if authErr == nil {
-					slog.Info("transfer session authorized", "session", answer.SessionID, "sender", env.ToDevice, "receiver", session.DeviceID)
-					answer.Token = token
-					env.Payload, _ = json.Marshal(answer)
-					// Echo authorized token back to the receiver as well
-					echoEnv := env
-					echoEnv.ToDevice = session.DeviceID
-					echoBytes, _ := json.Marshal(echoEnv)
-					session.Send(echoBytes)
-				} else {
-					slog.Warn("failed to authorize transfer session", "session", answer.SessionID, "error", authErr)
-				}
+
+				slog.Info("transfer session authorized", "session", answer.SessionID, "sender", env.ToDevice, "receiver", session.DeviceID)
+				answer.Token = token
+				env.Payload, _ = json.Marshal(answer)
+				// Echo authorized token back to the receiver as well
+				echoEnv := env
+				echoEnv.ToDevice = session.DeviceID
+				echoBytes, _ := json.Marshal(echoEnv)
+				session.Send(echoBytes)
 			}
 			h.routeToPeer(session, env)
 
@@ -345,8 +403,25 @@ func (h *ControlWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					SessionID string `json:"session_id"`
 				}
 				if err := json.Unmarshal(env.Payload, &termPayload); err == nil && termPayload.SessionID != "" {
-					slog.Info("relay pipe removed", "action", string(env.Action), "session", termPayload.SessionID, "from", session.DeviceID)
-					h.relayManager.RemovePipe(termPayload.SessionID)
+					// 拒绝原因由 relay 在持锁期间一并定下，调用方不再二次查询：
+					// 两次独立加锁之间可以插入一次新授权，会把一条良性的迟到信令
+					// 误报成「跨账号拆除」告警。
+					switch result, owner := h.relayManager.RemovePipeForSession(
+						termPayload.SessionID, session.AccountID, session.DeviceID); result {
+					case relay.TeardownOK:
+						slog.Info("relay pipe removed", "action", string(env.Action),
+							"session", termPayload.SessionID, "from", session.DeviceID)
+					case relay.TeardownDenied:
+						// 会话存在但不归请求方所有 —— 归属校验正是为这一支而加。
+						slog.Warn("cross-account pipe teardown blocked",
+							"session", termPayload.SessionID, "from_account", session.AccountID,
+							"owner_account", owner, "from_device", session.DeviceID)
+					case relay.TeardownNotFound:
+						// 无可拆除：空闲回收之后迟到或重复的终结信令，属正常流量。
+						// 这里若打 warn，诚实的长传输会把上面那支真正的越权告警淹掉。
+						slog.Debug("terminal signal for unknown session",
+							"action", string(env.Action), "session", termPayload.SessionID)
+					}
 				}
 			}
 			h.routeToPeer(session, env)
@@ -432,13 +507,9 @@ func (h *ControlWSHandler) rejectToPeer(session *registry.DeviceSession, peerDev
 	if peerDevice == "" {
 		return
 	}
-	target, ok := h.registry.Get(peerDevice)
+	target, ok := h.registry.Get(session.AccountID, peerDevice)
 	if !ok {
-		slog.Debug("peer offline for limit rejection", "to_device", peerDevice)
-		return
-	}
-	if target.AccountID != session.AccountID {
-		slog.Warn("cross-account limit rejection blocked", "from", session.AccountID, "to_device", peerDevice)
+		slog.Debug("peer not found in account for limit rejection", "to_device", peerDevice)
 		return
 	}
 	envBytes, ok := buildFailure("server", peerDevice, sessionID, v)
@@ -468,21 +539,53 @@ func salvageSessionID(payload []byte) string {
 	return minimal.SessionID
 }
 
+// writeAuthFailure sends a failed AUTH_RESPONSE and closes the connection.
+//
+// Note that the two kinds of message flowing through here have different
+// audiences, and that is deliberate rather than an inconsistency waiting to be
+// tidied up. The identifier rejections carry Chinese text that states the rule
+// itself, because the user is the only one who can fix it and "invalid account
+// id" alone is not actionable. The UNAUTHORIZED path forwards err.Error() —
+// English, internal, occasionally carrying things like diff=1.2s — because it
+// is a diagnostic for whoever is debugging a signature or clock problem, and
+// the user-facing wording for it already lives in USER_GUIDE.md.
+func writeAuthFailure(ctx context.Context, ws *websocket.Conn, traceID, code, message string) {
+	respPayload, _ := json.Marshal(protocol.AuthResponsePayload{
+		Success:      false,
+		ErrorCode:    code,
+		ErrorMessage: message,
+	})
+	respEnv, _ := json.Marshal(protocol.ControlEnvelope{
+		Version:   1,
+		TraceID:   traceID,
+		Action:    protocol.ActionAuthResponse,
+		Timestamp: time.Now().UnixMilli(),
+		Payload:   respPayload,
+	})
+	_ = ws.Write(ctx, websocket.MessageText, respEnv)
+	_ = ws.Close(websocket.StatusPolicyViolation, "authentication failed")
+}
+
 // routeToPeer routes a control message to target peer and logs drops (P1-1).
+//
+// The lookup is scoped to the sender's account, so cross-account delivery is
+// structurally impossible rather than prevented by a comparison that a later
+// edit could forget. One thing was given up in exchange, on purpose: this used
+// to log "cross-account transfer attempt blocked" separately from "target
+// device offline", and now both are one miss. Distinguishing them would mean
+// confirming to the caller that another account owns a device by that name —
+// and writing that into the log leaks it to operations as well.
 func (h *ControlWSHandler) routeToPeer(session *registry.DeviceSession, env protocol.ControlEnvelope) {
 	if env.ToDevice == "" {
 		return
 	}
-	if targetSession, ok := h.registry.Get(env.ToDevice); ok {
-		if targetSession.AccountID == session.AccountID {
-			repacked, _ := json.Marshal(env)
-			if !targetSession.Send(repacked) {
-				slog.Warn("failed to deliver control message to target peer (queue full)", "action", env.Action, "to_device", env.ToDevice)
-			}
-		} else {
-			slog.Warn("cross-account transfer attempt blocked", "from", session.AccountID, "to_device", env.ToDevice)
-		}
-	} else {
-		slog.Debug("target device offline for transfer message", "action", env.Action, "to_device", env.ToDevice)
+	targetSession, ok := h.registry.Get(session.AccountID, env.ToDevice)
+	if !ok {
+		slog.Debug("peer not found in account for transfer message", "action", env.Action, "to_device", env.ToDevice)
+		return
+	}
+	repacked, _ := json.Marshal(env)
+	if !targetSession.Send(repacked) {
+		slog.Warn("failed to deliver control message to target peer (queue full)", "action", env.Action, "to_device", env.ToDevice)
 	}
 }
