@@ -252,9 +252,13 @@ export const App: React.FC = () => {
             <h1 className="text-sm font-semibold text-slate-100 flex items-center space-x-1.5 pointer-events-none">
               <span>瞬贴</span>
               <span className="text-[11px] text-slate-400 font-normal">UniDrop</span>
-              <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-teal-500/20 text-teal-300 font-normal">
-                v0.1.1
-              </span>
+              {/* 版本取后端上报值（编译期来自 Cargo.toml），不要写死：
+                  写死的那份不会随发版更新，迟早和设备列表里显示的对不上 */}
+              {selfDevice && (
+                <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-teal-500/20 text-teal-300 font-normal">
+                  v{selfDevice.app_version}
+                </span>
+              )}
             </h1>
             <p className="text-[11px] text-slate-400 pointer-events-none">
               本机: {selfDevice ? `${selfDevice.hostname} (${selfDevice.os_type.toUpperCase()})` : "载入中..."}

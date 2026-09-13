@@ -72,7 +72,7 @@ pub fn run() {
         psk_secret: initial_settings.psk_secret.clone(),
         hostname: app_state::whoami_hostname(),
         os_type: std::env::consts::OS.to_string(),
-        app_version: "0.1.0".to_string(),
+        app_version: app_state::APP_VERSION.to_string(),
     };
 
     let config_actor = Arc::new(tokio::sync::RwLock::new(config));

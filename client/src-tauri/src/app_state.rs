@@ -9,6 +9,13 @@ use crate::core::connection_actor::ConnectionConfig;
 use crate::core::transfer_engine::{TransferEngine, TransferSource};
 use crate::protocol::{ControlEnvelope, OnlineDevice, TransferOfferPayload};
 
+/// 应用版本的唯一事实源，编译期取自 Cargo.toml 的 `version`。
+///
+/// 此前这里和 `lib.rs` 各写了一份 "0.1.0" 字面量，而 Cargo.toml、
+/// tauri.conf.json、package.json 都已是 0.1.1——对端设备列表里显示的版本号
+/// 因此始终停在 0.1.0。字面量不会随发版更新，用 env! 从根上断掉这种漂移。
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub struct AppState {
     pub device_id: String,
     pub hostname: String,
@@ -39,7 +46,7 @@ impl AppState {
 
         let hostname = whoami_hostname();
         let os_type = std::env::consts::OS.to_string();
-        let app_version = "0.1.0".to_string();
+        let app_version = APP_VERSION.to_string();
 
         Self {
             device_id,
@@ -72,4 +79,24 @@ pub fn whoami_hostname() -> String {
     std::env::var("HOSTNAME")
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "localhost".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 版本号必须与 Cargo.toml 同步。此前 lib.rs 与本文件各写死一份 "0.1.0"，
+    /// 而 Cargo.toml 早已是 0.1.1，对端设备列表因此一直显示旧版本。
+    #[test]
+    fn app_version_tracks_cargo_manifest() {
+        assert_eq!(APP_VERSION, env!("CARGO_PKG_VERSION"));
+        assert!(!APP_VERSION.is_empty());
+        // 形如 x.y.z，防止有人改成别的字面量
+        assert_eq!(APP_VERSION.split('.').count(), 3, "版本号应为三段式");
+    }
+
+    #[test]
+    fn app_version_is_not_a_stale_literal() {
+        assert_ne!(APP_VERSION, "0.1.0", "不得退回硬编码的旧版本号");
+    }
 }
