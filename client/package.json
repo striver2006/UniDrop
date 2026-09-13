@@ -10,7 +10,7 @@
     "tauri": "tauri",
     "test": "vitest run",
     "test:watch": "vitest",
-    "tauri:build": "if [ -f .env ]; then set -a; . ./.env; set +a; fi; tauri build"
+    "tauri:build": "if [ -f .env ]; then set -a; . ./.env; set +a; fi; tauri build && sh scripts/notarize-dmg.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
