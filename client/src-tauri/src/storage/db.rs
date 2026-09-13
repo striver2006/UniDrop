@@ -20,6 +20,21 @@ pub fn init_database(db_path: Option<PathBuf>) -> Result<Connection, rusqlite::E
     // Errors (duplicate column) are intentionally ignored.
     let _ = conn.execute_batch("ALTER TABLE transfer_tasks ADD COLUMN preview_summary TEXT;");
 
+    // 删除 paired_devices。
+    //
+    // 这张表自建库起就没有任何读写：全仓库对它的引用只有一条建表语句，
+    // 既没有 repo 模块也没有任何 SQL，配对与 E2EE 都还停在设计稿上。
+    // 它与 config.go 顶部注释里被删掉的那两个「定义了、赋值了、从来没人读」
+    // 的字段是同一类东西。
+    //
+    // 更糟的是它**主动制造了账号分区的假象**：一个 `account_id TEXT NOT NULL`
+    // 的列会让读 schema 的人以为配对表已经按账号分区了，本轮的需求正是被它
+    // 误导出来的（而这已经是它第二次造成误判，上一次见 2026-09-11 的审查留痕）。
+    //
+    // DROP 在这里可证明无损，因为从来不存在写入方。**不要**把这个模式抄到
+    // 任何有数据的表上——那需要真正的迁移，而不是一句 DROP。
+    let _ = conn.execute_batch("DROP TABLE IF EXISTS paired_devices;");
+
     Ok(conn)
 }
 
@@ -65,17 +80,7 @@ pub fn create_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             PRIMARY KEY (session_id, item_index, chunk_index)
         );
 
-        -- 4. Paired Trusted Devices
-        CREATE TABLE IF NOT EXISTS paired_devices (
-            device_id TEXT PRIMARY KEY,
-            account_id TEXT NOT NULL,
-            alias TEXT NOT NULL,
-            os_type TEXT NOT NULL,
-            ed25519_pubkey BLOB NOT NULL,
-            x25519_pubkey BLOB NOT NULL,
-            paired_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            is_trusted INTEGER DEFAULT 1
-        );
+        -- 4. （原 paired_devices 表已删除，见 init_database 的迁移说明）
 
         -- 5. Cache Lifecycle with 2h Clipboard Immunity Lock
         CREATE TABLE IF NOT EXISTS cache_entries (

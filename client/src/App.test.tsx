@@ -30,6 +30,7 @@ const baseSettings: AppSettings = {
   cache_ttl_hours: 24,
   cache_max_size_mb: 10240,
   cache_sweep_interval_minutes: 60,
+  allow_insecure_tls: false,
 };
 
 function transfer(overrides: Partial<ActiveTransfer> = {}): ActiveTransfer {
@@ -176,5 +177,57 @@ describe("完成卡片自动消失（需求 5）", () => {
     expect(errorSpy).not.toHaveBeenCalled();
     expect(listenerCount("transfer-progress")).toBe(0);
     errorSpy.mockRestore();
+  });
+});
+
+describe("TLS 证书失败提示", () => {
+  // 这条守的是「事件发了但没人接」这一整类缺陷。
+  // 后端 connection_actor 在证书校验失败时 emit tls-cert-failed，
+  // 若前端不监听，默认开启校验后自签/IP/内部 CA 三类部署升级即进入
+  // 无提示的静默重连——而 USER_GUIDE 已经向用户许诺了这个提示。
+  it("注册了 tls-cert-failed 监听", async () => {
+    await renderApp();
+    expect(listenerCount("tls-cert-failed")).toBe(1);
+  });
+
+  it("证书失败时显示常驻横幅，并引导去连接设置", async () => {
+    await renderApp();
+
+    await act(async () => {
+      emitEvent("tls-cert-failed", "无法验证服务器证书：UnknownIssuer。请在「设置」中勾选「允许不安全连接」。");
+    });
+
+    expect(screen.getByText(/无法验证服务器证书/)).toBeInTheDocument();
+    // 文案不得沿用鉴权失败那套：证书问题改密钥没有用
+    expect(screen.queryByText(/鉴权失败/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "检查连接设置" })).toBeInTheDocument();
+    expect(screen.getByText("证书不受信任")).toBeInTheDocument();
+  });
+
+  // 连接 actor 每次退避重试都会重发该事件，横幅必须幂等而不是越堆越多
+  it("重复收到同一事件不会堆叠横幅", async () => {
+    await renderApp();
+
+    for (let i = 0; i < 3; i++) {
+      await act(async () => {
+        emitEvent("tls-cert-failed", "无法验证服务器证书：UnknownIssuer");
+      });
+    }
+
+    expect(screen.getAllByText(/无法验证服务器证书/)).toHaveLength(1);
+  });
+
+  it("连接恢复后横幅消失", async () => {
+    await renderApp();
+
+    await act(async () => {
+      emitEvent("tls-cert-failed", "无法验证服务器证书：UnknownIssuer");
+    });
+    expect(screen.getByText(/无法验证服务器证书/)).toBeInTheDocument();
+
+    await act(async () => {
+      emitEvent("devices-updated", []);
+    });
+    expect(screen.queryByText(/无法验证服务器证书/)).not.toBeInTheDocument();
   });
 });

@@ -71,6 +71,21 @@ const parseU32 = (
   return { value };
 };
 
+/// 校验账号标识。规则必须与服务端 `auth/identity.go` 一致：
+/// 1..=64 字节的 `[A-Za-z0-9._@-]`。
+///
+/// 形态对齐 parseU32：返回 `{value}` 或 `{error}`，由 handleSubmit 汇总进
+/// fieldErrors，用同一套红字渲染。
+const parseAccountId = (raw: string): { value: string } | { error: string } => {
+  const trimmed = raw.trim();
+  if (trimmed === "") return { error: "不能为空" };
+  if (trimmed.length > 64) return { error: "长度不能超过 64" };
+  if (!/^[A-Za-z0-9._@-]+$/.test(trimmed)) {
+    return { error: "只能包含字母、数字与 . _ @ -" };
+  }
+  return { value: trimmed };
+};
+
 /** 缓存保留小时数上限：1 年 */
 const MAX_CACHE_TTL_HOURS = 8760;
 /** 缓存容量上限：1 TB（MB 计） */
@@ -115,6 +130,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     String(settings.cache_sweep_interval_minutes)
   );
   const [fieldErrors, setFieldErrors] = useState<{
+    account?: string;
     history?: string;
     retain?: string;
     ttl?: string;
@@ -195,6 +211,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
     // 先做字段级校验再提交。后端 u32 反序列化失败只会返回笼统的「保存设置失败」，
     // 用户看不出是哪个字段的问题，所以小数、负数、超上限都必须在这里拦住。
+    const account = parseAccountId(form.account_id);
     const history = parseU32(historyLimitInput);
     // 保持秒数额外受 setTimeout 的 32 位上限约束，不能放行到 u32::MAX
     const retain = parseU32(retainSecsInput, MAX_RETAIN_SECS);
@@ -207,6 +224,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       MIN_SWEEP_INTERVAL_MINUTES
     );
     const nextFieldErrors = {
+      account: "error" in account ? account.error : undefined,
       history: "error" in history ? history.error : undefined,
       retain: "error" in retain ? retain.error : undefined,
       ttl: "error" in ttl ? ttl.error : undefined,
@@ -230,7 +248,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       await onSave({
         ...form,
         server_url: cleanUrl,
-        account_id: form.account_id.trim(),
+        account_id: (account as { value: string }).value,
         psk_secret: form.psk_secret.trim(),
         history_max_entries: (history as { value: number }).value,
         transfer_card_retain_secs: (retain as { value: number }).value,
@@ -276,14 +294,28 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </div>
 
           <div>
-            <label className="block text-slate-400 mb-1">账号标识 (Account ID)</label>
+            <label htmlFor="account-id" className="block text-slate-400 mb-1">
+              账号标识 (Account ID)
+            </label>
+            {/* 这里刻意**不加** required，与上面的 server_url 不同。
+                理由同数字输入框那条注释：原生校验在 submit 之前拦下，handleSubmit
+                根本不跑，用户看到的是样式不可控的英文原生气泡，而填非法字符时
+                看到的却是我们的中文红字——同一个输入框两套错误呈现。
+                更要命的是 required 判定 "   " 为已填写，而提交前的 trim 会把它
+                变成空串，于是一个原生校验放行的值恰好是服务端必然拒绝的值。
+                server_url / psk_secret 的 required 本轮不动，这处不一致是有意的。 */}
             <input
+              id="account-id"
               type="text"
               value={form.account_id}
               onChange={(e) => setForm({ ...form, account_id: e.target.value })}
               className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-teal-500"
-              required
             />
+            {fieldErrors.account && (
+              <p className="mt-1 text-[11px] text-rose-400 flex items-start gap-1">
+                <span>{fieldErrors.account}</span>
+              </p>
+            )}
           </div>
 
           <div>
@@ -294,6 +326,30 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               onChange={(e) => setForm({ ...form, psk_secret: e.target.value })}
               className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-teal-500"
               required
+            />
+          </div>
+
+          {/* 文案要说清后果，而不是只说「允许自签证书」：用户据此做的是
+              一个安全取舍，不告诉他代价就等于替他做了决定。
+              三类场景都要列全——少写「非公共 CA」那一类，用内部 CA 的用户会
+              以为这个开关与自己无关，最后仍然被引导来勾选它。 */}
+          <div className="flex items-center justify-between pt-2">
+            <div className="pr-3">
+              <span className="font-medium text-slate-200">允许不安全连接</span>
+              <p className="text-[11px] text-slate-500">
+                跳过服务器证书校验，用于自签证书、IP 直连或非公共 CA 签发的部署
+              </p>
+              {form.allow_insecure_tls && (
+                <p className="mt-1 text-[11px] text-amber-400">
+                  已关闭证书校验：任何中间人都可冒充服务器读取你传输的内容
+                </p>
+              )}
+            </div>
+            <input
+              type="checkbox"
+              checked={form.allow_insecure_tls}
+              onChange={(e) => setForm({ ...form, allow_insecure_tls: e.target.checked })}
+              className="w-4 h-4 rounded text-teal-500 focus:ring-teal-400 bg-slate-800 border-slate-700"
             />
           </div>
 

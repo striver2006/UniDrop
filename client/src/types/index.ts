@@ -23,6 +23,8 @@ export interface AppSettings {
   cache_max_size_mb: number;
   /** 后台清理间隔（分钟），最小 1。 */
   cache_sweep_interval_minutes: number;
+  /** 跳过 TLS 服务器证书校验；默认 false（= 校验）。 */
+  allow_insecure_tls: boolean;
 }
 
 /**

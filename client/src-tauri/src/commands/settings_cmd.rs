@@ -47,6 +47,19 @@ pub struct AppSettings {
     #[serde(default = "default_cache_max_size_mb")]
     pub cache_max_size_mb: u32,
 
+    /// 允许不安全的 TLS 连接：跳过服务器证书校验。
+    ///
+    /// 需要它的部署有三类：自签证书、直连 IP（证书上没有对应名字）、
+    /// 以及证书由**非公共 CA**（企业内部 CA）签发——webpki 根存储不含后者，
+    /// 所以合法的内部证书同样过不了默认校验。
+    ///
+    /// 这里用裸 `#[serde(default)]` 是对的，与上面几个字段相反：
+    /// `bool` 的 `Default` 是 `false`，而 `false` 恰好是安全值，
+    /// 老库升级后默认变成「校验证书」。上面那些字段之所以要自定义 default，
+    /// 是因为它们的零值 `0` 被定义成「关闭限制」——不安全的那一侧。
+    #[serde(default)]
+    pub allow_insecure_tls: bool,
+
     /// 后台清理间隔（分钟），最小 1。
     ///
     /// 这个字段的裸 `#[serde(default)]` 后果最严重：`0` 会让调度循环拿到
@@ -98,8 +111,31 @@ impl AppSettings {
             cache_ttl_hours: crate::core::retention::DEFAULT_CACHE_TTL_HOURS,
             cache_max_size_mb: crate::core::retention::DEFAULT_CACHE_MAX_SIZE_MB,
             cache_sweep_interval_minutes: crate::core::retention::DEFAULT_SWEEP_INTERVAL_MINUTES,
+            allow_insecure_tls: false,
         }
     }
+}
+
+/// 账号标识的合法性校验，规则必须与服务端 `auth/identity.go` 保持一致：
+/// 1..=64 字节的 `[A-Za-z0-9._@-]`。
+///
+/// 为什么客户端也要校验一遍：设置面板不是唯一的写入方。`default_config()`
+/// 与老库里反序列化出来的 JSON 都会直接流进 `config_actor`（见 lib.rs），
+/// 不经过面板那一层。仓库里已有同形态的先例——`cache_sweep_interval_minutes`
+/// 就是前后端各校验一次。
+///
+/// 两边不一致时的表现是：客户端放行、服务端拒绝，用户看到顶部红色横幅。
+/// 也就是说这一层是体验优化，服务端那一层才是约束。
+pub fn validate_account_id(s: &str) -> Result<(), String> {
+    if s.is_empty() || s.len() > 64 {
+        return Err("账号标识不能为空，长度需在 1-64 之间".to_string());
+    }
+    if !s.bytes().all(|c| {
+        c.is_ascii_alphanumeric() || c == b'_' || c == b'-' || c == b'.' || c == b'@'
+    }) {
+        return Err("账号标识只能包含字母、数字与 . _ @ -".to_string());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -115,6 +151,12 @@ pub async fn cmd_save_settings(
     new_settings: AppSettings,
 ) -> Result<(), String> {
     let mut clean_settings = new_settings;
+
+    // 账号标识：先 trim 再校验。
+    // 面板那一层已经拦过一次，这里是兜底——理由见 validate_account_id。
+    clean_settings.account_id = clean_settings.account_id.trim().to_string();
+    validate_account_id(&clean_settings.account_id)?;
+
     clean_settings.server_url = clean_settings
         .server_url
         .chars()
@@ -153,6 +195,7 @@ pub async fn cmd_save_settings(
         cfg.server_url = clean_settings.server_url.clone();
         cfg.account_id = clean_settings.account_id.clone();
         cfg.psk_secret = clean_settings.psk_secret.clone();
+        cfg.allow_insecure_tls = clean_settings.allow_insecure_tls;
     }
 
     // 3. Clear online devices from previous server/account and notify frontend
@@ -379,5 +422,81 @@ mod tests {
         // 自启状态只存在于操作系统，不得出现在落库的 JSON 里
         let json = serde_json::to_string(&AppSettings::default_config()).expect("序列化失败");
         assert!(!json.contains("autostart"));
+    }
+
+    #[test]
+    fn account_id_empty_is_rejected() {
+        assert!(validate_account_id("").is_err(), "空账号标识必须被拒绝");
+    }
+
+    #[test]
+    fn account_id_whitespace_only_is_rejected() {
+        // 面板的原生 required 放行纯空格，而 handleSubmit 的 trim 会把它变成空串。
+        // 这里校验的是 trim 之后的值，所以等价于空串。
+        assert!(validate_account_id("   ".trim()).is_err(), "纯空格账号标识必须被拒绝");
+    }
+
+    #[test]
+    fn account_id_with_newline_is_rejected() {
+        // canonical string 以换行分隔字段，放行换行就等于放行分隔符注入
+        assert!(validate_account_id("acct\nUNIDROP_V1").is_err());
+    }
+
+    #[test]
+    fn account_id_non_ascii_is_rejected() {
+        // NFC / NFD 两种字节形式肉眼相同，会静默分成两个账号桶
+        assert!(validate_account_id("团队").is_err());
+    }
+
+    #[test]
+    fn default_config_account_id_passes_validation() {
+        // 钉死「新规则没有把随发的默认值打死」——它红了就说明默认安装连不上
+        let cfg = AppSettings::default_config();
+        assert!(
+            validate_account_id(&cfg.account_id).is_ok(),
+            "默认账号标识 {} 必须通过校验",
+            cfg.account_id
+        );
+    }
+
+    #[test]
+    fn account_id_accepts_documented_shapes() {
+        for s in ["default_user", "my_team_sync", "user@example.com", "a.b", "A-1_2"] {
+            assert!(validate_account_id(s).is_ok(), "合法账号标识被误拒: {}", s);
+        }
+    }
+
+    #[test]
+    fn legacy_settings_json_with_invalid_account_id_still_deserializes() {
+        // 反序列化**不得**因账号非法而失败。
+        // 校验只发生在保存与连接时；若读库这一步就整条失败，
+        // lib.rs 的 unwrap_or_else 会回落到全部默认值，
+        // 把用户已配置的 server_url / psk_secret 一起冲掉 ——
+        // 那正是本文件其他注释反复强调要避免的形态。
+        let legacy = r#"{
+            "server_url": "wss://example.com",
+            "account_id": "",
+            "psk_secret": "secret",
+            "auto_inject": false
+        }"#;
+        let parsed: AppSettings = serde_json::from_str(legacy).expect("老库 JSON 必须仍能反序列化");
+        assert_eq!(parsed.server_url, "wss://example.com");
+        assert_eq!(parsed.psk_secret, "secret");
+        assert!(validate_account_id(&parsed.account_id).is_err(), "但它的账号标识确实非法");
+    }
+
+    #[test]
+    fn allow_insecure_tls_defaults_to_secure_on_legacy_db() {
+        // 老库的 JSON 没有这个字段，缺省必须是 false（= 校验证书）。
+        // bool 的 Default 恰好是安全值，这也是它可以用裸 serde(default) 的原因。
+        let legacy = r#"{
+            "server_url": "wss://example.com",
+            "account_id": "acct",
+            "psk_secret": "secret",
+            "auto_inject": false
+        }"#;
+        let parsed: AppSettings = serde_json::from_str(legacy).expect("反序列化失败");
+        assert!(!parsed.allow_insecure_tls, "老库升级后必须默认校验证书");
+        assert!(!AppSettings::default_config().allow_insecure_tls);
     }
 }

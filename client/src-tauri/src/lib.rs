@@ -73,6 +73,7 @@ pub fn run() {
         hostname: app_state::whoami_hostname(),
         os_type: std::env::consts::OS.to_string(),
         app_version: app_state::APP_VERSION.to_string(),
+        allow_insecure_tls: initial_settings.allow_insecure_tls,
     };
 
     let config_actor = Arc::new(tokio::sync::RwLock::new(config));
@@ -133,7 +134,7 @@ pub fn run() {
                 let cache_manager_ref = cache_manager_for_actor;
                 let settings_ref = settings_for_actor;
                 let (internal_tx, mut internal_rx) = mpsc::channel(128);
-                tokio::spawn(actor.run(internal_tx));
+                tokio::spawn(actor.run(internal_tx, app_handle.clone()));
 
                 while let Some(env) = internal_rx.recv().await {
                     match env.action {
@@ -206,12 +207,13 @@ pub fn run() {
 
                                         if let Some((offer, source)) = outbound_entry {
                                             log::info!("Starting Sender task for session {}", answer.session_id);
-                                            let active_server_url = {
+                                            let (active_server_url, allow_insecure_tls) = {
                                                 let s = settings_ref.lock().await;
-                                                s.server_url.clone()
+                                                (s.server_url.clone(), s.allow_insecure_tls)
                                             };
                                             tokio::spawn(TransferEngine::start_sender_task(
                                                 active_server_url,
+                                                allow_insecure_tls,
                                                 answer.session_id.clone(),
                                                 token.clone(),
                                                 self_device_id.clone(),
@@ -229,13 +231,14 @@ pub fn run() {
                                             };
 
                                             if let Some((offer, sender_device)) = inbound_entry {
-                                                let (auto_inject, active_server_url) = {
+                                                let (auto_inject, active_server_url, allow_insecure_tls) = {
                                                     let s = settings_ref.lock().await;
-                                                    (s.auto_inject, s.server_url.clone())
+                                                    (s.auto_inject, s.server_url.clone(), s.allow_insecure_tls)
                                                 };
                                                 log::info!("Starting Receiver task for session {}, auto_inject={}", answer.session_id, auto_inject);
                                                 tokio::spawn(TransferEngine::start_receiver_task(
                                                     active_server_url,
+                                                    allow_insecure_tls,
                                                     answer.session_id.clone(),
                                                     token,
                                                     sender_device,
@@ -249,6 +252,64 @@ pub fn run() {
                                             }
                                         }
                                     }
+                                } else {
+                                    // 接收方明确拒收（accepted=false）。
+                                    //
+                                    // 改造前这里没有 else：服务端原样转发拒收的 ANSWER，
+                                    // 而客户端只处理 accepted 的那一支，于是发送方的
+                                    // pending_outbound 永不释放、卡片停在等待状态——
+                                    // 一个不需要任何异常就能稳定复现的静默挂起。
+                                    //
+                                    // 它与本轮服务端「授权失败双向拒绝」是同一族问题的
+                                    // 两半：那边堵的是服务端不肯授权，这边堵的是对端不愿接收。
+                                    // 只修一半的话「不再有静默挂起」这个说法就只对一半。
+                                    let sid = answer.session_id.clone();
+                                    {
+                                        let state = app_handle.state::<AppState>();
+                                        state.pending_outbound.lock().await.remove(&sid);
+                                    }
+                                    pending_inbound_ref.lock().await.remove(&sid);
+
+                                    let brief = {
+                                        let state = app_handle.state::<AppState>();
+                                        let conn = state.db_conn.lock().await;
+                                        let brief = HistoryRepo::get_task_brief(&conn, &sid);
+                                        let _ = HistoryRepo::update_task_status(
+                                            &conn, &sid, "FAILED", Some("对方拒绝了本次传输"),
+                                        );
+                                        brief
+                                    };
+
+                                    let (direction, summary, total_size, data_type) = match brief {
+                                        Some(b) => (
+                                            b.direction,
+                                            format!(
+                                                "{} (对方拒绝了本次传输)",
+                                                b.preview_summary.unwrap_or_else(|| "传输".into())
+                                            ),
+                                            b.total_size,
+                                            b.data_type,
+                                        ),
+                                        None => (
+                                            "SEND".to_string(),
+                                            "传输 (对方拒绝了本次传输)".to_string(),
+                                            0,
+                                            "FILES".to_string(),
+                                        ),
+                                    };
+
+                                    let _ = app_handle.emit("transfer-progress", ActiveTransfer {
+                                        session_id: sid,
+                                        preview_summary: summary,
+                                        total_size,
+                                        transferred_size: 0,
+                                        direction,
+                                        progress: 0.0,
+                                        status: "FAILED".to_string(),
+                                        data_type,
+                                    });
+
+                                    crate::core::history_pruner::prune_and_notify(&app_handle).await;
                                 }
                             }
                         }

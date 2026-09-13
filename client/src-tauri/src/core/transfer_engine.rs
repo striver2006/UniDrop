@@ -229,6 +229,9 @@ impl TransferEngine {
     /// Connects to /ws/data as Sender and executes Sliding Window ARQ transfer (P0-3).
     pub async fn start_sender_task(
         server_url: String,
+        // 与 server_url 同路取自设置：数据面必须与控制面用同一套 TLS 策略，
+        // 否则用户在界面上关掉的校验会在这条连接上悄悄恢复（反之亦然）。
+        allow_insecure_tls: bool,
         session_id: String,
         token: String,
         from_device: String,
@@ -253,12 +256,16 @@ impl TransferEngine {
 
         log::info!("Sender connecting to data plane: {}", ws_data_url);
 
-        // Same TLS policy as the control plane (supports self-signed / direct-IP deployments)
+        // 与控制面同一套 TLS 策略：默认校验证书，勾选后才跳过。
+        //
+        // 注意一处有意接受的取舍：这里的证书失败**不做**专门提示，只会以
+        // 「数据通道连接失败」呈现。控制面连不上时数据面根本不会启动，
+        // 所以这条路径实际不可达，不值得再铺一条通知链路。
         let (ws_stream, _) = match connect_async_tls_with_config(
             &ws_data_url,
             None,
             false,
-            Some(create_tls_connector()),
+            create_tls_connector(allow_insecure_tls),
         )
         .await
         {
@@ -559,6 +566,7 @@ impl TransferEngine {
     /// Connects to /ws/data as Receiver, writes chunks into sandbox, verifies SHA256 and sends ACKs (P0-3, P1-6).
     pub async fn start_receiver_task(
         server_url: String,
+        allow_insecure_tls: bool,
         session_id: String,
         token: String,
         from_device: String,
@@ -584,12 +592,16 @@ impl TransferEngine {
 
         log::info!("Receiver connecting to data plane: {}", ws_data_url);
 
-        // Same TLS policy as the control plane (supports self-signed / direct-IP deployments)
+        // 与控制面同一套 TLS 策略：默认校验证书，勾选后才跳过。
+        //
+        // 注意一处有意接受的取舍：这里的证书失败**不做**专门提示，只会以
+        // 「数据通道连接失败」呈现。控制面连不上时数据面根本不会启动，
+        // 所以这条路径实际不可达，不值得再铺一条通知链路。
         let (ws_stream, _) = match connect_async_tls_with_config(
             &ws_data_url,
             None,
             false,
-            Some(create_tls_connector()),
+            create_tls_connector(allow_insecure_tls),
         )
         .await
         {

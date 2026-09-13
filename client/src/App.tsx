@@ -31,6 +31,7 @@ const defaultSettings: AppSettings = {
   cache_ttl_hours: 24,
   cache_max_size_mb: 10240,
   cache_sweep_interval_minutes: 60,
+  allow_insecure_tls: false,
 };
 
 export const App: React.FC = () => {
@@ -41,7 +42,11 @@ export const App: React.FC = () => {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [selectedDeviceForSend, setSelectedDeviceForSend] = useState<OnlineDevice | null>(null);
-  const [authError, setAuthError] = useState<string | null>(null);
+  /// 连接层错误横幅。kind 决定文案与引导按钮：
+  /// "auth" 是 PSK / 账号格式被服务端拒绝，"tls" 是服务器证书校验失败。
+  /// 两者的修复动作不同——前者改密钥或账号，后者要么换受信任的证书、
+  /// 要么显式勾选「允许不安全连接」——所以不能共用一句「检查密钥」。
+  const [connError, setConnError] = useState<{ kind: "auth" | "tls"; message: string } | null>(null);
   // 服务端下发的限额。null = 尚未拿到（未连接，或老服务端不发这个字段）。
   // 不要用默认值顶上——那会让用户以为看到的就是实际生效的值。
   const [serverLimits, setServerLimits] = useState<ServerLimits | null>(null);
@@ -134,18 +139,26 @@ export const App: React.FC = () => {
           console.error("fetch devices error:", err);
         }
       }
-      setAuthError(null); // Devices updated implies successful authentication
+      setConnError(null); // Devices updated implies successful authentication
     });
 
     // 2. Listen for auth events
     const unlistenAuthPromise = listen<string>("auth-failed", (event) => {
-      setAuthError(event.payload);
+      setConnError({ kind: "auth", message: event.payload });
       showNotification(`身份验证失败: ${event.payload}`, "error");
     });
 
     const unlistenAuthSuccessPromise = listen("auth-success", () => {
-      setAuthError(null);
+      setConnError(null);
       showNotification("安全鉴权成功，已连接中继服务器", "success");
+    });
+
+    // TLS 证书校验失败。
+    //
+    // 刻意**不弹 toast**：连接 actor 每次退避重试（≤30s）都会重新 emit，
+    // 弹 toast 会堆成一串。常驻横幅天然幂等——重复 set 同一内容不产生新 UI。
+    const unlistenTlsPromise = listen<string>("tls-cert-failed", (event) => {
+      setConnError({ kind: "tls", message: event.payload });
     });
 
     // 3. Listen for transfer progress updates (both outbound and inbound)
@@ -198,6 +211,7 @@ export const App: React.FC = () => {
       unlistenDevicesPromise.then((unlisten) => unlisten());
       unlistenAuthPromise.then((unlisten) => unlisten());
       unlistenAuthSuccessPromise.then((unlisten) => unlisten());
+      unlistenTlsPromise.then((unlisten) => unlisten());
       unlistenProgressPromise.then((unlisten) => unlisten());
       unlistenOfferPromise.then((unlisten) => unlisten());
       unlistenSettingsPromise.then((unlisten) => unlisten());
@@ -212,7 +226,7 @@ export const App: React.FC = () => {
     try {
       await invoke("cmd_save_settings", { newSettings });
       setSettings(newSettings);
-      setAuthError(null);
+      setConnError(null);
       showNotification("配置已保存并即时生效，正在重连中继服务器...", "success");
       setTimeout(() => {
         fetchInitialData();
@@ -320,18 +334,20 @@ export const App: React.FC = () => {
         </div>
       </header>
 
-      {/* Auth Error Banner */}
-      {authError && (
+      {/* Connection Error Banner */}
+      {connError && (
         <div className="bg-rose-950/80 border-b border-rose-800/80 px-4 py-2 flex items-center justify-between text-xs text-rose-300">
           <div className="flex items-center space-x-2 truncate">
             <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0" />
-            <span className="truncate">鉴权失败: {authError}</span>
+            <span className="truncate">
+              {connError.kind === "tls" ? connError.message : `鉴权失败: ${connError.message}`}
+            </span>
           </div>
           <button
             onClick={() => setIsSettingsOpen(true)}
             className="text-[11px] underline hover:text-rose-200 font-medium shrink-0 ml-2"
           >
-            检查密钥
+            {connError.kind === "tls" ? "检查连接设置" : "检查密钥"}
           </button>
         </div>
       )}
@@ -388,9 +404,11 @@ export const App: React.FC = () => {
 
       {/* Footer Info */}
       <footer className="px-4 py-2 bg-slate-950/60 border-t border-slate-800/80 flex items-center justify-between text-[11px] text-slate-500">
-        <div className={`flex items-center space-x-1 ${authError ? "text-rose-400" : "text-teal-500/90"}`}>
-          {authError ? <ShieldAlert className="w-3.5 h-3.5" /> : <ShieldCheck className="w-3.5 h-3.5" />}
-          <span>{authError ? "连接未授权" : "PSK 接入安全就绪"}</span>
+        <div className={`flex items-center space-x-1 ${connError ? "text-rose-400" : "text-teal-500/90"}`}>
+          {connError ? <ShieldAlert className="w-3.5 h-3.5" /> : <ShieldCheck className="w-3.5 h-3.5" />}
+          <span>
+            {connError ? (connError.kind === "tls" ? "证书不受信任" : "连接未授权") : "PSK 接入安全就绪"}
+          </span>
         </div>
         <span>支持跨设备秒级同步</span>
       </footer>

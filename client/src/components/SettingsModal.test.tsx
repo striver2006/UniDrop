@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { invoke, invokeResults, resetTauriMock } from "../test/tauri-mock";
@@ -20,6 +20,7 @@ const baseSettings: AppSettings = {
   cache_ttl_hours: 24,
   cache_max_size_mb: 10240,
   cache_sweep_interval_minutes: 60,
+  allow_insecure_tls: false,
 };
 
 function setup(
@@ -268,5 +269,62 @@ describe("服务端限额只读展示（需求 3）", () => {
     const submitted = onSave.mock.calls[0][0];
     expect(submitted).not.toHaveProperty("max_single_file_bytes");
     expect(submitted).not.toHaveProperty("rate_limit_mb");
+  });
+});
+
+describe("账号标识校验", () => {
+  const accountInput = () => screen.getByLabelText("账号标识 (Account ID)");
+
+  it("空账号被拦下且不提交", async () => {
+    const { onSave, user } = setup();
+    await user.clear(accountInput());
+    await user.click(submit());
+
+    expect(await screen.findByText("不能为空")).toBeInTheDocument();
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  // 原生 required 判定纯空格为「已填写」，而提交前的 trim 会把它变成空串 ——
+  // 一个原生校验放行的值恰好是服务端必然拒绝的值。这条钉死我们自己拦住它。
+  it("纯空格账号被拦下", async () => {
+    const { onSave, user } = setup();
+    await user.clear(accountInput());
+    await user.type(accountInput(), "   ");
+    await user.click(submit());
+
+    expect(await screen.findByText("不能为空")).toBeInTheDocument();
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it("含空格或斜杠的账号被拦下", async () => {
+    const { onSave, user } = setup();
+    for (const bad of ["a b", "acct/other"]) {
+      await user.clear(accountInput());
+      await user.type(accountInput(), bad);
+      await user.click(submit());
+      expect(await screen.findByText("只能包含字母、数字与 . _ @ -")).toBeInTheDocument();
+    }
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  it("超长账号被拦下", async () => {
+    const { onSave, user } = setup();
+    await user.clear(accountInput());
+    await user.type(accountInput(), "a".repeat(65));
+    await user.click(submit());
+
+    expect(await screen.findByText("长度不能超过 64")).toBeInTheDocument();
+    expect(onSave).not.toHaveBeenCalled();
+  });
+
+  // 正例：防止规则被收紧成拒绝一切
+  it("合法账号正常提交，且被 trim", async () => {
+    const { onSave, user } = setup();
+    await user.clear(accountInput());
+    await user.type(accountInput(), "  my_team_sync  ");
+    await user.click(submit());
+
+    await waitFor(() => expect(onSave).toHaveBeenCalled());
+    expect(onSave.mock.calls[0][0]).toMatchObject({ account_id: "my_team_sync" });
   });
 });
