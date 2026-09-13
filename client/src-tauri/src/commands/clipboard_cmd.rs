@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use serde::Serialize;
-use tauri::State;
+use tauri::{Emitter, State};
 use uuid::Uuid;
 
 use crate::app_state::AppState;
@@ -238,8 +238,17 @@ async fn dispatch_offer(
     target_device: &str,
     offer: TransferOfferPayload,
     source: TransferSource,
+    e2ee_key: Option<&ring::aead::LessSafeKey>,
 ) -> Result<String, String> {
     let session_id = offer.session_id.clone();
+
+    // 发往中继的是**密封副本**；本地的 pending_outbound 与历史行继续用带明文
+    // 元数据的原件。两者分开是本函数存在密钥参数的唯一理由：
+    // 抹空后的 offer 一旦进了本地，发送端自己的卡片与历史就只剩空文件名。
+    let wire_offer = match e2ee_key {
+        Some(key) => crate::core::e2ee::sealed_offer_for_wire(&offer, key)?,
+        None => offer.clone(),
+    };
 
     let offer_env = ControlEnvelope {
         version: 1,
@@ -248,7 +257,7 @@ async fn dispatch_offer(
         from_device: state.device_id.clone(),
         to_device: Some(target_device.to_string()),
         timestamp: crate::core::connection_actor::current_time_ms(),
-        payload: serde_json::to_value(&offer).map_err(|e| e.to_string())?,
+        payload: serde_json::to_value(&wire_offer).map_err(|e| e.to_string())?,
     };
 
     {
@@ -268,8 +277,91 @@ async fn dispatch_offer(
     Ok(session_id)
 }
 
+/// 本次传输的加密决策。
+///
+/// `key` 为 `None` 时 `fallback_reason` 必然为 `Some`——调用方据此发出可见提示。
+/// **静默回落明文是安全功能里最糟的反模式**：用户以为加密了，实际没有。
+struct E2eeDecision {
+    /// 用 `Arc` 是因为这把密钥要用在两个地方：`prepare_offer`（决定块长）
+    /// 与 `dispatch_offer`（密封发往中继的那一份）。`LessSafeKey` 不是 `Clone`，
+    /// 而重新派生一次就多一处「用错 session_id」的机会。
+    key: Option<std::sync::Arc<ring::aead::LessSafeKey>>,
+    fallback_reason: Option<String>,
+}
+
+/// 在构造 OFFER **之前**决定加不加密。
+///
+/// 协商为什么必须前置到这里，而不是等对端在 ANSWER 里回一个能力位：
+/// 1. 元数据在构造 OFFER 的那一刻就已经抹空了，等 ANSWER 回来才决定已经太晚——
+///    老接收端收到 OFFER 会无条件 `accepted=true`（lib.rs），然后拿着空文件名失败；
+/// 2. ANSWER 根本带不回自定义字段：服务端在授权成功后会
+///    `env.Payload, _ = json.Marshal(answer)` 重建载荷，未知字段被 Go 静默丢弃
+///    （server/internal/controller/control_ws.go:388）。OFFER 路径则是原样转发——
+///    这个不对称会绊倒任何下一个想给 ANSWER 加字段的人。
+///
+/// 所以改读在线设备表里已有的 `app_version`，单次 OFFER 即定形态，服务端零改动。
+///
+/// **注意这不是抗主动攻击的保证**：协商信息全部经过服务器，恶意服务端可以改写
+/// `app_version` 把传输打回明文。本轮是机会性加密，威胁模型里已如实记录。
+async fn decide_e2ee(
+    state: &State<'_, AppState>,
+    target_device: &str,
+    session_id: &Uuid,
+) -> E2eeDecision {
+    let (enabled, psk, account_id) = {
+        let s = state.settings.lock().await;
+        (s.e2ee_enabled, s.psk_secret.clone(), s.account_id.clone())
+    };
+
+    if !enabled {
+        // 用户自己关的，不必提示——提示应当只用于「你以为开着但这次没生效」。
+        return E2eeDecision { key: None, fallback_reason: None };
+    }
+
+    let peer_version = {
+        let devs = state.online_devices.lock().await;
+        devs.iter()
+            .find(|d| d.device_id == target_device)
+            .map(|d| d.app_version.clone())
+    };
+
+    if !crate::core::e2ee::peer_supports_e2ee(peer_version.as_deref()) {
+        // 文案刻意不写死「对端版本过旧」：协商信息经过服务器，
+        // 「对端确实老」与「协商字段被剥离」在客户端是**不可区分**的。
+        // 只陈述现象与后果，不做无法证实的归因。
+        return E2eeDecision {
+            key: None,
+            fallback_reason: Some("本次传输未加密：未能确认对端支持端到端加密".to_string()),
+        };
+    }
+
+    match crate::core::e2ee::derive_session_key(&psk, session_id, &account_id) {
+        Ok(k) => E2eeDecision { key: Some(std::sync::Arc::new(k)), fallback_reason: None },
+        Err(e) => {
+            log::warn!("会话密钥派生失败，本次回落明文: {}", e);
+            E2eeDecision {
+                key: None,
+                fallback_reason: Some(format!("本次传输未加密：无法派生会话密钥（{e}）")),
+            }
+        }
+    }
+}
+
+/// 回落提示统一从这里发，保证四条发送路径的行为一致。
+fn emit_fallback(app: &tauri::AppHandle, reason: Option<String>) {
+    if let Some(r) = reason {
+        log::warn!("{}", r);
+        let _ = app.emit("e2ee-fallback", r);
+    }
+}
+
 #[tauri::command]
-pub async fn cmd_send_files(state: State<'_, AppState>, target_device: String, paths: Vec<String>) -> Result<String, String> {
+pub async fn cmd_send_files(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    target_device: String,
+    paths: Vec<String>,
+) -> Result<String, String> {
     if paths.is_empty() {
         return Err("No files specified".into());
     }
@@ -292,25 +384,40 @@ pub async fn cmd_send_files(state: State<'_, AppState>, target_device: String, p
     .await
     .map_err(|e| e.to_string())??;
 
-    // 1. Prepare offer in spawn_blocking (P1-10: prevent hashing from blocking Tokio worker)
+    // 1. 协商加密——必须在 prepare_offer 之前，理由见 decide_e2ee。
+    let decision = decide_e2ee(&state, &target_device, &session_id).await;
+    emit_fallback(&app, decision.fallback_reason);
+
+    // 2. Prepare offer in spawn_blocking (P1-10: prevent hashing from blocking Tokio worker)
     let paths_for_hash = path_bufs.clone();
+    let e2ee_key = decision.key;
+    let key_for_prepare = e2ee_key.clone();
     let (offer_payload, valid_paths) = tokio::task::spawn_blocking(move || {
-        TransferEngine::prepare_offer(session_id, &paths_for_hash)
+        TransferEngine::prepare_offer(session_id, &paths_for_hash, key_for_prepare.as_deref())
     })
     .await
     .map_err(|e| e.to_string())??;
 
-    // 2. Dispatch offer envelope (R2 / N2: 1:1 aligned pending entry)
-    dispatch_offer(&state, &target_device, offer_payload, TransferSource::Files(valid_paths)).await
+    // 3. Dispatch offer envelope (R2 / N2: 1:1 aligned pending entry)
+    dispatch_offer(&state, &target_device, offer_payload, TransferSource::Files(valid_paths), e2ee_key.as_deref()).await
 }
 
 /// Reads the local clipboard (text / image / file list) and sends it as one transfer.
 #[tauri::command]
-pub async fn cmd_send_clipboard(state: State<'_, AppState>, target_device: String) -> Result<String, String> {
+pub async fn cmd_send_clipboard(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    target_device: String,
+) -> Result<String, String> {
     let session_id = Uuid::new_v4();
     let limits_snapshot = { state.server_limits.lock().await.clone() };
 
+    let decision = decide_e2ee(&state, &target_device, &session_id).await;
+    let e2ee_key = decision.key;
+    let key_for_prepare = e2ee_key.clone();
+
     let (offer_payload, source) = tokio::task::spawn_blocking(move || -> Result<(TransferOfferPayload, TransferSource), String> {
+        let e2ee_key = key_for_prepare.as_deref();
         let limits = limits_snapshot.as_ref();
         let content = read_clipboard();
         match content {
@@ -327,7 +434,7 @@ pub async fn cmd_send_clipboard(state: State<'_, AppState>, target_device: Strin
                         human_bytes(cap)
                     ));
                 }
-                TransferEngine::prepare_offer_from_bytes(session_id, "TEXT", "clipboard.txt", t.into_bytes())
+                TransferEngine::prepare_offer_from_bytes(session_id, "TEXT", "clipboard.txt", t.into_bytes(), e2ee_key)
             }
             ClipboardContent::Image(png) => {
                 let cap = limits
@@ -340,13 +447,13 @@ pub async fn cmd_send_clipboard(state: State<'_, AppState>, target_device: Strin
                         human_bytes(cap)
                     ));
                 }
-                TransferEngine::prepare_offer_from_bytes(session_id, "IMAGE", "clipboard.png", png)
+                TransferEngine::prepare_offer_from_bytes(session_id, "IMAGE", "clipboard.png", png, e2ee_key)
             }
             ClipboardContent::Files(paths) => {
                 // 剪贴板里的文件走与 cmd_send_files 相同的预检，
                 // 否则「复制文件再发送」会绕开限额。
                 let usable = precheck_file_paths(&paths, limits)?;
-                let (offer, valid) = TransferEngine::prepare_offer(session_id, &usable)?;
+                let (offer, valid) = TransferEngine::prepare_offer(session_id, &usable, e2ee_key)?;
                 Ok((offer, TransferSource::Files(valid)))
             }
             ClipboardContent::Empty => Err("剪贴板为空或不包含可发送内容（支持文本 / 图片 / 文件）".into()),
@@ -355,7 +462,12 @@ pub async fn cmd_send_clipboard(state: State<'_, AppState>, target_device: Strin
     .await
     .map_err(|e| e.to_string())??;
 
-    dispatch_offer(&state, &target_device, offer_payload, source).await
+    // 回落提示放在这里而不是 decide_e2ee 之后：剪贴板为空时上面的 `??` 已经返回 Err，
+    // 那次传输根本没发生，却先弹一条「本次传输未加密」会让人莫名其妙。
+    // cmd_send_files 因为 precheck 排在协商之前而天然没有这个问题，两处顺序对齐。
+    emit_fallback(&app, decision.fallback_reason);
+
+    dispatch_offer(&state, &target_device, offer_payload, source, e2ee_key.as_deref()).await
 }
 
 /// Re-loads a finished session into the clipboard, dispatching on its data_type:

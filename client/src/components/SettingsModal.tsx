@@ -353,6 +353,33 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             />
           </div>
 
+          {/* 与上面的 TLS 开关相对：那个默认关闭（安全值是 false），
+              这个默认开启（安全值是 true）。文案同样要说清它保证什么、
+              不保证什么——「端到端加密」四个字很容易被读成比实际更强的承诺。 */}
+          <div className="flex items-center justify-between pt-2">
+            <div className="pr-3">
+              <span className="font-medium text-slate-200">端到端加密</span>
+              <p className="text-[11px] text-slate-500">
+                内容在本机加密后才经中继转发，服务器看不到明文；对端版本过旧时会回落为不加密并提示
+              </p>
+              {!form.e2ee_enabled && (
+                <p className="mt-1 text-[11px] text-amber-400">
+                  已关闭：传输内容将以明文经过中继服务器
+                </p>
+              )}
+            </div>
+            <input
+              type="checkbox"
+              // 旁边的说明文字在独立的 div 里，与 input 没有 label 关联，
+              // 屏幕阅读器与测试都定位不到。新加的开关补上 aria-label；
+              // 上面几个既有开关同样缺，但那属于另一件事，不在本轮一并动。
+              aria-label="端到端加密"
+              checked={form.e2ee_enabled}
+              onChange={(e) => setForm({ ...form, e2ee_enabled: e.target.checked })}
+              className="w-4 h-4 rounded text-teal-500 focus:ring-teal-400 bg-slate-800 border-slate-700"
+            />
+          </div>
+
           <div className="flex items-center justify-between pt-2">
             <div>
               <span className="font-medium text-slate-200">静默自动装载剪贴板</span>

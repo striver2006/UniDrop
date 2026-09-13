@@ -21,6 +21,7 @@ const baseSettings: AppSettings = {
   cache_max_size_mb: 10240,
   cache_sweep_interval_minutes: 60,
   allow_insecure_tls: false,
+  e2ee_enabled: true,
 };
 
 function setup(
@@ -326,5 +327,17 @@ describe("账号标识校验", () => {
 
     await waitFor(() => expect(onSave).toHaveBeenCalled());
     expect(onSave.mock.calls[0][0]).toMatchObject({ account_id: "my_team_sync" });
+  });
+
+  it("端到端加密开关默认开启，关闭时给出明文警告", async () => {
+    const { user } = setup();
+
+    const toggle = screen.getByRole("checkbox", { name: /端到端加密/ });
+    expect(toggle).toBeChecked();
+    // 开启时不该出现警告——警告只用于「你以为安全但其实不是」的状态
+    expect(screen.queryByText(/将以明文经过中继服务器/)).not.toBeInTheDocument();
+
+    await user.click(toggle);
+    expect(screen.getByText(/将以明文经过中继服务器/)).toBeInTheDocument();
   });
 });

@@ -383,6 +383,7 @@ mod tests {
             preview_summary: "demo".to_string(),
             encrypted: false,
             encrypted_metadata: None,
+            e2ee_version: None,
             items: vec![crate::protocol::TransferItemPayload {
                 item_index: 0,
                 relative_path: "a.bin".to_string(),

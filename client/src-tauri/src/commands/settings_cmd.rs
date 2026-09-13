@@ -60,6 +60,19 @@ pub struct AppSettings {
     #[serde(default)]
     pub allow_insecure_tls: bool,
 
+    /// 是否对传输内容做端到端加密。
+    ///
+    /// **这里必须写自定义 default，不能用裸 `#[serde(default)]`——与紧邻的
+    /// `allow_insecure_tls` 恰好相反。** 那个字段的安全值是 `false`，正好等于
+    /// `bool::default()`；而这个字段的安全值是 `true`，裸 default 会让所有
+    /// 老库升级后静默关闭加密，且没有任何迹象。两个相邻的 bool 取了相反的默认，
+    /// 看起来像风格不一致，实际都是「默认值必须落在安全的那一侧」。
+    ///
+    /// 开启后并不保证每次传输都加密：对端版本过旧时会回落明文并给出可见提示
+    /// （见 `core::e2ee::peer_supports_e2ee`）。
+    #[serde(default = "default_e2ee_enabled")]
+    pub e2ee_enabled: bool,
+
     /// 后台清理间隔（分钟），最小 1。
     ///
     /// 这个字段的裸 `#[serde(default)]` 后果最严重：`0` 会让调度循环拿到
@@ -67,6 +80,12 @@ pub struct AppSettings {
     /// 保存时也会规范化，但 default 仍必须给出合法值而非 0。
     #[serde(default = "default_cache_sweep_interval_minutes")]
     pub cache_sweep_interval_minutes: u32,
+}
+
+/// E2EE 默认开启。回落机制保证了对端老版本不会因此失败，
+/// 而默认关闭等于绝大多数用户永远不会用上它。
+fn default_e2ee_enabled() -> bool {
+    true
 }
 
 /// 历史保留条数的默认值。沿用改造前 `cmd_list_history` 硬编码的 100，
@@ -112,6 +131,7 @@ impl AppSettings {
             cache_max_size_mb: crate::core::retention::DEFAULT_CACHE_MAX_SIZE_MB,
             cache_sweep_interval_minutes: crate::core::retention::DEFAULT_SWEEP_INTERVAL_MINUTES,
             allow_insecure_tls: false,
+            e2ee_enabled: true,
         }
     }
 }

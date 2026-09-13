@@ -32,6 +32,7 @@ const defaultSettings: AppSettings = {
   cache_max_size_mb: 10240,
   cache_sweep_interval_minutes: 60,
   allow_insecure_tls: false,
+  e2ee_enabled: true,
 };
 
 export const App: React.FC = () => {
@@ -177,6 +178,23 @@ export const App: React.FC = () => {
       setConnError({ kind: "tls", message: event.payload });
     });
 
+    // E2EE 回落：本次传输没能加密。
+    //
+    // 用 toast 而不是常驻横幅，与 tls-cert-failed 相反：那个是持续性的连接故障、
+    // 每次重试都会重发，横幅才幂等；这个是**一次传输一条**的事件，
+    // 用横幅反而会一直挂着，让人以为当前状态仍然不安全。
+    // 这里可以直接调 showNotification（不必像 settingsRef 那样过 ref）：
+    // 它只依赖 setNotification，而 React 保证 setState 的引用稳定，
+    // 不读任何会过期的 state。
+    const unlistenE2eeFallbackPromise = listen<string>("e2ee-fallback", (event) => {
+      showNotification(event.payload, "error");
+    });
+
+    // 收到一份解不开的加密 OFFER，已拒收。最常见的原因是两端 PSK 不一致。
+    const unlistenE2eeRejectPromise = listen<string>("e2ee-offer-rejected", (event) => {
+      showNotification(event.payload, "error");
+    });
+
     // 3. Listen for transfer progress updates (both outbound and inbound)
     const unlistenProgressPromise = listen<ActiveTransfer>("transfer-progress", (event) => {
       const update = event.payload;
@@ -228,6 +246,8 @@ export const App: React.FC = () => {
       unlistenAuthPromise.then((unlisten) => unlisten());
       unlistenAuthSuccessPromise.then((unlisten) => unlisten());
       unlistenTlsPromise.then((unlisten) => unlisten());
+      unlistenE2eeFallbackPromise.then((unlisten) => unlisten());
+      unlistenE2eeRejectPromise.then((unlisten) => unlisten());
       unlistenAccountPromise.then((unlisten) => unlisten());
       unlistenProgressPromise.then((unlisten) => unlisten());
       unlistenOfferPromise.then((unlisten) => unlisten());

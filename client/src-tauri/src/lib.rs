@@ -42,6 +42,22 @@ fn reveal_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     }
 }
 
+/// 按会话 ID 字符串派生密钥。
+///
+/// session_id 在信令里是字符串，而密钥派生要的是 16 字节原始 UUID
+/// （字符串形式有大小写与连字符的歧义，见 `e2ee::derive_session_key`）。
+/// 解析失败必须报错而不是回落到一个随便造的 UUID——那会让两端派生出不同的 key，
+/// 表现为整批 tag 失败，而真正的原因（ID 格式不对）完全看不出来。
+fn derive_key_for(
+    session_id: &str,
+    psk: &str,
+    account_id: &str,
+) -> Result<ring::aead::LessSafeKey, String> {
+    let uuid = uuid::Uuid::parse_str(session_id)
+        .map_err(|e| format!("session_id 不是合法 UUID（{session_id}）: {e}"))?;
+    core::e2ee::derive_session_key(psk, &uuid, account_id)
+}
+
 pub fn run() {
     env_logger::init();
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -188,8 +204,63 @@ pub fn run() {
                         }
                         ActionType::TRANSFER_OFFER => {
                             // Receiver received offer: send TRANSFER_ANSWER(accepted=true) back
-                            if let Ok(offer) = serde_json::from_value::<TransferOfferPayload>(env.payload.clone()) {
+                            if let Ok(mut offer) = serde_json::from_value::<TransferOfferPayload>(env.payload.clone()) {
                                 log::info!("Received TRANSFER_OFFER from {} for session {}", env.from_device, offer.session_id);
+
+                                // 加密 OFFER：必须**先解密元数据再做任何别的事**。
+                                //
+                                // 下面几步会 emit 给界面并把历史行落库，而加密 OFFER 里的
+                                // relative_path / sha256 / preview_summary 都是空的——
+                                // 不先还原就会展示并持久化空文件名，后续展示与修剪都带着它。
+                                //
+                                // 解密失败就地拒收，不建数据面：最常见的原因是两端 PSK 不一致，
+                                // 让它在信令阶段以明确理由失败，比拖到数据面靠 tag 失败发现要好得多
+                                // （那条路径给出的现象与真正的原因隔了好几层）。
+                                let mut reject_reason: Option<String> = None;
+                                if offer.encrypted {
+                                    let (psk, acct) = {
+                                        let s = settings_ref.lock().await;
+                                        (s.psk_secret.clone(), s.account_id.clone())
+                                    };
+                                    match derive_key_for(&offer.session_id, &psk, &acct) {
+                                        Ok(key) => {
+                                            if let Err(e) = core::e2ee::open_offer_metadata(&mut offer, &key) {
+                                                log::warn!("加密 OFFER 的元数据解密失败，拒收 session {}: {}", offer.session_id, e);
+                                                reject_reason = Some("E2EE_KEY_MISMATCH".to_string());
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log::warn!("接收端密钥派生失败，拒收 session {}: {}", offer.session_id, e);
+                                            reject_reason = Some("E2EE_KEY_MISMATCH".to_string());
+                                        }
+                                    }
+                                }
+
+                                if let Some(reason) = reject_reason {
+                                    let answer = TransferAnswerPayload {
+                                        session_id: offer.session_id.clone(),
+                                        accepted: false,
+                                        reject_reason: Some(reason),
+                                        resumed_items: Vec::new(),
+                                        token: None,
+                                    };
+                                    let answer_env = protocol::ControlEnvelope {
+                                        version: 1,
+                                        trace_id: uuid::Uuid::new_v4().to_string(),
+                                        action: ActionType::TRANSFER_ANSWER,
+                                        from_device: self_device_id.clone(),
+                                        to_device: Some(env.from_device.clone()),
+                                        timestamp: core::connection_actor::current_time_ms(),
+                                        payload: serde_json::to_value(&answer).unwrap(),
+                                    };
+                                    let _ = outgoing_tx_actor.send(answer_env).await;
+                                    let _ = app_handle.emit(
+                                        "e2ee-offer-rejected",
+                                        "收到一份无法解密的传输请求，已拒收：两端密钥可能不一致",
+                                    );
+                                    continue;
+                                }
+
                                 let answer = TransferAnswerPayload {
                                     session_id: offer.session_id.clone(),
                                     accepted: true,
@@ -236,9 +307,24 @@ pub fn run() {
 
                                         if let Some((offer, source)) = outbound_entry {
                                             log::info!("Starting Sender task for session {}", answer.session_id);
-                                            let (active_server_url, allow_insecure_tls) = {
+                                            let (active_server_url, allow_insecure_tls, psk, acct) = {
                                                 let s = settings_ref.lock().await;
-                                                (s.server_url.clone(), s.allow_insecure_tls)
+                                                (s.server_url.clone(), s.allow_insecure_tls,
+                                                 s.psk_secret.clone(), s.account_id.clone())
+                                            };
+                                            // offer.encrypted 是发 OFFER 时就定下的，这里按它派生。
+                                            // 派生失败不能静默降级成明文：接收端已经按加密形态
+                                            // 准备好了，发明文过去只会让它整批 tag 失败。
+                                            let sender_key = if offer.encrypted {
+                                                match derive_key_for(&answer.session_id, &psk, &acct) {
+                                                    Ok(k) => Some(k),
+                                                    Err(e) => {
+                                                        log::error!("发送端会话密钥派生失败，放弃本次传输: {}", e);
+                                                        continue;
+                                                    }
+                                                }
+                                            } else {
+                                                None
                                             };
                                             tokio::spawn(TransferEngine::start_sender_task(
                                                 active_server_url,
@@ -249,6 +335,7 @@ pub fn run() {
                                                 env.from_device.clone(),
                                                 source,
                                                 offer,
+                                                sender_key,
                                                 outgoing_tx_actor.clone(),
                                                 app_handle.clone(),
                                             ));
@@ -260,9 +347,21 @@ pub fn run() {
                                             };
 
                                             if let Some((offer, sender_device)) = inbound_entry {
-                                                let (auto_inject, active_server_url, allow_insecure_tls) = {
+                                                let (auto_inject, active_server_url, allow_insecure_tls, psk, acct) = {
                                                     let s = settings_ref.lock().await;
-                                                    (s.auto_inject, s.server_url.clone(), s.allow_insecure_tls)
+                                                    (s.auto_inject, s.server_url.clone(), s.allow_insecure_tls,
+                                                     s.psk_secret.clone(), s.account_id.clone())
+                                                };
+                                                let receiver_key = if offer.encrypted {
+                                                    match derive_key_for(&answer.session_id, &psk, &acct) {
+                                                        Ok(k) => Some(k),
+                                                        Err(e) => {
+                                                            log::error!("接收端会话密钥派生失败，放弃本次接收: {}", e);
+                                                            continue;
+                                                        }
+                                                    }
+                                                } else {
+                                                    None
                                                 };
                                                 log::info!("Starting Receiver task for session {}, auto_inject={}", answer.session_id, auto_inject);
                                                 tokio::spawn(TransferEngine::start_receiver_task(
@@ -275,6 +374,7 @@ pub fn run() {
                                                     offer,
                                                     cache_manager_ref.clone(),
                                                     auto_inject,
+                                                    receiver_key,
                                                     outgoing_tx_actor.clone(),
                                                     app_handle.clone(),
                                                 ));

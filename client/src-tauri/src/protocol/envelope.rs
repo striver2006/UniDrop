@@ -139,12 +139,47 @@ pub struct TransferOfferPayload {
     pub data_type: String, // "TEXT" | "IMAGE" | "FILES"
     pub total_size: i64,
     pub total_items: usize,
+    /// 预览摘要。`encrypted = true` 时这里是空串，真值在 `encrypted_metadata` 里。
     pub preview_summary: String,
+    /// 本次传输是否加密。此前是一直硬编码 `false` 的协议占位，现已启用。
     pub encrypted: bool,
+    /// `encrypted = true` 时装 base64(AEAD(条目元数据 JSON))，见 `EncryptedMetadata`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub encrypted_metadata: Option<String>,
+    /// E2EE 协议版本。`None` = 明文传输（老客户端或协商回落）。
+    ///
+    /// 它**不承担能力协商职责**——协商在发 OFFER 之前就由对端 `app_version` 定了
+    /// （见 `core::e2ee::peer_supports_e2ee`）。这里只是接收端的自描述。
+    /// `skip_serializing_if` 让明文 OFFER 与老版本保持字节级一致。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e2ee_version: Option<u8>,
     #[serde(default)]
     pub items: Vec<TransferItemPayload>,
+}
+
+/// 加密元数据的明文形态：`encrypted = true` 时从 `items[]` 里摘出来的敏感字段。
+///
+/// 为什么这几个字段必须加密，而 `size` / `total_chunks` 不能加密：
+/// 服务端限额只读 `total_size` / `data_type` / `items[].size` 与条目数
+/// （server/internal/limits/limits.go），**从不读文件名与哈希**。
+/// 所以能藏的就藏，藏不了的如实留明文——这条切分线是限额机制的必然代价，
+/// 不是可以再优化的空间。
+///
+/// `sha256` 尤其要藏：它是内容的密码学指纹，服务端拿它**查表**就能精确确认
+/// 你传了哪个已知文件，不需要暴力枚举。加密了正文却附赠内容指纹，
+/// 与把 CRC32 算在明文上是同一类错误。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptedMetadata {
+    pub preview_summary: String,
+    pub items: Vec<EncryptedItemMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptedItemMeta {
+    pub item_index: u32,
+    pub relative_path: String,
+    pub sha256: String,
+    pub is_dir: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

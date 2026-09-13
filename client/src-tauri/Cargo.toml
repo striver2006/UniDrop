@@ -1,6 +1,6 @@
 [package]
 name = "unidrop-client"
-version = "0.2.0"
+version = "0.3.0"
 description = "UniDrop Cross-Platform Native Clipboard & File Distribution Client"
 edition = "2021"
 authors = ["UniDrop Team"]
@@ -30,6 +30,11 @@ tokio = { version = "1.38", features = ["full"] }
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", features = ["ring"] }
+# ring 本来就在依赖树里（rustls 的 ring feature），这里显式声明是为了直接用它的
+# aead/hkdf。版本必须与 rustls 解析出的一致（当前 0.17.14），否则依赖树会出现两份。
+ring = "0.17"
+# 只用于把 AEAD 密文塞进 OFFER 的 JSON 字段（encrypted_metadata）。
+base64 = "0.22"
 uuid = { version = "1.8", features = ["v4", "fast-rng"] }
 crc32fast = "1.4"
 sha2 = "0.10"

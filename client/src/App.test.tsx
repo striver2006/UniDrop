@@ -31,6 +31,7 @@ const baseSettings: AppSettings = {
   cache_max_size_mb: 10240,
   cache_sweep_interval_minutes: 60,
   allow_insecure_tls: false,
+  e2ee_enabled: true,
 };
 
 function transfer(overrides: Partial<ActiveTransfer> = {}): ActiveTransfer {
@@ -215,6 +216,36 @@ describe("TLS 证书失败提示", () => {
     }
 
     expect(screen.getAllByText(/无法验证服务器证书/)).toHaveLength(1);
+  });
+
+  it("E2EE 回落时以 toast 提示，而不是常驻横幅", async () => {
+    await renderApp();
+
+    await act(async () => {
+      emitEvent("e2ee-fallback", "本次传输未加密：未能确认对端支持端到端加密");
+    });
+
+    expect(screen.getByText(/本次传输未加密/)).toBeInTheDocument();
+    // 回落是「一次传输一条」的事件，不能走常驻横幅那条路——
+    // 横幅会一直挂着，让人以为当前连接状态有问题。
+    expect(screen.queryByRole("button", { name: "检查连接设置" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/鉴权失败/)).not.toBeInTheDocument();
+  });
+
+  it("收到解不开的加密 OFFER 时提示密钥可能不一致", async () => {
+    await renderApp();
+
+    await act(async () => {
+      emitEvent("e2ee-offer-rejected", "收到一份无法解密的传输请求，已拒收：两端密钥可能不一致");
+    });
+
+    expect(screen.getByText(/两端密钥可能不一致/)).toBeInTheDocument();
+  });
+
+  it("注册了两个 E2EE 事件监听", async () => {
+    await renderApp();
+    expect(listenerCount("e2ee-fallback")).toBe(1);
+    expect(listenerCount("e2ee-offer-rejected")).toBe(1);
   });
 
   it("连接恢复后横幅消失", async () => {

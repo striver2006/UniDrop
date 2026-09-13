@@ -25,6 +25,14 @@ export interface AppSettings {
   cache_sweep_interval_minutes: number;
   /** 跳过 TLS 服务器证书校验；默认 false（= 校验）。 */
   allow_insecure_tls: boolean;
+  /**
+   * 对传输内容做端到端加密；默认 **true**。
+   *
+   * 与紧邻的 allow_insecure_tls 默认值相反，两者都遵循同一条规则：
+   * 默认值必须落在安全的那一侧。开启后不保证每次都加密——对端版本过旧时
+   * 会回落明文并推送 e2ee-fallback 事件。
+   */
+  e2ee_enabled: boolean;
 }
 
 /**

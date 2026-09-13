@@ -21,7 +21,7 @@ use crate::core::path_guard::PathGuard;
 use crate::core::sliding_window::SlidingWindow;
 use crate::platform::show_transfer_notification;
 use crate::protocol::{
-    ActionType, BinaryHeader, ChunkType, ControlEnvelope, HEADER_SIZE, MAX_PAYLOAD_LENGTH,
+    ActionType, BinaryHeader, ChunkType, ControlEnvelope, FLAG_ENCRYPTED, HEADER_SIZE,
     TransferItemPayload, TransferOfferPayload,
 };
 use crate::storage::HistoryRepo;
@@ -86,7 +86,19 @@ impl TransferEngine {
     }
 
     /// Prepares a TransferOfferPayload and matching valid file paths (R2 / N2: strictly 1:1 index-aligned).
-    pub fn prepare_offer(session_id: Uuid, file_paths: &[PathBuf]) -> Result<(TransferOfferPayload, Vec<PathBuf>), String> {
+    /// 构造文件传输的 OFFER。
+    ///
+    /// `e2ee_key` 为 `Some` 时本次传输加密：分块按明文块长切（给 GCM tag 留出
+    /// 16 字节，否则满块密文会超 4MB 上限被中继断连），且敏感元数据会被摘出加密。
+    /// 传 `Option<&LessSafeKey>` 而不是 `bool`，是为了让「声称加密却没有密钥」
+    /// 这个状态在类型上就不可表示。
+    pub fn prepare_offer(
+        session_id: Uuid,
+        file_paths: &[PathBuf],
+        e2ee_key: Option<&ring::aead::LessSafeKey>,
+    ) -> Result<(TransferOfferPayload, Vec<PathBuf>), String> {
+        // 四处同源之一：块长只从 plaintext_chunk_len 取，不得就地写 MAX_PAYLOAD_LENGTH。
+        let chunk_len = crate::core::e2ee::plaintext_chunk_len(e2ee_key.is_some()) as i64;
         let mut items = Vec::new();
         let mut valid_paths = Vec::new();
         let mut total_size = 0i64;
@@ -127,7 +139,7 @@ impl TransferEngine {
             let total_chunks = if file_size == 0 {
                 1
             } else {
-                ((file_size + (MAX_PAYLOAD_LENGTH as i64) - 1) / (MAX_PAYLOAD_LENGTH as i64)) as u32
+                ((file_size + chunk_len - 1) / chunk_len) as u32
             };
 
             items.push(TransferItemPayload {
@@ -151,19 +163,25 @@ impl TransferEngine {
             format!("{} 等 {} 个文件", items[0].relative_path, items.len())
         };
 
-        Ok((
-            TransferOfferPayload {
-                session_id: session_id.to_string(),
-                data_type: "FILES".to_string(),
-                total_size,
-                total_items: items.len(),
-                preview_summary: summary,
-                encrypted: false,
-                encrypted_metadata: None,
-                items,
-            },
-            valid_paths,
-        ))
+        let mut offer = TransferOfferPayload {
+            session_id: session_id.to_string(),
+            data_type: "FILES".to_string(),
+            total_size,
+            total_items: items.len(),
+            preview_summary: summary,
+            encrypted: false,
+            encrypted_metadata: None,
+            e2ee_version: None,
+            items,
+        };
+        // 只打标记，**不在这里密封**：密封会抹空文件名与摘要，而这份 offer 还要
+        // 进本地的 pending_outbound 与历史库。密封在 dispatch_offer 里对副本做。
+        if e2ee_key.is_some() {
+            offer.encrypted = true;
+            offer.e2ee_version = Some(crate::core::e2ee::E2EE_VERSION);
+        }
+
+        Ok((offer, valid_paths))
     }
 
     /// Prepares an offer for in-memory content (clipboard text / image) without touching disk.
@@ -172,6 +190,7 @@ impl TransferEngine {
         data_type: &str,
         name: &str,
         bytes: Vec<u8>,
+        e2ee_key: Option<&ring::aead::LessSafeKey>,
     ) -> Result<(TransferOfferPayload, TransferSource), String> {
         if bytes.is_empty() {
             return Err("Empty payload".into());
@@ -182,7 +201,9 @@ impl TransferEngine {
         hasher.update(&bytes);
         let hash = hex::encode(hasher.finalize());
 
-        let total_chunks = ((size + (MAX_PAYLOAD_LENGTH as i64) - 1) / (MAX_PAYLOAD_LENGTH as i64)) as u32;
+        // 四处同源之一，理由见 prepare_offer。剪贴板内容同样按明文块长切。
+        let chunk_len = crate::core::e2ee::plaintext_chunk_len(e2ee_key.is_some()) as i64;
+        let total_chunks = ((size + chunk_len - 1) / chunk_len) as u32;
 
         let preview_summary = match data_type {
             "TEXT" => {
@@ -205,7 +226,7 @@ impl TransferEngine {
             _ => name.to_string(),
         };
 
-        let offer = TransferOfferPayload {
+        let mut offer = TransferOfferPayload {
             session_id: session_id.to_string(),
             data_type: data_type.to_string(),
             total_size: size,
@@ -213,6 +234,7 @@ impl TransferEngine {
             preview_summary,
             encrypted: false,
             encrypted_metadata: None,
+            e2ee_version: None,
             items: vec![TransferItemPayload {
                 item_index: 0,
                 relative_path: name.to_string(),
@@ -222,6 +244,12 @@ impl TransferEngine {
                 total_chunks,
             }],
         };
+        // 只打标记，**不在这里密封**：密封会抹空文件名与摘要，而这份 offer 还要
+        // 进本地的 pending_outbound 与历史库。密封在 dispatch_offer 里对副本做。
+        if e2ee_key.is_some() {
+            offer.encrypted = true;
+            offer.e2ee_version = Some(crate::core::e2ee::E2EE_VERSION);
+        }
 
         Ok((offer, TransferSource::Memory(bytes)))
     }
@@ -238,9 +266,15 @@ impl TransferEngine {
         to_device: String,
         source: TransferSource,
         offer: TransferOfferPayload,
+        // 本次传输的会话密钥。None = 明文传输。
+        // 由调用方派生并传入，而不是在这里重新派生：派生需要 PSK 与 account_id，
+        // 把它们再传一遍只会多两个参数，且多一处「用错 session_id 派生」的机会。
+        e2ee_key: Option<ring::aead::LessSafeKey>,
         outgoing_tx: mpsc::Sender<ControlEnvelope>,
         app_handle: AppHandle,
     ) {
+        // 四处同源之一：与 prepare_offer 算 total_chunks 时用的块长必须一致。
+        let chunk_len = crate::core::e2ee::plaintext_chunk_len(e2ee_key.is_some());
         let base = server_url.trim().trim_end_matches('/');
         let ws_data_url = if base.starts_with("ws://") || base.starts_with("wss://") {
             format!(
@@ -338,11 +372,13 @@ impl TransferEngine {
         for (item_idx, item) in offer.items.iter().enumerate() {
             let file_size = item.size as u64;
             for c in 0..item.total_chunks {
-                let offset = (c as u64) * (MAX_PAYLOAD_LENGTH as u64);
-                let length = if offset + (MAX_PAYLOAD_LENGTH as u64) > file_size {
+                // 四处同源之一：切块必须与 total_chunks 用同一个块长，
+                // 否则最后一块的长度会算错，或多切/少切一块。
+                let offset = (c as u64) * (chunk_len as u64);
+                let length = if offset + (chunk_len as u64) > file_size {
                     (file_size.saturating_sub(offset)) as usize
                 } else {
-                    MAX_PAYLOAD_LENGTH as usize
+                    chunk_len
                 };
                 let origin = if let Some(mem) = &mem_buf {
                     ChunkOrigin::Memory(mem.clone())
@@ -404,18 +440,22 @@ impl TransferEngine {
                     }
                 };
 
-                // Build BinaryHeader
-                let header = BinaryHeader::new_data(
+                // 成帧（加密在这里发生，三条发送路径共用同一个函数）
+                let frame = match build_data_frame(
                     session_uuid,
                     desc.item_index,
                     desc.chunk_index,
                     desc.total_chunks,
                     &payload,
-                );
-
-                let mut frame = vec![0u8; HEADER_SIZE + payload.len()];
-                if header.encode(&mut frame[..HEADER_SIZE]).is_ok() {
-                    frame[HEADER_SIZE..].copy_from_slice(&payload);
+                    e2ee_key.as_ref(),
+                ) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        log::error!("成帧失败（session {}）: {}", session_id, e);
+                        break;
+                    }
+                };
+                {
                     if write.send(Message::Binary(frame)).await.is_ok() {
                         window.on_chunk_sent(next_chunk_to_send);
                         next_chunk_to_send += 1;
@@ -461,16 +501,14 @@ impl TransferEngine {
                                             log::warn!("Received NACK for chunk {}, immediately fast-retransmitting", retransmit_idx);
                                             let desc = &all_chunks[retransmit_idx as usize];
                                             if let Ok(payload) = read_chunk_payload(desc) {
-                                                    let header = BinaryHeader::new_data(
+                                                    if let Ok(frame) = build_data_frame(
                                                         session_uuid,
                                                         desc.item_index,
                                                         desc.chunk_index,
                                                         desc.total_chunks,
                                                         &payload,
-                                                    );
-                                                    let mut frame = vec![0u8; HEADER_SIZE + payload.len()];
-                                                    if header.encode(&mut frame[..HEADER_SIZE]).is_ok() {
-                                                        frame[HEADER_SIZE..].copy_from_slice(&payload);
+                                                        e2ee_key.as_ref(),
+                                                    ) {
                                                         let _ = write.send(Message::Binary(frame)).await;
                                                     }
                                                 }
@@ -489,16 +527,14 @@ impl TransferEngine {
                     for timed_out_idx in timeouts {
                         let desc = &all_chunks[timed_out_idx as usize];
                         if let Ok(payload) = read_chunk_payload(desc) {
-                            let header = BinaryHeader::new_data(
+                            if let Ok(frame) = build_data_frame(
                                 session_uuid,
                                 desc.item_index,
                                 desc.chunk_index,
                                 desc.total_chunks,
                                 &payload,
-                            );
-                            let mut frame = vec![0u8; HEADER_SIZE + payload.len()];
-                            if header.encode(&mut frame[..HEADER_SIZE]).is_ok() {
-                                frame[HEADER_SIZE..].copy_from_slice(&payload);
+                                e2ee_key.as_ref(),
+                            ) {
                                 let _ = write.send(Message::Binary(frame)).await;
                             }
                         }
@@ -574,9 +610,29 @@ impl TransferEngine {
         offer: TransferOfferPayload,
         cache_manager: CacheManager,
         auto_inject: bool,
+        // 会话密钥。None = 明文传输。必须与 offer.encrypted 一致：
+        // 不一致时要么把密文当明文写盘（文件损坏），要么对明文做 AEAD 解密（全块失败）。
+        e2ee_key: Option<ring::aead::LessSafeKey>,
         outgoing_tx: mpsc::Sender<ControlEnvelope>,
         app_handle: AppHandle,
     ) {
+        // 四处同源之一：写盘定位必须与发送端切块用同一个块长。
+        let chunk_len = crate::core::e2ee::plaintext_chunk_len(e2ee_key.is_some());
+
+        // §D 双层熔断的计数器。
+        //
+        // 单块阈值处理「CRC32 漏检后仍 tag 失败」这种极罕见情形；
+        // **会话级阈值才是主力**：滑动窗口有 4 个在途块，PSK 不一致时它们会
+        // 同时 tag 失败、各自只计到 1，永远够不到单块阈值——只按单块计数的话
+        // 限次在最常见的触发场景下完全失效，退化成无限重传。
+        let mut tag_fail_total: u32 = 0;
+        // 是否因 AEAD 熔断而主动中止。置位后收尾阶段不再补发泛化的失败信令——
+        // 两条失败信令走同一个 session_id，后到的会覆盖先到的错误文案，
+        // 于是**越精准的诊断越先被发出、也越先被覆盖**。
+        let mut e2ee_aborted = false;
+        let mut tag_fail_per_chunk: std::collections::HashMap<(u32, u32), u32> =
+            std::collections::HashMap::new();
+
         let base = server_url.trim().trim_end_matches('/');
         let ws_data_url = if base.starts_with("ws://") || base.starts_with("wss://") {
             format!(
@@ -678,8 +734,12 @@ impl TransferEngine {
                 }
             };
 
-            let payload = &chunk_data[HEADER_SIZE..];
-            if header.verify_crc32(payload).is_err() {
+            // 线路上的字节：加密时这里是密文（含 tag）。
+            let wire_payload = &chunk_data[HEADER_SIZE..];
+
+            // 第一道：CRC32。它算在**密文**上（见 build_data_frame），所以这一步
+            // 不需要先解密，能在做任何 AES 运算之前就把损坏的块打回重传。
+            if header.verify_crc32(wire_payload).is_err() {
                 log::warn!("CRC32 corruption on chunk {}, requesting retransmit", header.chunk_index);
                 // Send NACK
                 let nack = BinaryHeader::new_nack(header.session_id, header.item_index, header.chunk_index);
@@ -689,6 +749,71 @@ impl TransferEngine {
                 }
                 continue;
             }
+
+            // 第二道：AEAD。CRC32 过了而 tag 不过，实践中几乎只剩篡改或 PSK 不一致
+            // （CRC32 碰撞在 2^-32 量级），所以这里不能像损坏那样无限重传。
+            let decrypted;
+            let payload: &[u8] = match e2ee_key.as_ref() {
+                Some(key) => {
+                    // nonce **自行重算**，不读 header.nonce：发送端填了它只为抓包可读。
+                    // 信任帧头里的 nonce 会让攻击者靠改它制造解密失败——后果虽与直接
+                    // 改密文相同，但自己算消除了一整类需要论证的问题，成本为零。
+                    let nonce = crate::core::e2ee::data_nonce(header.item_index, header.chunk_index);
+                    match crate::core::e2ee::open(key, nonce, wire_payload) {
+                        Ok(pt) => {
+                            decrypted = pt;
+                            &decrypted
+                        }
+                        Err(e) => {
+                            let should_abort = record_tag_failure(
+                                &mut tag_fail_per_chunk,
+                                &mut tag_fail_total,
+                                header.item_index,
+                                header.chunk_index,
+                            );
+                            log::warn!(
+                                "AEAD 校验失败（item {} chunk {}，本会话累计 {} 次）: {}",
+                                header.item_index, header.chunk_index, tag_fail_total, e
+                            );
+
+                            if should_abort {
+                                log::error!(
+                                    "session {} 触发 E2EE 熔断，中止接收", session_id
+                                );
+                                let fail_env = ControlEnvelope {
+                                    version: 1,
+                                    trace_id: Uuid::new_v4().to_string(),
+                                    action: ActionType::TRANSFER_FAILURE,
+                                    from_device: to_device.clone(),
+                                    to_device: Some(from_device.clone()),
+                                    timestamp: crate::core::connection_actor::current_time_ms(),
+                                    payload: serde_json::json!({
+                                        "session_id": session_id,
+                                        "error_code": "E2EE_AUTH_FAILED",
+                                        // 最常见的原因是两端 PSK 不一致，不是篡改——
+                                        // 文案先指向它，否则用户会去排查网络。
+                                        "error_message": "内容校验失败：两端密钥可能不一致，或数据在传输中被篡改"
+                                    }),
+                                };
+                                let _ = outgoing_tx.send(fail_env).await;
+                                e2ee_aborted = true;
+                                break;
+                            }
+
+                            // 未触顶：当作可恢复的损坏，请求重传。
+                            let nack = BinaryHeader::new_nack(
+                                header.session_id, header.item_index, header.chunk_index,
+                            );
+                            let mut nack_frame = [0u8; HEADER_SIZE];
+                            if nack.encode(&mut nack_frame).is_ok() {
+                                let _ = write.send(Message::Binary(nack_frame.to_vec())).await;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                None => wire_payload,
+            };
 
             let item_idx = header.item_index as usize;
             if item_idx >= offer.items.len() {
@@ -711,7 +836,7 @@ impl TransferEngine {
 
             // 2. Write chunk into file (P1-6: truncate on first chunk)
             let is_first = header.chunk_index == 0 && !safe_target.exists();
-            let write_res = write_payload_chunk(&safe_target, header.chunk_index, payload, is_first);
+            let write_res = write_payload_chunk(&safe_target, header.chunk_index, payload, is_first, chunk_len);
             if let Err(e) = write_res {
                 log::error!("Failed to write chunk to {:?}: {}", safe_target, e);
                 break;
@@ -727,6 +852,11 @@ impl TransferEngine {
             // 4. Track completion via bitmap set
             let was_new = received_chunks_per_item[item_idx].insert(header.chunk_index);
             if was_new {
+                // 这里必须累加 `payload`（解密后的明文）而不是 `wire_payload`（密文）：
+                // total_size 是明文口径，密文每块多 16 字节，累加密文会让
+                // transferred_size 虚高、进度提前触顶。上面的 clamp 会盖住百分比的
+                // 越界，但不会修正 transferred_size 本身——所以守卫测试断言的是
+                // transferred_size，不是百分比。
                 total_received_bytes += payload.len() as i64;
                 let pct = if total_size > 0 {
                     ((total_received_bytes as f64) / (total_size as f64) * 100.0).clamp(0.0, 100.0)
@@ -909,24 +1039,103 @@ impl TransferEngine {
                 status: "FAILED".to_string(),
                 data_type: offer.data_type.clone(),
             });
-            finalize_history_status(&app_handle, &session_id, "FAILED", Some("接收连接中断或校验失败")).await;
-
-            let fail_env = ControlEnvelope {
-                version: 1,
-                trace_id: Uuid::new_v4().to_string(),
-                action: ActionType::TRANSFER_FAILURE,
-                from_device: to_device.clone(),
-                to_device: Some(from_device.clone()),
-                timestamp: crate::core::connection_actor::current_time_ms(),
-                payload: serde_json::json!({
-                    "session_id": session_id,
-                    "error_code": "RECEIVER_DISCONNECTED",
-                    "error_message": "Receiver connection dropped or checksum verification failed before completion"
-                }),
+            // 熔断路径已经发过 E2EE_AUTH_FAILED 并给出了精准原因，这里既不能改写
+            // 本地历史文案，也不能再补一条泛化信令——否则两端最终看到的都是
+            // 「连接中断」，而真正的原因（多半是两端 PSK 不一致）被自己盖掉了。
+            let (reason, send_generic_failure) = if e2ee_aborted {
+                ("内容校验失败：两端密钥可能不一致，或数据在传输中被篡改", false)
+            } else {
+                ("接收连接中断或校验失败", true)
             };
-            let _ = outgoing_tx.send(fail_env).await;
+            finalize_history_status(&app_handle, &session_id, "FAILED", Some(reason)).await;
+
+            if send_generic_failure {
+                let fail_env = ControlEnvelope {
+                    version: 1,
+                    trace_id: Uuid::new_v4().to_string(),
+                    action: ActionType::TRANSFER_FAILURE,
+                    from_device: to_device.clone(),
+                    to_device: Some(from_device.clone()),
+                    timestamp: crate::core::connection_actor::current_time_ms(),
+                    payload: serde_json::json!({
+                        "session_id": session_id,
+                        "error_code": "RECEIVER_DISCONNECTED",
+                        "error_message": "Receiver connection dropped or checksum verification failed before completion"
+                    }),
+                };
+                let _ = outgoing_tx.send(fail_env).await;
+            }
         }
     }
+}
+
+/// AEAD 校验失败的熔断阈值。单块与会话级共用这一个数。
+///
+/// CRC32 已算在密文上，线路偶发损坏会先被它拦下走 NACK；能同时通过 CRC32
+/// 又 tag 失败的情形实践中几乎只剩篡改或 PSK 不一致（CRC32 碰撞在 2^-32 量级），
+/// 所以快速熔断不会误伤正常传输。
+pub(crate) const TAG_FAIL_LIMIT: u32 = 3;
+
+/// 记录一次 AEAD 失败，返回是否应当熔断整个会话。
+///
+/// **双层计数缺一不可**：滑动窗口有 4 个在途块，PSK 不一致时它们会同时 tag 失败，
+/// 每块各自只计到 1——只按单块计数的话永远够不到阈值，限次在最常见的触发场景下
+/// 完全失效，退化成无限 NACK 重传（传输永不结束，用户看不到任何错误）。
+/// 会话级累计才是主力，单块阈值负责「同一块反复失败」这种更窄的情形。
+pub(crate) fn record_tag_failure(
+    per_chunk: &mut std::collections::HashMap<(u32, u32), u32>,
+    total: &mut u32,
+    item_index: u32,
+    chunk_index: u32,
+) -> bool {
+    *total += 1;
+    let per = per_chunk.entry((item_index, chunk_index)).or_insert(0);
+    *per += 1;
+    *per >= TAG_FAIL_LIMIT || *total >= TAG_FAIL_LIMIT
+}
+
+/// 把一块明文封装成完整数据帧。
+///
+/// 加密时：payload 换成 AEAD 密文，**CRC32 因此算在密文上**，nonce 写进帧头、
+/// 置 `FLAG_ENCRYPTED`。
+///
+/// CRC32 为什么算密文而不是明文：帧头对中继完全可见，而明文的 32 位指纹足以让
+/// 短内容被暴力枚举确认——剪贴板文本正是短内容。加密了正文却在帧头附赠校验和，
+/// 等于自己拆掉一半。算在密文上还保留了「解密之前就能拒绝坏块」的能力，
+/// 不必对已知损坏的数据做无用的 AES 运算。
+///
+/// **三条发送路径（首发 / NACK 快重传 / 超时重传）都必须走这个函数。**
+/// 漏掉任一条的后果是那条路径发出明文而接收端按加密解析，
+/// 表现为随机的 tag 失败——极难定位到是某条重传路径没加密。
+fn build_data_frame(
+    session_uuid: Uuid,
+    item_index: u32,
+    chunk_index: u32,
+    total_chunks: u32,
+    plaintext: &[u8],
+    e2ee_key: Option<&ring::aead::LessSafeKey>,
+) -> Result<Vec<u8>, String> {
+    let (payload, nonce) = match e2ee_key {
+        Some(k) => {
+            let n = crate::core::e2ee::data_nonce(item_index, chunk_index);
+            (crate::core::e2ee::seal(k, n, plaintext)?, Some(n))
+        }
+        None => (plaintext.to_vec(), None),
+    };
+
+    let mut header =
+        BinaryHeader::new_data(session_uuid, item_index, chunk_index, total_chunks, &payload);
+    if let Some(n) = nonce {
+        header.nonce = n;
+        header.flags |= FLAG_ENCRYPTED;
+    }
+
+    let mut frame = vec![0u8; HEADER_SIZE + payload.len()];
+    header
+        .encode(&mut frame[..HEADER_SIZE])
+        .map_err(|e| e.to_string())?;
+    frame[HEADER_SIZE..].copy_from_slice(&payload);
+    Ok(frame)
 }
 
 fn read_file_chunk(path: &Path, offset: u64, length: usize) -> std::io::Result<Vec<u8>> {
@@ -937,14 +1146,26 @@ fn read_file_chunk(path: &Path, offset: u64, length: usize) -> std::io::Result<V
     Ok(buf)
 }
 
-fn write_payload_chunk(path: &Path, chunk_index: u32, payload: &[u8], truncate: bool) -> std::io::Result<()> {
+/// 把一块**明文**写进目标文件的对应位置。
+///
+/// `chunk_len` 必须与发送端切块、以及 `total_chunks` 的计算用同一个值。
+/// 四处同源里这一处的失败形态最隐蔽：offset 用错不会报错、不会 CRC 失败、
+/// 也不会 tag 失败——每块都成功解密、成功写入，只是写在错误的位置，
+/// 直到最后 SHA256 才发现文件是坏的，而那时整个传输已经跑完了。
+fn write_payload_chunk(
+    path: &Path,
+    chunk_index: u32,
+    payload: &[u8],
+    truncate: bool,
+    chunk_len: usize,
+) -> std::io::Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(truncate)
         .open(path)?;
 
-    let offset = (chunk_index as u64) * (MAX_PAYLOAD_LENGTH as u64);
+    let offset = (chunk_index as u64) * (chunk_len as u64);
     file.seek(SeekFrom::Start(offset))?;
     file.write_all(payload)?;
     Ok(())
@@ -968,6 +1189,8 @@ fn verify_file_sha256(path: &Path, expected_hex: &str) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 生产代码已全部改走 plaintext_chunk_len，只有测试还需要这个原始上限。
+    use crate::protocol::MAX_PAYLOAD_LENGTH;
     use std::io::Write;
 
     #[test]
@@ -991,7 +1214,7 @@ mod tests {
         let input_paths = vec![sub_dir, file1.clone(), non_existent, file2.clone()];
 
         let session_id = Uuid::new_v4();
-        let (offer, valid_paths) = TransferEngine::prepare_offer(session_id, &input_paths).unwrap();
+        let (offer, valid_paths) = TransferEngine::prepare_offer(session_id, &input_paths, None).unwrap();
 
         assert_eq!(offer.items.len(), 2);
         assert_eq!(valid_paths.len(), 2);
@@ -1012,7 +1235,7 @@ mod tests {
 
         // Small text: single chunk, TEXT summary present
         let (offer, source) =
-            TransferEngine::prepare_offer_from_bytes(session_id, "TEXT", "clipboard.txt", b"hello clipboard".to_vec())
+            TransferEngine::prepare_offer_from_bytes(session_id, "TEXT", "clipboard.txt", b"hello clipboard".to_vec(), None)
                 .unwrap();
         assert_eq!(offer.data_type, "TEXT");
         assert_eq!(offer.total_items, 1);
@@ -1029,11 +1252,250 @@ mod tests {
         // Payload larger than one chunk (>4MB) splits into the right number of chunks
         let big = vec![7u8; (MAX_PAYLOAD_LENGTH as usize) * 2 + 1024];
         let (offer_big, _) =
-            TransferEngine::prepare_offer_from_bytes(session_id, "IMAGE", "clipboard.png", big).unwrap();
+            TransferEngine::prepare_offer_from_bytes(session_id, "IMAGE", "clipboard.png", big, None).unwrap();
         assert_eq!(offer_big.items[0].total_chunks, 3);
         assert!(offer_big.preview_summary.contains("图片"));
 
         // Empty payload is rejected
-        assert!(TransferEngine::prepare_offer_from_bytes(session_id, "TEXT", "clipboard.txt", Vec::new()).is_err());
+        assert!(TransferEngine::prepare_offer_from_bytes(session_id, "TEXT", "clipboard.txt", Vec::new(), None).is_err());
+    }
+
+    // ---------- E2EE ----------
+
+    fn test_key(sid: &Uuid) -> ring::aead::LessSafeKey {
+        crate::core::e2ee::derive_session_key("psk-for-test", sid, "acct").unwrap()
+    }
+
+    /// 帧头的 CRC32 必须算在**密文**上。
+    ///
+    /// 算在明文上会把明文的 32 位指纹写进对中继完全可见的帧头，
+    /// 短内容（剪贴板文本正是短内容）可被暴力枚举确认——加密了正文却附赠校验和。
+    /// 后半条断言（≠ 明文 CRC32）才是真正的守卫：它防的是有人"顺手"改回明文。
+    #[test]
+    fn crc32_is_computed_over_ciphertext_not_plaintext() {
+        let sid = Uuid::new_v4();
+        let key = test_key(&sid);
+        let plaintext = b"secret clipboard payload";
+
+        let frame = build_data_frame(sid, 0, 0, 1, plaintext, Some(&key)).unwrap();
+        let header = BinaryHeader::decode(&frame[..HEADER_SIZE]).unwrap();
+        let wire = &frame[HEADER_SIZE..];
+
+        assert_eq!(
+            header.checksum,
+            crate::protocol::binary_header::compute_crc32(wire),
+            "帧头 CRC32 应等于密文的 CRC32"
+        );
+        assert_ne!(
+            header.checksum,
+            crate::protocol::binary_header::compute_crc32(plaintext),
+            "帧头 CRC32 等于明文的 CRC32——明文指纹泄露给了中继"
+        );
+        assert_ne!(wire, plaintext, "线路上出现了明文");
+        assert_eq!(header.flags & FLAG_ENCRYPTED, FLAG_ENCRYPTED, "未置加密标志位");
+    }
+
+    /// 不加密时行为必须与改造前完全一致：CRC32 算在明文上、不置标志位。
+    #[test]
+    fn plaintext_frame_is_unchanged() {
+        let sid = Uuid::new_v4();
+        let plaintext = b"plain payload";
+        let frame = build_data_frame(sid, 0, 0, 1, plaintext, None).unwrap();
+        let header = BinaryHeader::decode(&frame[..HEADER_SIZE]).unwrap();
+        assert_eq!(&frame[HEADER_SIZE..], plaintext);
+        assert_eq!(
+            header.checksum,
+            crate::protocol::binary_header::compute_crc32(plaintext)
+        );
+        assert_eq!(header.flags & FLAG_ENCRYPTED, 0);
+    }
+
+    /// 满的加密块整帧不得超过中继的 4MB 上限。
+    /// 超了的话中继会 ErrPayloadTooLarge 断连，而客户端只看到"连接被关"。
+    #[test]
+    fn full_encrypted_frame_fits_the_relay_limit() {
+        let sid = Uuid::new_v4();
+        let key = test_key(&sid);
+        let pt = vec![3u8; crate::core::e2ee::plaintext_chunk_len(true)];
+        let frame = build_data_frame(sid, 0, 0, 1, &pt, Some(&key)).unwrap();
+        let payload_len = frame.len() - HEADER_SIZE;
+        assert_eq!(
+            payload_len, MAX_PAYLOAD_LENGTH as usize,
+            "满块密文应恰好等于上限（多一字节就会被中继拒收）"
+        );
+    }
+
+    /// **端到端错位守卫**：跨 3 块的加密传输，按发送端切块 → 成帧 → 接收端解密 →
+    /// 按同一块长写盘，重组后必须与原文逐字节相同。
+    ///
+    /// 这条防的是"四处同源"漏改任意一处：offset 用错时每块都能解密、能写入，
+    /// 只有重组后的字节会不同——单看每一块都是成功的。
+    #[test]
+    fn encrypted_multichunk_roundtrip_is_byte_identical() {
+        let sid = Uuid::new_v4();
+        let key = test_key(&sid);
+        let chunk_len = crate::core::e2ee::plaintext_chunk_len(true);
+
+        // 3 块：两满块 + 一个零头，确保覆盖"最后一块长度不同"的分支
+        let original: Vec<u8> = (0..(chunk_len * 2 + 777)).map(|i| (i % 251) as u8).collect();
+        let total_chunks = ((original.len() + chunk_len - 1) / chunk_len) as u32;
+        assert_eq!(total_chunks, 3);
+
+        let mut rebuilt = vec![0u8; original.len()];
+        for c in 0..total_chunks {
+            let offset = c as usize * chunk_len;
+            let end = (offset + chunk_len).min(original.len());
+            let frame =
+                build_data_frame(sid, 0, c, total_chunks, &original[offset..end], Some(&key)).unwrap();
+
+            let header = BinaryHeader::decode(&frame[..HEADER_SIZE]).unwrap();
+            let wire = &frame[HEADER_SIZE..];
+            assert!(header.verify_crc32(wire).is_ok(), "第 {c} 块 CRC32 未通过");
+
+            // 接收端自行重算 nonce，不读 header.nonce
+            let nonce = crate::core::e2ee::data_nonce(header.item_index, header.chunk_index);
+            let plain = crate::core::e2ee::open(&key, nonce, wire).unwrap();
+
+            // 与 write_payload_chunk 相同的定位方式
+            let write_at = header.chunk_index as usize * chunk_len;
+            rebuilt[write_at..write_at + plain.len()].copy_from_slice(&plain);
+        }
+
+        assert_eq!(rebuilt, original, "重组结果与原文不一致——块长或写盘 offset 不同源");
+    }
+
+    /// 加密与不加密的分块数可能不同（块长差 16 字节），而两端必须各自
+    /// 按同一个 encrypted 取块长。这条钉死 total_chunks 确实跟着 encrypted 走。
+    #[test]
+    fn total_chunks_follows_the_encrypted_flag() {
+        let sid = Uuid::new_v4();
+        let key = test_key(&sid);
+        // 恰好等于一个明文满块：不加密时 1 块，加密时因为块长少 16 字节而变成 2 块
+        let size = MAX_PAYLOAD_LENGTH as usize;
+        let bytes = vec![9u8; size];
+
+        let (plain_offer, _) =
+            TransferEngine::prepare_offer_from_bytes(sid, "IMAGE", "a.png", bytes.clone(), None).unwrap();
+        let (enc_offer, _) =
+            TransferEngine::prepare_offer_from_bytes(sid, "IMAGE", "a.png", bytes, Some(&key)).unwrap();
+
+        assert_eq!(plain_offer.items[0].total_chunks, 1);
+        assert_eq!(
+            enc_offer.items[0].total_chunks, 2,
+            "加密块长少 16 字节，这个尺寸必须多切一块"
+        );
+    }
+
+    /// 加密 OFFER 序列化后**不得**出现明文文件名与 sha256。
+    ///
+    /// 直接对序列化后的字符串做子串断言，而不是检查结构体字段——
+    /// 后者在新增字段时不会跟着变红，而真正上线的是这串 JSON。
+    #[test]
+    fn encrypted_offer_leaks_no_filename_or_hash() {
+        let sid = Uuid::new_v4();
+        let key = test_key(&sid);
+        let (offer, _) = TransferEngine::prepare_offer_from_bytes(
+            sid, "TEXT", "my-secret-notes.txt", b"hello".to_vec(), Some(&key),
+        ).unwrap();
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"hello");
+        let real_hash = hex::encode(hasher.finalize());
+
+        // 发往中继的是密封副本，断言必须打在它身上
+        let wire = crate::core::e2ee::sealed_offer_for_wire(&offer, &key).unwrap();
+        let json = serde_json::to_string(&wire).unwrap();
+        assert!(!json.contains("my-secret-notes.txt"), "文件名明文出现在 OFFER 里");
+        assert!(!json.contains(&real_hash), "内容 sha256 明文出现在 OFFER 里——查表即可确认传了哪个文件");
+        assert!(!json.contains("文本: hello"), "预览摘要明文出现在 OFFER 里");
+        assert!(wire.encrypted);
+        assert_eq!(wire.e2ee_version, Some(crate::core::e2ee::E2EE_VERSION));
+
+        // 服务端限额要读的字段必须仍是明文，否则限额会静默失效或误拒
+        assert_eq!(wire.total_size, 5);
+        assert_eq!(wire.total_items, 1);
+        assert_eq!(wire.data_type, "TEXT");
+        assert_eq!(wire.items[0].size, 5);
+
+        // 接收端解密后必须原样还原
+        let mut received = wire.clone();
+        crate::core::e2ee::open_offer_metadata(&mut received, &key).unwrap();
+        assert_eq!(received.items[0].relative_path, "my-secret-notes.txt");
+        assert_eq!(received.items[0].sha256, real_hash);
+        assert!(received.preview_summary.contains("hello"));
+    }
+
+    /// **发送端本地必须保留明文元数据。**
+    ///
+    /// 这条与 `encrypted_offer_leaks_no_filename_or_hash` 是一正一反的一对：
+    /// 那条管「线上不能有明文」（安全属性），这条管「本地还得看得见」（功能属性）。
+    /// 先前只有前者，于是密封原地抹空了 offer，而那个 offer 随后进了发送端的
+    /// pending_outbound 与历史库——线上确实干净了，发送端自己的卡片与历史
+    /// 也一起变成了空文件名，全套测试照样全绿。
+    #[test]
+    fn sender_keeps_plaintext_metadata_locally() {
+        let sid = Uuid::new_v4();
+        let key = test_key(&sid);
+        let (local, _) = TransferEngine::prepare_offer_from_bytes(
+            sid, "TEXT", "my-notes.txt", b"hello".to_vec(), Some(&key),
+        ).unwrap();
+
+        // 本地这一份：标记为加密，但元数据仍是明文，供卡片与历史使用
+        assert!(local.encrypted, "本地这份也要标记加密，块长与接收端据此判断");
+        assert_eq!(local.items[0].relative_path, "my-notes.txt");
+        assert!(!local.items[0].sha256.is_empty());
+        assert!(local.preview_summary.contains("hello"));
+        assert!(local.encrypted_metadata.is_none(), "本地这份不该带密文元数据");
+
+        // 发往中继的那一份：抹空且带密文
+        let wire = crate::core::e2ee::sealed_offer_for_wire(&local, &key).unwrap();
+        assert_eq!(wire.items[0].relative_path, "");
+        assert_eq!(wire.items[0].sha256, "");
+        assert_eq!(wire.preview_summary, "");
+        assert!(wire.encrypted_metadata.is_some());
+
+        // 密封不得回头改动原件
+        assert_eq!(local.items[0].relative_path, "my-notes.txt", "密封污染了本地原件");
+    }
+
+    /// 用错的密钥解 OFFER 元数据必须失败——这条是"PSK 不一致在信令阶段就被发现"的依据。
+    #[test]
+    fn offer_metadata_rejects_wrong_key() {
+        let sid = Uuid::new_v4();
+        let (offer, _) = TransferEngine::prepare_offer_from_bytes(
+            sid, "TEXT", "a.txt", b"x".to_vec(), Some(&test_key(&sid)),
+        ).unwrap();
+
+        let wire = crate::core::e2ee::sealed_offer_for_wire(&offer, &test_key(&sid)).unwrap();
+        let wrong = crate::core::e2ee::derive_session_key("another-psk", &sid, "acct").unwrap();
+        let mut received = wire.clone();
+        assert!(crate::core::e2ee::open_offer_metadata(&mut received, &wrong).is_err());
+    }
+
+    /// **AGY-04**：滑动窗口有 4 个在途块，PSK 不一致时它们同时 tag 失败、
+    /// 每块各自只计到 1。只按单块计数的话永远够不到阈值 3，会无限重传。
+    /// 这条钉死会话级累计存在。
+    #[test]
+    fn concurrent_window_failures_trip_the_session_breaker() {
+        let mut per = std::collections::HashMap::new();
+        let mut total = 0u32;
+
+        // 四个**不同**的块各失败一次，模拟窗口内并发失败
+        assert!(!record_tag_failure(&mut per, &mut total, 0, 0));
+        assert!(!record_tag_failure(&mut per, &mut total, 0, 1));
+        assert!(
+            record_tag_failure(&mut per, &mut total, 0, 2),
+            "三个不同块各失败一次后必须熔断——只按单块计数会在这里放行并无限重传"
+        );
+    }
+
+    /// 同一块连续失败同样要熔断（更窄的情形，由单块阈值负责）。
+    #[test]
+    fn repeated_failure_on_one_chunk_trips_the_breaker() {
+        let mut per = std::collections::HashMap::new();
+        let mut total = 0u32;
+        assert!(!record_tag_failure(&mut per, &mut total, 5, 5));
+        assert!(!record_tag_failure(&mut per, &mut total, 5, 5));
+        assert!(record_tag_failure(&mut per, &mut total, 5, 5));
     }
 }
