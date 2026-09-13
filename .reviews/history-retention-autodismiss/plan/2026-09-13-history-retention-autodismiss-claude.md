@@ -1,0 +1,303 @@
+# 传输历史条数上限 + 完成卡片自动消失 — 实施计划
+
+- 主题：`history-retention-autodismiss`
+- 阶段：plan（原稿）
+- 日期：2026-09-13
+- 角色：Driver (claude)
+- 任务目标：可以设置传输历史保存最新的多少条，超出的删除（界面提醒和缓存的内容）；
+  可以设置新到传输任务完成后在界面中保持多久，一段时间后自动在界面中消失；设置都有默认值。
+
+---
+
+## 1. 背景与现状核验
+
+需求来自 `docs/需求.md` 20260912 清单的第 4、5 条：
+
+> 4. 可以设置传输历史保存最新的多少条，超出的删除（界面提醒和缓存的内容）。
+> 5. 可以设置传输任务完成后在界面中保持多久，一段时间后自动在界面中消失。
+
+起草前已核验代码，两条都**完全未实现**，且各自要动的是**不同的两处 UI 状态**——
+需求文本里的「界面」在第 4 条和第 5 条指的不是同一个东西，必须先分清，否则会做错。
+
+### 1.1 「传输历史」= 持久化列表（需求 4 的落点）
+
+`HistoryPanel.tsx` 从 `cmd_list_history` 拉取，数据源是 SQLite `transfer_tasks` 表：
+
+- `client/src-tauri/src/commands/history_cmd.rs:12` —— **条数上限 100 是硬编码的**：
+  `HistoryRepo::list_history(&conn, 100)`；
+- `client/src-tauri/src/storage/history_repo.rs:110-141` —— `list_history` 只做
+  `ORDER BY created_at DESC LIMIT ?1` 的**查询截断**，超出部分**仍留在库里**，
+  磁盘缓存文件也仍在。即当前是「只看最近 100 条」，不是「只保留最近 100 条」。
+
+### 1.2 「传输任务卡片」= 内存中的活动任务（需求 5 的落点）
+
+`App.tsx:34` 的 `transfers` state 由 `transfer-progress` 事件累积（`App.tsx:99-117`），
+渲染成 `TransferProgress.tsx` 卡片。核验到的行为：
+
+- 卡片**永不自动消失**。终态（COMPLETED / FAILED）后唯一的移除路径是用户点 X ——
+  `App.tsx:165-167` 的 `handleDismissTransfer`，对应 `TransferProgress.tsx:70-78`；
+- 这份 state 是纯内存的，重启即清空，**与 `transfer_tasks` 表无关**。
+
+所以需求 5 只需在前端加定时移除，**不得**顺手删库或删缓存——那是需求 4 的职责。
+
+### 1.3 现有缓存清理：只按时间和容量，不按条数
+
+`client/src-tauri/src/core/cache_manager.rs:104-166` 的 `sweep_expired_and_lru()`：
+TTL 24h 淘汰 + 超 10GB 时 LRU 降到 8GB，均**尊重 2 小时剪贴板免疫锁**
+（`clipboard_injected_at`）。由 `lib.rs:320-332` 的后台任务每小时跑一次。
+
+**没有任何一条按「历史条数」淘汰的路径**，本轮要新增的正是这一条。
+
+### 1.4 三个必须注意的库结构事实
+
+核验 `client/src-tauri/src/storage/db.rs:28-100` 的 schema，有三点直接影响删除逻辑：
+
+1. `transfer_items` 声明了 `FOREIGN KEY ... ON DELETE CASCADE`（`db.rs:56`），
+   但 `init_database` 只设了 `journal_mode` / `synchronous`（`db.rs:16`），
+   **没有 `PRAGMA foreign_keys = ON`**。SQLite 外键默认关闭 ⇒ **级联不会发生**。
+   删 `transfer_tasks` 会留下孤儿 `transfer_items` 行。
+2. `chunk_bitmaps`（`db.rs:62-70`）**根本没有外键声明**，任何情况下都不会级联。
+3. `cache_entries`（`db.rs:84-92`）也没有外键，且它管的是**磁盘上的真实文件**——
+   只删表行会留下磁盘垃圾，只删文件会留下悬空表行。两者必须同一处成对处理。
+
+### 1.5 设置持久化的既有约定
+
+`AppSettings`（`client/src-tauri/src/commands/settings_cmd.rs:7-21`）整份以**一条 JSON**
+存在 `local_config` 表（`db.rs:95-99`、`save_persisted_settings`）。
+上一轮 `start_minimized` 已经踩过并写下了教训（`settings_cmd.rs:12-19` 的注释）：
+新字段漏 `#[serde(default)]`，老库 JSON 反序列化整条失败 → `lib.rs` 的
+`unwrap_or_else` 静默回落到全部默认值 → **把用户的 server_url / psk_secret 一起冲掉**。
+
+`settings_cmd.rs:24-34` 的 `AppSettings::default_config()` 是默认值的唯一定义点；
+`settings_cmd.rs:180-199` 已有一个「老格式 JSON 必须能反序列化」的回归测试。
+
+---
+
+## 2. 设计决策
+
+### 2.1 两个新设置字段
+
+| 字段 | 类型 | 默认值 | 语义 |
+|---|---|---|---|
+| `history_max_entries` | `u32` | `100` | 传输历史最多保留的条数；`0` = 不限制 |
+| `transfer_card_retain_secs` | `u32` | `30` | 终态卡片在界面保持的秒数；`0` = 不自动消失 |
+
+默认值的取法有理由，不是随手填的：
+
+- `history_max_entries = 100` 沿用 `history_cmd.rs:12` 现在硬编码的 100。
+  这样**未改设置的老用户看到的列表长度完全不变**，本轮只是把「查询截断」
+  换成了「真删除」，可见行为不出现无解释的跳变。
+- `transfer_card_retain_secs = 30` 对齐 `App.tsx:45-50` 既有 toast 的 4 秒量级但放宽一档：
+  卡片上带「重新复制文本 / 装载到剪贴板」按钮（`TransferProgress.tsx:104-137`），
+  4 秒够读一条提示、不够完成一次点击。30 秒是「看完并来得及点」的下限。
+- **`0` 一律表示「关闭该限制」**，两个字段语义一致，用户不用记两套规则。
+
+### 2.2 `#[serde(default)]` 不够用 —— 必须自定义 default 函数
+
+这是本轮最容易出错的一点，**单写 `#[serde(default)]` 是错的**：
+
+`u32` 的 `Default` 是 `0`，而 `0` 在 §2.1 里被定义成「不限制 / 不消失」。
+于是老库（JSON 里没这两个字段）升级后会静默得到「历史无上限 + 卡片永不消失」——
+恰好是两个需求都没生效的形态，且用户在设置面板里看到的是 `0`，
+根本看不出这是「老库缺字段」而不是「我自己设的」。
+
+正确做法：`#[serde(default = "default_history_max_entries")]`，
+default 函数与 `default_config()` **共用同一个常量**，避免两处字面量漏改：
+
+```rust
+pub const DEFAULT_HISTORY_MAX_ENTRIES: u32 = 100;
+pub const DEFAULT_TRANSFER_CARD_RETAIN_SECS: u32 = 30;
+
+fn default_history_max_entries() -> u32 { DEFAULT_HISTORY_MAX_ENTRIES }
+fn default_transfer_card_retain_secs() -> u32 { DEFAULT_TRANSFER_CARD_RETAIN_SECS }
+```
+
+### 2.3 修剪的删除范围：四张表 + 磁盘文件
+
+按 §1.4，删一条历史必须显式处理五处，**不能指望级联**：
+
+1. `cache_entries` 对应行 → 先取 `file_path`，`fs::remove_file` 删磁盘文件，再删行；
+2. `chunk_bitmaps` 中该 `session_id` 的行；
+3. `transfer_items` 中该 `session_id` 的行；
+4. `transfer_tasks` 该行本身。
+
+**顺序是先子后父**：中途失败时留下的是「父在、子少」的可恢复状态，
+而不是「父没了、子成孤儿」的不可追溯状态。全部包在**一个事务**里。
+
+### 2.4 修剪的两条硬约束
+
+**约束 A：只删终态任务。** 候选集必须排除 `PENDING` / `TRANSFERRING` ——
+正在传的任务删掉 `chunk_bitmaps` 会直接打断断点续传，删掉 `transfer_tasks` 会让
+`transfer_engine` 的状态更新写到一条不存在的行上（`update_task_status` 的
+`UPDATE ... WHERE session_id` 静默影响 0 行，**不报错**，故障会很难查）。
+
+实现上：计数与排序按全部行做（用户说的「最新 N 条」包含进行中的），
+但**实际执行删除时跳过非终态行**。
+
+**约束 B：尊重 2 小时剪贴板免疫锁。** 若某会话的缓存文件正处于
+`clipboard_injected_at` 2h 窗口内（判据与 `cache_manager.rs:110-113` 完全一致），
+说明用户刚把它装载进系统剪贴板、随时可能 Ctrl+V。此时**本轮跳过该条**，
+下一轮修剪再处理。理由：条数超限是「攒久了」的慢问题，
+而剪贴板失效是用户下一秒就会撞上的快问题——不值得为前者破坏后者。
+
+> 这条与 §1.3 既有 sweep 的取舍保持一致，不是本轮新发明的规则。
+
+### 2.5 修剪的触发时机
+
+- **每次任务落到终态之后**（`update_task_status` 到 COMPLETED/FAILED/CANCELLED 的调用点）
+  —— 这是唯一会让条数增长的时刻，也是最自然的触发点；
+- **保存设置之后**（`cmd_save_settings` 内）—— 用户把上限调小时必须立刻见效，
+  否则要等到下次传输才生效，看起来像设置没保存；
+- **应用启动时跑一次** —— 收敛上一次运行期间遗留的超额。
+
+不新增定时器：条数只在传输完成时增长，挂到既有的每小时 sweep 上反而让「超限后
+最长 1 小时才清理」，用户视角是设置失灵。
+
+### 2.6 需求 4 的「界面提醒」如何落地
+
+需求原文「超出的删除（界面提醒和缓存的内容）」中的「界面提醒」，按 §1.1 的辨析
+指的是**历史列表里那一条记录**（即用户在界面上看到的那条提醒性条目），
+删掉记录它自然从列表消失，无须额外做「弹一条通知告诉用户我删了历史」——
+那属于噪音，且与 §2.4 的静默跳过规则冲突（跳过时反而没法给出一致的提示）。
+
+修剪结果走日志（`log::info!`），与 `lib.rs:326-330` 既有 sweep 的处理一致。
+
+> 这一条是本计划对需求文本的**解读**，是最值得审查员挑战的地方。
+> 若解读有误、用户确实要一条 toast 提醒，改动量集中在 §3.3 一处。
+
+### 2.7 需求 5 的定时器：按 session 记账，卸载时清干净
+
+`transfer-progress` 事件对同一 `session_id` 会**反复到达**（`App.tsx:99` 起的处理
+每次都在更新同一条）。终态事件也可能重复送达。因此：
+
+- 用 `useRef<Map<string, timeoutId>>` 按 `session_id` 记账，**设新定时器前先清旧的**，
+  否则同一会话堆积多个定时器；
+- 用户手动点 X 移除时（`handleDismissTransfer`）**同时清掉该会话的定时器**，
+  否则定时器留到超时才空转一次，且持有已移除会话的闭包；
+- `useEffect` 清理函数里**清空整个 Map**，避免组件卸载后定时器仍触发 `setTransfers`
+  （React 18 严格模式下开发期会双次挂载，不清会稳定复现重复定时器）；
+- `transfer_card_retain_secs === 0` 时**不注册定时器**（而不是注册一个 0ms 的）。
+
+定时器的秒数取**事件到达时**的设置值。用户改设置不追溯已在计时的卡片——
+追溯要重建全部定时器，收益不抵复杂度。
+
+---
+
+## 3. 改动清单
+
+### 3.1 后端 · 设置字段（`client/src-tauri/src/commands/settings_cmd.rs`）
+
+- `AppSettings` 增加 `history_max_entries` / `transfer_card_retain_secs` 两字段，
+  各带 `#[serde(default = "...")]`（理由见 §2.2），并补与 `start_minimized`
+  同风格的说明注释；
+- `default_config()` 里用 §2.2 的两个常量填默认值；
+- `cmd_save_settings` 在设置落库、内存更新之后，调用一次修剪（§2.5）。
+
+### 3.2 后端 · 修剪实现（`client/src-tauri/src/storage/history_repo.rs`）
+
+新增 `HistoryRepo::prune_to_limit(conn, limit) -> Result<Vec<PathBuf>, rusqlite::Error>`：
+
+- `limit == 0` 直接返回空（不限制）；
+- 选出按 `created_at DESC, rowid DESC` 排序后**第 limit 名之后**的 `session_id`，
+  排序键与 `list_history`（`history_repo.rs:118-119`）保持**逐字一致**，
+  否则「列表里看得到的第 N 条」和「被删的第 N 条」会错位；
+- 过滤掉非终态（§2.4 约束 A）与处于剪贴板免疫锁内（§2.4 约束 B）的会话；
+- 在一个事务内按 §2.3 的顺序删四张表的行；
+- **返回待删的磁盘文件路径列表**，由调用方删文件——
+  `HistoryRepo` 现在是纯 SQL 层（`history_repo.rs` 全文无 `std::fs`），
+  把文件 IO 塞进来会破坏它的可测性（现有测试全跑在 `Connection::open_in_memory` 上）。
+
+磁盘删除的落点放在 `CacheManager`（它已经在做同样的事，`cache_manager.rs:120-127`），
+新增一个薄封装 `prune_history(limit)`：调 `prune_to_limit` 拿路径 → 删文件 → 记日志。
+
+### 3.3 后端 · 触发点
+
+- `client/src-tauri/src/lib.rs` setup 阶段：启动时跑一次修剪（§2.5 第 3 条）；
+- `client/src-tauri/src/core/transfer_engine.rs`：在任务落终态的位置触发
+  （具体调用点实现时以 `update_task_status` 的实际调用处为准）；
+- `client/src-tauri/src/commands/history_cmd.rs:12`：`cmd_list_history` 的硬编码 `100`
+  改为读 `state.settings` 的 `history_max_entries`；
+  **`0`（不限制）时不能传 0 给 `LIMIT`** ——SQLite 的 `LIMIT 0` 返回空集，
+  会让「不限制」变成「一条都不显示」。用 `-1` 或改走无 LIMIT 分支。
+
+> `list_history` 的形参是 `limit: u32`，传 `-1` 需改签名为 `i64`。
+> 实现时二选一即可，但**必须显式处理 0**，这是个会静默出错的坑。
+
+### 3.4 前端 · 类型与默认值
+
+- `client/src/types/index.ts`：`AppSettings` 补两个字段；
+- `client/src/App.tsx:22-29` 的 `defaultSettings`：补两个字段的默认值。
+  **这份字面量与 Rust 侧 `default_config()` 是两份独立真值**（既有问题，本轮不重构），
+  补的时候两边数值必须一致。
+
+### 3.5 前端 · 设置面板（`client/src/components/SettingsModal.tsx`）
+
+在「启动时最小化到托盘」之后新增两个数字输入项，沿用既有 `form` 受控模式
+（与 `rate_limit_mb` 同类，`SettingsModal.tsx` 现有 checkbox/输入框样式）：
+
+- 「传输历史保留条数」：`type="number"`，`min=0`，提示「0 表示不限制」；
+- 「完成任务在界面保持秒数」：`type="number"`，`min=0`，提示「0 表示不自动消失」。
+
+输入校验：空串 / 非数字 / 负数不得提交。`e.target.value` 为 `""` 时
+`Number("")` 是 `0`，会把空输入静默变成「不限制」——需显式拦住空串。
+
+### 3.6 前端 · 卡片自动消失（`client/src/App.tsx`）
+
+按 §2.7 实现：`transfer-progress` 处理函数中，终态时按 `session_id` 注册/重置定时器；
+`handleDismissTransfer` 中清定时器；`useEffect` 清理函数中清空 Map。
+
+**注意 `App.tsx:139` 的 `useEffect` 依赖数组是 `[]`**，闭包里读不到最新的 `settings`
+（初次渲染时是 `defaultSettings`，真实值要等 `fetchInitialData` 拉回来）。
+直接在闭包里读 `settings.transfer_card_retain_secs` 会**永远拿到默认值**。
+用 `useRef` 保存最新设置并在 `settings` 变化时同步，闭包读 ref。
+
+> 这是本轮最容易写出「看起来能跑、实际用的是旧值」的地方。
+
+---
+
+## 4. 测试计划
+
+### 4.1 Rust 单测（`history_repo.rs` 的 `mod tests`，沿用 `test_conn()` 内存库）
+
+- `prune_to_limit` 在超额时精确保留最新 N 条，删除的是最旧的；
+- `limit == 0` 时一条不删；
+- 进行中（`TRANSFERRING`）的任务即使排在 N 名之外也**不被删**（§2.4 约束 A）；
+- 处于剪贴板免疫锁内的会话本轮**被跳过**（§2.4 约束 B）；
+- 删除后 `transfer_items` / `chunk_bitmaps` / `cache_entries` 中对应行**同时消失**
+  （§1.4 的外键关闭事实使这条测试成为必需，否则孤儿行无人发现）；
+- 返回的磁盘路径列表与被删会话的 `cache_entries.file_path` 一致。
+
+### 4.2 Rust 单测（`settings_cmd.rs` 的 `mod tests`，扩展既有两个测试）
+
+- **老库 JSON（无新字段）反序列化后拿到的是 100 / 30，不是 0 / 0** ——
+  这条直接守护 §2.2，删掉自定义 default 函数它必须变红；
+- 现行 JSON 往返不丢新字段。
+
+### 4.3 手工端到端
+
+1. `cd client && npm run tauri dev` 起客户端；
+2. 设置面板把「保留条数」设为 3，保存 → 历史列表**立即**只剩 3 条（验证 §2.5 触发点 2）；
+3. 检查缓存目录（`~/Library/Caches/UniDrop/cache`，见 `cache_manager.rs:42-46`）
+   中被删会话的文件已消失；
+4. 再传一次 → 仍保持 3 条，最旧的被挤出；
+5. 把「保持秒数」设为 5 → 发一次传输，完成后卡片约 5 秒自行消失，
+   期间点 X 能立刻移除且之后无异常；
+6. 「保持秒数」设为 0 → 卡片不再自动消失；
+7. 「保留条数」设为 0 → 历史不再被裁剪且列表**能正常显示**（验证 §3.3 的 `LIMIT 0` 坑）。
+
+### 4.4 老库升级验证
+
+用上一版本产生的 `unidrop.db`（JSON 无新字段）启动，确认：
+server_url / account_id / psk_secret **未被冲掉**，且两个新设置显示为 100 / 30。
+
+---
+
+## 5. 明确不做
+
+- 不改 `sweep_expired_and_lru` 的 TTL / 容量策略（24h / 10GB）——与条数上限正交；
+- 不为「历史被裁剪」弹 toast（理由见 §2.6，若审查认为需要则加在 §3.3）；
+- 不重构 `App.tsx` / `default_config()` 两份默认值字面量的重复（既有问题，扩大范围）；
+- 不开 `PRAGMA foreign_keys = ON`。§1.4 说明了它现在是关的，但打开它会影响
+  **全部**既有写路径（`INSERT OR REPLACE` 在外键开启下的行为会变），风险远超本轮收益。
+  本轮采取显式删除，不依赖级联。
+- 不改版本号。
