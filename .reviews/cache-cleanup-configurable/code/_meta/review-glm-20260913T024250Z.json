@@ -1,0 +1,95 @@
+{
+  "schema": "trivium.review.v1",
+  "verdict": "approve-with-nits",
+  "summary": "四个焦点全部核实成立：「先 sweep 后 sleep」准确保留了启动即扫（lib.rs:355-374）；MB→字节先升位再乘，4096/8192/1048576 MB 的回绕归零反转有专门测试钉死；ttl/quota 的 0=关闭语义在 SQL 分支、前端校验、测试三层一致；三段式锁纪律与常量收敛落实到位，实现与修订计划逐项吻合，无阻塞项。最值得修的一条：三个新字段的 #[serde(default=...)] 回归无测试守护——守护该机制的 legacy-JSON 测试没有扩展到新字段，而字段文档自己称此为「后果最严重」的静默失效。其余为 sweep 第 2 段新开的装载竞态窗口、锁内 O(n²) contains、sweep 错误被静默吞掉、一处改名后的陈旧文档引用。",
+  "findings": [
+    {
+      "id": "GLM-01",
+      "severity": "minor",
+      "layer": "code",
+      "kind": "test-gap",
+      "location": "client/src-tauri/src/commands/settings_cmd.rs:44-57（serde 属性）；:252-302（既有 serde 测试）",
+      "problem": "三个新字段的 #[serde(default = ...)] 没有任何测试守护。守护该机制的既有测试 legacy_settings_json_deserializes_without_data_loss 只断言 history_max_entries 与 transfer_card_retain_secs 的默认值；若日后有人把新字段改回裸 #[serde(default)]（u32 的 Default 是 0），老库升级会静默变成「永不按时间清理 / 不限容量 / 间隔 0」——字段文档自己承认这是后果最严重的失效形态，却没有一道闸。retention.rs 的单测经 default_config() 显式赋值构造，走不到 serde 缺字段路径，测不到这个回归。",
+      "evidence": "实读 client/src-tauri/src/commands/settings_cmd.rs：44-57 为三个新字段的 serde 属性，252-302 的 legacy 与 explicit_zero 两个测试均未覆盖新字段；实读 client/src-tauri/src/core/retention.rs：tests 模块（112-119）经 AppSettings::default_config() 构造，非 serde 反序列化路径；被审 diff 未扩展该测试。",
+      "suggestion": "在 legacy_settings_json_deserializes_without_data_loss 中补三条断言（缺字段时取 24/10240/60，而非 0），并在 explicit_zero_is_preserved_not_defaulted 中补 ttl=0、size=0 的显式 0 不被 default 覆写的断言。",
+      "confidence": "high"
+    },
+    {
+      "id": "GLM-02",
+      "severity": "minor",
+      "layer": "code",
+      "kind": "concurrency",
+      "location": "client/src-tauri/src/core/cache_manager.rs:243-256（sweep 第 2 段删文件）",
+      "problem": "三段式在选取与删文件之间放开了 db_conn 锁，新开了一个旧实现（从取锁持到函数尾）不存在的竞态窗口：mark_clipboard_injected（cache_manager.rs:59-67，需同一把锁）若落在第 1 段选取之后、第 2 段 remove_file 之前，一个超过 24h 的老条目刚被用户「装载」进剪贴板，其文件仍会在第 2 段被删，第 3 段删行也不做免疫复核——行与文件一起消失，粘贴失效。prune_history 对同一窗口既有第 3 段复核（HistoryRepo::filter_recently_injected）又把残余风险明文写进文档；sweep 既无复核也无文档，与它自己引用的「history_pruner 总纲」不对称。需要说明：文件在第 2 段已删，复核救不回文件（只能让行多留一轮自愈），所以本条主要指风险未被记录、与姊妹实现不对称。",
+      "evidence": "实读 cache_manager.rs 全文（sweep 三段结构与 mark_clipboard_injected 的锁依赖、prune_history 第 3 段复核对照）、history_repo.rs:245-289（复核的存在理由与「本复核只挡得住行被删」的取舍记录）、history_pruner.rs（锁纪律总纲）、lib.rs（sweep 工作与调度循环无其他互斥）；transfer_engine.rs:741-765 确认 register_entry 仅在 SHA-256 校验后调用且路径含会话根目录，路径复用型 TOCTOU 不可达，故该窗口是本次改造新增的唯一暴露面。",
+      "suggestion": "二选一或在文档层面补齐：第 3 段删行前按 file_path 复核 clipboard_injected_at（与 prune_history 对齐，成本是每轮一次短锁查询）；或至少在 sweep 的文档注里如实记录该窗口及「为何不复核」的取舍，坦率程度与 prune_history / history_repo 的既有说明对齐。",
+      "confidence": "medium"
+    },
+    {
+      "id": "GLM-03",
+      "severity": "minor",
+      "layer": "code",
+      "kind": "performance",
+      "location": "client/src-tauri/src/core/cache_manager.rs:226-234",
+      "problem": "配额段选取循环里 victims.contains(&path) 是对持续增长的 Vec 的线性扫描，而整段循环处在第 1 段持锁区间内——最坏 O(n²) 字符串比较发生在 db_conn 锁内。剪贴板类应用常见海量小文件（数万条 100KB 级条目、且配额因免疫文件无法满足时会遍历全部候选），锁停顿会回到本次重构自己宣称要消除的形态（「持锁停顿会把整条信令链路一起堵住」），构成对自身文档理由的反例。",
+      "evidence": "实读 cache_manager.rs:202-237：SUM、LRU 候选查询与 victims 去重循环全部位于 `// 锁在此释放` 之前的作用域内，contains 在循环体内逐候选执行。修订计划 §4.7 已明示 last_accessed_at 无更新路径属既有缺陷、本轮不修，故本条不涉及 LRU 正确性，仅指锁内复杂度。",
+      "suggestion": "方向：成员判断换成 HashSet<String>（构建一次，均摊 O(1)），顺带可评估第 3 段 DELETE 循环（cache_manager.rs:262-268，同在持锁区间）复用 prepared statement。",
+      "confidence": "medium"
+    },
+    {
+      "id": "GLM-04",
+      "severity": "minor",
+      "layer": "code",
+      "kind": "correctness",
+      "location": "client/src-tauri/src/lib.rs:366-370",
+      "problem": "调度循环用 if let Ok(purged) 接收 sweep 结果，Err 被整体丢弃且不留任何日志。后台清理的唯一职责就是防磁盘占满，一旦持续失败（第 1 段 SQL 错误、第 3 段事务失败都会走 Err 提前返回），外部没有任何信号，故障呈现形态恰是该功能要防的「磁盘被无声占满」。同为后台维护入口的 prune_and_notify 对 Err 记 log::warn（history_pruner.rs:45），两处不对称。被审 diff 重写了这几行却沿用了旧的吞错写法。",
+      "evidence": "实读 lib.rs:355-374（if let Ok 结构，Err 未绑定）与 history_pruner.rs:25-47（Err(e) => log::warn!）对照；cache_manager.rs:262-268 确认 sweep 存在真实的错误路径（事务 map_err）。",
+      "suggestion": "方向：改为 match 或 if let Err(e) 并记 log::warn!，失败处理与 prune_and_notify 对齐。",
+      "confidence": "high"
+    },
+    {
+      "id": "GLM-05",
+      "severity": "nit",
+      "layer": "code",
+      "kind": "maintainability",
+      "location": "client/src-tauri/src/core/cache_manager.rs:108",
+      "problem": "prune_history 的文档注释写着「与 `sweep_expired_and_lru` 同序」，而本次变更已把该函数改名为 sweep——全仓代码中仅剩这一处引用旧名，读者按图索骥找不到函数，跨函数的顺序约定指向悬空。",
+      "evidence": "对 client/src-tauri/src 全目录 grep：sweep_expired_and_lru 仅剩 cache_manager.rs:108 一处（retention.rs:3-4 的命中是对旧常量历史的叙述性提及，非函数引用）；被审 diff 的改名 hunk 未同步此处。",
+      "suggestion": "方向：把该处引用更新为 sweep，并顺带核对「同序」的表述对三段式后的 sweep 仍然成立（目前成立：先删文件后删行）。",
+      "confidence": "high"
+    }
+  ],
+  "agreed": [
+    "「先 sweep 后 sleep」落实准确：每轮先读设置再 sweep 后 sleep，启动即扫得以保留，tokio::time::interval 首跳即时的叙述属实；settings guard 在 sweep 前显式释放（lib.rs:357-364），不与 db_conn 交叠。",
+    "u64 换算正确且收敛为唯一入口：from_settings 先 as u64 再乘（retention.rs:60-65），默认值 10240 MB 及 4096/8192/1048576 MB 的「回绕归零→语义反转」各有专门测试（default_size_exceeds_u32_and_must_not_wrap、sizes_that_would_wrap_to_zero_are_preserved），这两条测试在 u32 实现下确实会红，测得出目标缺陷。",
+    "0 值语义三层一致：SQL 段以 ttl_enabled()/quota_enabled() 门控而非把 0 当阈值（cache_manager.rs:184,202），sweep_with_zero_ttl_deletes_nothing 守住「0=关闭而非删光」的反向语义；前端 parseU32 对 ttl/size 放行 0、对 interval 以 min=1 拦 0，空串文案按 min 分支不再误导。",
+    "三段式锁纪律与 prune_history/history_pruner 总纲对齐：选取持锁即释、磁盘 IO 不持锁、删行重取锁单事务；删不掉的保留行留待下轮重试，且有回归测试（sweep_keeps_row_when_file_cannot_be_removed）。",
+    "常量收敛彻底：DEFAULT_TTL/CLIPBOARD_LOCK_DURATION/MAX_CACHE_SIZE_BYTES/SAFE_LOW_WATERMARK_BYTES 全部删除，grep 确认无残留（仅文档叙述）；7200 单点定义于 retention.rs，sweep 两处 SQL 与 history_repo 两处查询共用同一常量；86400/3600/10GB/8GB 字面量均已消灭。",
+    "保存路径用 effective_sweep_interval_minutes 规范化落库，与调度循环共用同一钳制函数，「后端校验」有真实落点且可单测——与修订计划 §4.4 的承诺一致。",
+    "实现与修订计划（revised-claude）逐项吻合：循环结构、retention.rs 条目、parseU32 文案、App.test.tsx 夹具、设置项「下一轮生效，重启立即生效」的披露文案均按计划落地。",
+    "register_entry 仅在 SHA-256 校验通过后调用且 file_path 为会话根目录下的相对路径，配合 uuid 会话根，sweep 与在途传输之间不存在实际的路径冲突竞态。"
+  ],
+  "not_covered": [
+    "未运行 cargo test / clippy / 前端 vitest（审查员只读约束，不能产生构建产物），编译与测试通过性未独立复核。",
+    "transfer_engine.rs 仅读接收完成段（register_entry 调用点上下文，700-790 行），数据面其余部分未审。",
+    "cmd_inject_session 的剪贴板写入实现未读，GLM-02 竞态的用户可见后果程度（粘贴失败 vs 死引用）属推断。",
+    "SettingsModal.tsx / App.tsx 仅核对变更 hunk 及标签-校验-默认值与 Rust 侧的一致性，未逐行审样式与交互细节。",
+    "docs/design/DESIGN.md 与 docs/需求.md 仅核对 diff 段落，未做全文一致性核查。",
+    "修订计划 §4.4 的手工验收步骤（含重启前置条件）未实际执行。"
+  ],
+  "consulted": [
+    ".reviews/cache-cleanup-configurable/code/_meta/changes-20260913T024250Z.diff",
+    ".reviews/cache-cleanup-configurable/plan/2026-09-13-cache-cleanup-configurable-revised-claude.md",
+    "CLAUDE.md",
+    "AGENTS.md",
+    "client/src-tauri/src/core/retention.rs",
+    "client/src-tauri/src/core/cache_manager.rs",
+    "client/src-tauri/src/core/history_pruner.rs",
+    "client/src-tauri/src/core/transfer_engine.rs",
+    "client/src-tauri/src/commands/settings_cmd.rs",
+    "client/src-tauri/src/lib.rs",
+    "client/src-tauri/src/storage/history_repo.rs",
+    "client/src-tauri/src/storage/db.rs",
+    "client/src-tauri/src/app_state.rs"
+  ]
+}
