@@ -572,6 +572,18 @@ func (p *RelayPipe) Push(data *[]byte, timeout time.Duration) error {
    ```text
    canonical_string = "UNIDROP_V1\n" + account_id + "\n" + device_id + "\n" + nonce + "\n" + timestamp_ms
    ```
+   **标识符格式契约**（服务端在验签**之前**强制校验，见 `internal/auth/identity.go`）：
+   * `account_id`：1–64 字节，仅允许 `[A-Za-z0-9._@-]`
+   * `device_id`：1–64 字节，仅允许 `[A-Za-z0-9_-]`
+
+   禁止换行不是风格约束：上面这个串以 `\n` 分隔字段，若标识符里可以带换行，
+   客户端就能重排它自己待签名内容的字段边界（分隔符注入）。
+   限定 ASCII 则是因为 `account_id` 是**匹配键**——同一个名字的 NFC 与 NFD
+   两种字节形式肉眼无法区分，却会被分进两个互不相通的工作区。
+
+   校验排在验签之前，因此格式错误**不会**消耗防重放的 nonce：
+   第三方实现若在 60s 窗口内复用 nonce 重试，仍会得到「格式非法」而不是
+   「重放攻击」这一误导性结论。
 3. **计算签名**：
    $$\text{Signature} = \text{hex\_encode}(\text{HMAC\_SHA256}(\text{PSK\_SECRET}, \text{canonical\_string}))$$
 4. **服务端防重放窗口**：
@@ -589,7 +601,20 @@ func (p *RelayPipe) Push(data *[]byte, timeout time.Duration) error {
 ### 4.6 可观测性设计 (Prometheus Metrics & Tracing)
 解决评审 P2-11 可观测性缺失：
 * 统一集成 Prometheus Exporter（`/metrics` 端点），暴露关键业务与运行指标：
-  * `unidrop_connected_devices{account_id, os_type}`：当前在线长连接设备数。
+  * `unidrop_online_devices`：当前在线长连接设备数（**无 label**）。
+  * `unidrop_online_accounts`：当前有设备在线的账号数。
+  * `unidrop_max_devices_per_account` / `unidrop_max_pipes_per_account`：
+    单账号持有量的峰值，用于回答「是否某一个账号吃满了整台机器」。
+  * `unidrop_auth_rejected_total{reason}`：握手拒绝计数，`reason` 取值为
+    `invalid_account_id` / `invalid_device_id` / `unauthorized` 三者之一。
+
+  > **不得按 `account_id` 打 label。** 本节原先规定的是
+  > `unidrop_connected_devices{account_id, os_type}`，那是一条照做会有害的规范：
+  > `account_id` 是未鉴权、客户端自报的任意字符串，单个客户端循环握手就能铸出
+  > 无限多个值，每一个都会在 exporter 里留下一条常驻时序——这使 `/metrics`
+  > 成为针对服务端与抓取端的内存放大面。上面那两个「峰值」指标正是为了用
+  > **一个数**回答同样的运维问题而设。
+  > `{reason}` 这类**代码内定义的闭集枚举**不受此限，它的基数由构造保证有界。
   * `unidrop_relay_bytes_total{direction}`：流式中转吞吐累计字节数。
   * `unidrop_active_relay_pipes`：当前活跃数据管道数。
   * `unidrop_chunk_retransmit_total{reason}`：分片重传累计次数（区分 timeout 或 nack）。
@@ -1014,6 +1039,10 @@ CREATE TABLE IF NOT EXISTS chunk_bitmaps (
 );
 
 -- 4. 已配对信任设备表 (E2EE 长期公钥存储)
+--
+-- 【未实现】配对与 E2EE 仍停留在设计阶段。此表曾被真实建出来却零读零写，
+-- 而它的 account_id 列会让人误以为配对数据已按账号分区，先后造成过两次误判，
+-- 因此已从 create_schema 中删除并在升级时 DROP。真正落地 E2EE 时按本节重建。
 CREATE TABLE IF NOT EXISTS paired_devices (
     device_id TEXT PRIMARY KEY,
     account_id TEXT NOT NULL,
@@ -1048,7 +1077,7 @@ CREATE TABLE IF NOT EXISTS cache_entries (
    * 客户端在本地生成各自唯一的长期身份密钥对：
      * 签名密钥：`Ed25519` (32 字节)
      * 加密密钥：`X25519` (32 字节)
-   * 双端首次互联时，通过展示/扫描带有公钥指纹的二维码或预共享码完成互相确认，公钥持久化至本地 `paired_devices` 表中。
+   * 双端首次互联时，通过展示/扫描带有公钥指纹的二维码或预共享码完成互相确认，公钥持久化至本地 `paired_devices` 表中（**该表尚未实现，见上文 schema 注记**）。
 2. **会话握手与身份验签**：
    * 发送端生成临时密钥对 `(e_priv_A, e_pub_A)`；
    * 发送端使用自身的长期身份密钥对 `e_pub_A` 进行数字签名：
