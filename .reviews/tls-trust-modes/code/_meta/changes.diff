@@ -1,0 +1,3506 @@
+# trivium changes.diff
+# run_id: 20260914T000047Z
+# base: HEAD
+# head: ab2f75e49e29799b20e0514add9de4f1eb7a8c38
+# files: 15
+#   client/src-tauri/Cargo.lock
+#   client/src-tauri/Cargo.toml
+#   client/src-tauri/src/commands/settings_cmd.rs
+#   client/src-tauri/src/core/connection_actor.rs
+#   client/src-tauri/src/core/mod.rs
+#   client/src-tauri/src/core/tls_trust.rs
+#   client/src-tauri/src/core/transfer_engine.rs
+#   client/src-tauri/src/lib.rs
+#   client/src/App.test.tsx
+#   client/src/App.tsx
+#   client/src/components/SettingsModal.test.tsx
+#   client/src/components/SettingsModal.tsx
+#   client/src/types/index.ts
+#   docs/USER_GUIDE.md
+#   docs/需求.md
+diff --git a/client/src-tauri/Cargo.lock b/client/src-tauri/Cargo.lock
+index fdbbf98..b49988e 100644
+--- a/client/src-tauri/Cargo.lock
++++ b/client/src-tauri/Cargo.lock
+@@ -45,70 +45,76 @@ dependencies = [
+ ]
+ 
+ [[package]]
+-name = "android_system_properties"
+-version = "0.1.6"
++name = "android_log-sys"
++version = "0.3.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ae221649c9976a6f6c56ae1facf410f3ddb33cc661c4b7b61020a912d4237fbc"
++checksum = "84521a3cf562bc62942e294181d9eef17eb38ceb8c68677bc49f144e4c3d4f8d"
++
++[[package]]
++name = "android_logger"
++version = "0.15.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dbb4e440d04be07da1f1bf44fb4495ebd58669372fe0cffa6e48595ac5bd88a3"
+ dependencies = [
+- "libc",
++ "android_log-sys",
++ "env_filter",
++ "log",
+ ]
+ 
+ [[package]]
+-name = "anstream"
+-version = "1.0.0"
++name = "android_system_properties"
++version = "0.1.6"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "824a212faf96e9acacdbd09febd34438f8f711fb84e09a8916013cd7815ca28d"
++checksum = "ae221649c9976a6f6c56ae1facf410f3ddb33cc661c4b7b61020a912d4237fbc"
+ dependencies = [
+- "anstyle",
+- "anstyle-parse",
+- "anstyle-query",
+- "anstyle-wincon",
+- "colorchoice",
+- "is_terminal_polyfill",
+- "utf8parse",
++ "libc",
+ ]
+ 
+ [[package]]
+-name = "anstyle"
+-version = "1.0.14"
++name = "anyhow"
++version = "1.0.104"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
++checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+ 
+ [[package]]
+-name = "anstyle-parse"
+-version = "1.0.0"
++name = "asn1-rs"
++version = "0.7.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "52ce7f38b242319f7cabaa6813055467063ecdc9d355bbb4ce0c68908cd8130e"
++checksum = "b7f43a50ac4fdca5df8e885c21b835997f0a1cdee65494a6847694a98652d9d8"
+ dependencies = [
+- "utf8parse",
++ "asn1-rs-derive",
++ "asn1-rs-impl",
++ "displaydoc",
++ "nom",
++ "num-traits",
++ "rusticata-macros",
++ "thiserror 2.0.20",
++ "time",
+ ]
+ 
+ [[package]]
+-name = "anstyle-query"
+-version = "1.1.5"
++name = "asn1-rs-derive"
++version = "0.6.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
++checksum = "3109e49b1e4909e9db6515a30c633684d68cdeaa252f215214cb4fa1a5bfee2c"
+ dependencies = [
+- "windows-sys 0.61.2",
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
++ "synstructure",
+ ]
+ 
+ [[package]]
+-name = "anstyle-wincon"
+-version = "3.0.11"
++name = "asn1-rs-impl"
++version = "0.2.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
++checksum = "7b18050c2cd6fe86c3a76584ef5e0baf286d038cda203eb6223df2cc413565f7"
+ dependencies = [
+- "anstyle",
+- "once_cell_polyfill",
+- "windows-sys 0.61.2",
++ "proc-macro2",
++ "quote",
++ "syn 2.0.119",
+ ]
+ 
+-[[package]]
+-name = "anyhow"
+-version = "1.0.104"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+-
+ [[package]]
+ name = "async-broadcast"
+ version = "0.7.2"
+@@ -333,7 +339,7 @@ version = "0.8.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
+ dependencies = [
+- "bit-vec",
++ "bit-vec 0.8.0",
+ ]
+ 
+ [[package]]
+@@ -342,6 +348,15 @@ version = "0.8.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
+ 
++[[package]]
++name = "bit-vec"
++version = "0.9.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51"
++dependencies = [
++ "serde",
++]
++
+ [[package]]
+ name = "bitflags"
+ version = "1.3.2"
+@@ -604,12 +619,6 @@ dependencies = [
+  "cc",
+ ]
+ 
+-[[package]]
+-name = "colorchoice"
+-version = "1.0.5"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
+-
+ [[package]]
+ name = "combine"
+ version = "4.6.8"
+@@ -864,6 +873,20 @@ dependencies = [
+  "thiserror 2.0.20",
+ ]
+ 
++[[package]]
++name = "der-parser"
++version = "10.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "07da5016415d5a3c4dd39b11ed26f915f52fc4e0dc197d87908bc916e51bc1a6"
++dependencies = [
++ "asn1-rs",
++ "displaydoc",
++ "nom",
++ "num-bigint",
++ "num-traits",
++ "rusticata-macros",
++]
++
+ [[package]]
+ name = "deranged"
+ version = "0.5.8"
+@@ -1122,27 +1145,14 @@ dependencies = [
+ 
+ [[package]]
+ name = "env_filter"
+-version = "2.0.0"
++version = "0.1.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "900d271a03799a1ee8d1ca9b19893b48ca674a9284fefcfb85f05e74ed314217"
++checksum = "1bf3c259d255ca70051b30e2e95b5446cdb8949ac4cd22c0d7fd634d89f568e2"
+ dependencies = [
+  "log",
+  "regex",
+ ]
+ 
+-[[package]]
+-name = "env_logger"
+-version = "0.11.11"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "de671bd27a75a797dc9ae289ba1e77276e75e2026408aab65185384e2d5cd3f6"
+-dependencies = [
+- "anstream",
+- "anstyle",
+- "env_filter",
+- "jiff",
+- "log",
+-]
+-
+ [[package]]
+ name = "equivalent"
+ version = "1.0.2"
+@@ -1223,6 +1233,15 @@ dependencies = [
+  "simd-adler32",
+ ]
+ 
++[[package]]
++name = "fern"
++version = "0.7.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "4316185f709b23713e41e3195f90edef7fb00c3ed4adc79769cf09cc762a3b29"
++dependencies = [
++ "log",
++]
++
+ [[package]]
+ name = "field-offset"
+ version = "0.3.6"
+@@ -2061,12 +2080,6 @@ dependencies = [
+  "once_cell",
+ ]
+ 
+-[[package]]
+-name = "is_terminal_polyfill"
+-version = "1.70.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
+-
+ [[package]]
+ name = "itoa"
+ version = "1.0.18"
+@@ -2247,6 +2260,12 @@ dependencies = [
+  "unicode-segmentation",
+ ]
+ 
++[[package]]
++name = "lazy_static"
++version = "1.5.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
++
+ [[package]]
+ name = "libappindicator"
+ version = "0.9.0"
+@@ -2392,6 +2411,12 @@ version = "0.3.17"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
+ 
++[[package]]
++name = "minimal-lexical"
++version = "0.2.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
++
+ [[package]]
+ name = "miniz_oxide"
+ version = "0.8.9"
+@@ -2511,6 +2536,16 @@ version = "1.0.6"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
+ 
++[[package]]
++name = "nom"
++version = "7.1.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
++dependencies = [
++ "memchr",
++ "minimal-lexical",
++]
++
+ [[package]]
+ name = "notify-rust"
+ version = "4.18.0"
+@@ -2525,12 +2560,31 @@ dependencies = [
+  "zbus",
+ ]
+ 
++[[package]]
++name = "num-bigint"
++version = "0.4.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
++dependencies = [
++ "num-integer",
++ "num-traits",
++]
++
+ [[package]]
+ name = "num-conv"
+ version = "0.2.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
+ 
++[[package]]
++name = "num-integer"
++version = "0.1.47"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b"
++dependencies = [
++ "num-traits",
++]
++
+ [[package]]
+ name = "num-traits"
+ version = "0.2.19"
+@@ -2562,6 +2616,15 @@ dependencies = [
+  "syn 2.0.119",
+ ]
+ 
++[[package]]
++name = "num_threads"
++version = "0.1.7"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "5c7398b9c8b70908f6371f47ed36737907c87c52af34c268fed0bf0ceb92ead9"
++dependencies = [
++ "libc",
++]
++
+ [[package]]
+ name = "objc-sys"
+ version = "0.3.5"
+@@ -2852,16 +2915,19 @@ dependencies = [
+ ]
+ 
+ [[package]]
+-name = "once_cell"
+-version = "1.21.4"
++name = "oid-registry"
++version = "0.8.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
++checksum = "12f40cff3dde1b6087cc5d5f5d4d65712f34016a03ed60e9c08dcc392736b5b7"
++dependencies = [
++ "asn1-rs",
++]
+ 
+ [[package]]
+-name = "once_cell_polyfill"
+-version = "1.70.2"
++name = "once_cell"
++version = "1.21.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
++checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+ 
+ [[package]]
+ name = "open"
+@@ -2954,6 +3020,16 @@ dependencies = [
+  "windows-link 0.2.1",
+ ]
+ 
++[[package]]
++name = "pem"
++version = "4.0.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d354a98a3d1251555de99e8fdd8afda05573c31b82f59063a7b0a29b5527f120"
++dependencies = [
++ "base64 0.23.1",
++ "serde_core",
++]
++
+ [[package]]
+ name = "percent-encoding"
+ version = "2.3.2"
+@@ -3326,6 +3402,20 @@ version = "0.6.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "20675572f6f24e9e76ef639bc5552774ed45f1c30e2951e1e99c59888861c539"
+ 
++[[package]]
++name = "rcgen"
++version = "0.14.10"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "8774e05a7d0de114588e6a28fe7e71694b82614ed569d86d8b389dfbc98b8ad8"
++dependencies = [
++ "pem",
++ "ring",
++ "rustls-pki-types",
++ "time",
++ "x509-parser",
++ "yasna",
++]
++
+ [[package]]
+ name = "redox_syscall"
+ version = "0.5.18"
+@@ -3516,6 +3606,15 @@ dependencies = [
+  "semver",
+ ]
+ 
++[[package]]
++name = "rusticata-macros"
++version = "4.1.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "faf0c4a6ece9950b9abdb62b1cfcf2a68b3b67a10ba445b3bb85be2a293d0632"
++dependencies = [
++ "nom",
++]
++
+ [[package]]
+ name = "rustix"
+ version = "1.1.4"
+@@ -4344,6 +4443,27 @@ dependencies = [
+  "url",
+ ]
+ 
++[[package]]
++name = "tauri-plugin-log"
++version = "2.9.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b4e8861142c21636b03ff6eb9682a073814112e35220435670738a8be7b49896"
++dependencies = [
++ "android_logger",
++ "fern",
++ "log",
++ "objc2 0.6.4",
++ "objc2-foundation 0.3.2",
++ "serde",
++ "serde_json",
++ "serde_repr",
++ "swift-rs",
++ "tauri",
++ "tauri-plugin",
++ "thiserror 2.0.20",
++ "time",
++]
++
+ [[package]]
+ name = "tauri-plugin-notification"
+ version = "2.4.0"
+@@ -4594,7 +4714,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "cdb87b95ec50ddfa440816d227a17b2ccbdda963a316a727fda0fc4334f7d134"
+ dependencies = [
+  "deranged",
++ "libc",
+  "num-conv",
++ "num_threads",
+  "powerfmt",
+  "serde_core",
+  "time-core",
+@@ -5035,7 +5157,6 @@ version = "0.3.0"
+ dependencies = [
+  "base64 0.22.1",
+  "crc32fast",
+- "env_logger",
+  "futures-util",
+  "hex",
+  "hmac",
+@@ -5044,6 +5165,7 @@ dependencies = [
+  "objc2 0.5.2",
+  "objc2-app-kit 0.2.2",
+  "objc2-foundation 0.2.2",
++ "rcgen",
+  "ring",
+  "rusqlite",
+  "rustls",
+@@ -5054,12 +5176,15 @@ dependencies = [
+  "tauri-build",
+  "tauri-plugin-autostart",
+  "tauri-plugin-dialog",
++ "tauri-plugin-log",
+  "tauri-plugin-notification",
+  "tauri-plugin-shell",
+  "tauri-plugin-single-instance",
+  "tokio",
++ "tokio-rustls",
+  "tokio-tungstenite",
+  "uuid",
++ "webpki-roots 0.26.11",
+  "whoami",
+  "windows 0.58.0",
+ ]
+@@ -5107,12 +5232,6 @@ version = "1.0.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
+ 
+-[[package]]
+-name = "utf8parse"
+-version = "0.2.2"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
+-
+ [[package]]
+ name = "uuid"
+ version = "1.26.1"
+@@ -6027,6 +6146,34 @@ dependencies = [
+  "pkg-config",
+ ]
+ 
++[[package]]
++name = "x509-parser"
++version = "0.18.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "d43b0f71ce057da06bc0851b23ee24f3f86190b07203dd8f567d0b706a185202"
++dependencies = [
++ "asn1-rs",
++ "data-encoding",
++ "der-parser",
++ "lazy_static",
++ "nom",
++ "oid-registry",
++ "ring",
++ "rusticata-macros",
++ "thiserror 2.0.20",
++ "time",
++]
++
++[[package]]
++name = "yasna"
++version = "0.6.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b5f6765e852b9b4dc8e2a76843e4d64d1cea8e79bcde0b6901aea8e7c7f08282"
++dependencies = [
++ "bit-vec 0.9.1",
++ "time",
++]
++
+ [[package]]
+ name = "yoke"
+ version = "0.8.3"
+diff --git a/client/src-tauri/Cargo.toml b/client/src-tauri/Cargo.toml
+index fbf512b..7065587 100644
+--- a/client/src-tauri/Cargo.toml
++++ b/client/src-tauri/Cargo.toml
+@@ -30,6 +30,10 @@ tokio = { version = "1.38", features = ["full"] }
+ futures-util = "0.3"
+ tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
+ rustls = { version = "0.23", features = ["ring"] }
++# 与 tokio-tungstenite 的 rustls-tls-webpki-roots feature 拉进来的是同一份
++# （lock 里 0.26.11，零新增 crate）。显式声明是因为「信任指定证书」这一档
++# 必须自建 ClientConfig，而自建就得自己装根存储。
++webpki-roots = "0.26"
+ # ring 本来就在依赖树里（rustls 的 ring feature），这里显式声明是为了直接用它的
+ # aead/hkdf。版本必须与 rustls 解析出的一致（当前 0.17.14），否则依赖树会出现两份。
+ ring = "0.17"
+@@ -42,7 +46,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
+ hmac = "0.12"
+ hex = "0.4"
+ log = "0.4"
+-env_logger = "0.11"
++# 取代 env_logger：后者只往 stderr 写，而 GUI 双击启动时 stderr 被 launchd 收走，
++# 用户报障时拿不出任何日志。插件自带轮转、保留期与各平台标准日志目录。
++tauri-plugin-log = "2"
+ 
+ [target.'cfg(target_os = "windows")'.dependencies]
+ windows = { version = "0.58", features = [
+@@ -57,3 +63,13 @@ windows = { version = "0.58", features = [
+ objc2 = "0.5"
+ objc2-foundation = { version = "0.2", features = ["NSString", "NSArray", "NSURL", "NSData"] }
+ objc2-app-kit = { version = "0.2", features = ["NSPasteboard", "NSPasteboardItem"] }
++
++[dev-dependencies]
++# 只为 tls_trust 的端到端分类测试而在：起一个本地自签 TLS 监听器，真握一次手，
++# 验证 tokio-rustls 产出的 io::Error 确实能被本包这份 rustls downcast 回来。
++# 手工构造的错误证明不了这一点——它绕过了"两处 rustls 必须是同一个 crate 实例"
++# 这个前提，而那正是分类唯一可能静默失效的地方。
++rcgen = "0.14"
++# 关掉默认的 aws_lc_rs，跟生产代码一样走 ring：让测试里的 provider 与
++# 真实运行时一致，否则测的就不是同一条路径了。
++tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+diff --git a/client/src-tauri/src/commands/settings_cmd.rs b/client/src-tauri/src/commands/settings_cmd.rs
+index f84faa5..861a6ba 100644
+--- a/client/src-tauri/src/commands/settings_cmd.rs
++++ b/client/src-tauri/src/commands/settings_cmd.rs
+@@ -47,18 +47,37 @@ pub struct AppSettings {
+     #[serde(default = "default_cache_max_size_mb")]
+     pub cache_max_size_mb: u32,
+ 
+-    /// 允许不安全的 TLS 连接：跳过服务器证书校验。
++    /// 【迁移专用，TLS 代码一律不要读它】跳过服务器证书校验的老开关。
+     ///
+-    /// 需要它的部署有三类：自签证书、直连 IP（证书上没有对应名字）、
+-    /// 以及证书由**非公共 CA**（企业内部 CA）签发——webpki 根存储不含后者，
+-    /// 所以合法的内部证书同样过不了默认校验。
++    /// 保留它只为两件事：读得懂老库；以及用户降级回旧版本时，旧版仍能读到
++    /// 正确的值。真正的读取入口是 `effective_trust_mode()`。
++    ///
++    /// Rust 侧加 `legacy_` 前缀而 serde 保留原 key，是为了让"直接读这个字段"
++    /// 在代码里长得就可疑——它现在只是三档枚举的一个投影，单独看会得出错误结论
++    /// （Pinned 档下它是 false，但那并不意味着走的是纯公共 CA 校验）。
+     ///
+     /// 这里用裸 `#[serde(default)]` 是对的，与上面几个字段相反：
+-    /// `bool` 的 `Default` 是 `false`，而 `false` 恰好是安全值，
+-    /// 老库升级后默认变成「校验证书」。上面那些字段之所以要自定义 default，
+-    /// 是因为它们的零值 `0` 被定义成「关闭限制」——不安全的那一侧。
++    /// `bool` 的 `Default` 是 `false`，而 `false` 恰好是安全值。
++    /// 上面那些字段之所以要自定义 default，是因为它们的零值 `0` 被定义成
++    /// 「关闭限制」——不安全的那一侧。
++    #[serde(rename = "allow_insecure_tls", default)]
++    pub legacy_allow_insecure_tls: bool,
++
++    /// TLS 信任档位。`None` = 老库里根本没有这个键，交给
++    /// `effective_trust_mode()` 做迁移。
++    ///
++    /// 刻意用 `Option` 而不是 `#[serde(default = "...")]`：「这是一个老库」
++    /// 必须是个能表达、也能被测试直接断言的状态，否则迁移逻辑就没有可钉的对象。
+     #[serde(default)]
+-    pub allow_insecure_tls: bool,
++    pub tls_trust_mode: Option<crate::core::tls_trust::TlsTrustMode>,
++
++    /// 「信任指定证书」档下用户填的证书 SHA-256 指纹，每条一项。
++    ///
++    /// 存原样字符串而不是解析后的字节：设置面板要把用户填的内容原样显示回去，
++    /// 而规范化（去冒号、转小写）会让他看到一串跟自己粘进去的不一样的东西。
++    /// 解析在保存时做一次，失败当场报错。
++    #[serde(default)]
++    pub pinned_cert_sha256: Vec<String>,
+ 
+     /// 是否对传输内容做端到端加密。
+     ///
+@@ -117,6 +136,43 @@ fn default_cache_sweep_interval_minutes() -> u32 {
+ }
+ 
+ impl AppSettings {
++    /// 三档信任的**唯一**读取入口。
++    ///
++    /// 老库里 `tls_trust_mode` 这个键根本不存在，所以必须能从老的
++    /// `allow_insecure_tls` 推出来——而且推的方向要对：
++    /// 显式关过校验的用户必须原样保持 Insecure，否则升级之后他会突然连不上，
++    /// 而界面上看不出任何东西变了。
++    pub fn effective_trust_mode(&self) -> crate::core::tls_trust::TlsTrustMode {
++        use crate::core::tls_trust::TlsTrustMode;
++        match self.tls_trust_mode {
++            Some(m) => m,
++            None if self.legacy_allow_insecure_tls => TlsTrustMode::Insecure,
++            // 键不存在、或存着 false：落到安全的那一侧。
++            // 这一支就是 legacy_db_without_tls_fields_defaults_to_public_ca 钉的东西。
++            None => TlsTrustMode::PublicCa,
++        }
++    }
++
++    /// 解析出连接层真正要用的信任配置。指纹格式错误在这里暴露。
++    pub fn tls_trust_config(&self) -> Result<crate::core::tls_trust::TlsTrustConfig, String> {
++        crate::core::tls_trust::TlsTrustConfig::new(
++            self.effective_trust_mode(),
++            &self.pinned_cert_sha256,
++        )
++    }
++
++    /// 把枚举回写成老 bool，保持两者一致。
++    ///
++    /// 为什么要回写：用户降级到旧版本时，旧版只认得 `allow_insecure_tls`。
++    /// Pinned 档在旧版本上会落成 `false`（= 严格校验）而连不上——
++    /// 那是**安全方向**的失败，正是降级时想要的形态。
++    pub fn normalize_tls_trust(&mut self) {
++        let mode = self.effective_trust_mode();
++        self.tls_trust_mode = Some(mode);
++        self.legacy_allow_insecure_tls =
++            matches!(mode, crate::core::tls_trust::TlsTrustMode::Insecure);
++    }
++
+     /// 首次启动与反序列化失败时的兜底配置（唯一定义点，避免多处字面量漏改）
+     pub fn default_config() -> Self {
+         Self {
+@@ -130,7 +186,9 @@ impl AppSettings {
+             cache_ttl_hours: crate::core::retention::DEFAULT_CACHE_TTL_HOURS,
+             cache_max_size_mb: crate::core::retention::DEFAULT_CACHE_MAX_SIZE_MB,
+             cache_sweep_interval_minutes: crate::core::retention::DEFAULT_SWEEP_INTERVAL_MINUTES,
+-            allow_insecure_tls: false,
++            legacy_allow_insecure_tls: false,
++            tls_trust_mode: Some(crate::core::tls_trust::TlsTrustMode::PublicCa),
++            pinned_cert_sha256: Vec::new(),
+             e2ee_enabled: true,
+         }
+     }
+@@ -197,6 +255,21 @@ pub async fn cmd_save_settings(
+     clean_settings.cache_sweep_interval_minutes =
+         crate::core::retention::effective_sweep_interval_minutes(&clean_settings);
+ 
++    // 指纹在**保存时**解析，不在重连循环里。
++    //
++    // 格式写错要在这里当场以精确原因回给用户（他刚粘完，还知道自己粘了什么）；
++    // 留到连接时才发现，就只剩一次次查不出原因的握手失败。
++    clean_settings.pinned_cert_sha256 = clean_settings
++        .pinned_cert_sha256
++        .iter()
++        .map(|s| s.trim().to_string())
++        .filter(|s| !s.is_empty())
++        .collect();
++    let trust_config = clean_settings.tls_trust_config()?;
++
++    // 枚举与老 bool 保持一致，理由见 normalize_tls_trust。
++    clean_settings.normalize_tls_trust();
++
+     let json_str = serde_json::to_string(&clean_settings).map_err(|e| e.to_string())?;
+     {
+         let conn = state.db_conn.lock().await;
+@@ -217,7 +290,7 @@ pub async fn cmd_save_settings(
+         cfg.server_url = clean_settings.server_url.clone();
+         cfg.account_id = clean_settings.account_id.clone();
+         cfg.psk_secret = clean_settings.psk_secret.clone();
+-        cfg.allow_insecure_tls = clean_settings.allow_insecure_tls;
++        cfg.tls_trust = trust_config;
+     }
+ 
+     // 3. Clear online devices from previous server/account and notify frontend
+@@ -338,6 +411,7 @@ pub async fn cmd_set_autostart(app: AppHandle, enabled: bool) -> Result<(), Stri
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use crate::core::tls_trust::TlsTrustMode;
+ 
+     /// 老库里的 JSON 没有 start_minimized 字段，却**有**已被删除的
+     /// rate_limit_mb 字段。本测试同时守护两个方向：
+@@ -538,9 +612,10 @@ mod tests {
+     }
+ 
+     #[test]
+-    fn allow_insecure_tls_defaults_to_secure_on_legacy_db() {
+-        // 老库的 JSON 没有这个字段，缺省必须是 false（= 校验证书）。
+-        // bool 的 Default 恰好是安全值，这也是它可以用裸 serde(default) 的原因。
++    fn legacy_db_without_tls_fields_defaults_to_public_ca() {
++        // 老库的 JSON 两个 TLS 字段都没有，缺省必须落在安全的一侧。
++        // bool 的 Default 恰好是安全值，这也是它可以用裸 serde(default) 的原因；
++        // 加了枚举之后这条结论仍然要成立，所以这条测试跟着改名留下来。
+         let legacy = r#"{
+             "server_url": "wss://example.com",
+             "account_id": "acct",
+@@ -548,7 +623,88 @@ mod tests {
+             "auto_inject": false
+         }"#;
+         let parsed: AppSettings = serde_json::from_str(legacy).expect("反序列化失败");
+-        assert!(!parsed.allow_insecure_tls, "老库升级后必须默认校验证书");
+-        assert!(!AppSettings::default_config().allow_insecure_tls);
++        assert!(!parsed.legacy_allow_insecure_tls, "老库升级后必须默认校验证书");
++        assert_eq!(parsed.effective_trust_mode(), TlsTrustMode::PublicCa);
++        assert_eq!(
++            AppSettings::default_config().effective_trust_mode(),
++            TlsTrustMode::PublicCa
++        );
++    }
++
++    #[test]
++    fn legacy_db_with_allow_insecure_true_migrates_to_insecure() {
++        // 显式关过校验的用户必须原样保持，否则升级后突然连不上，
++        // 而界面上看不出任何东西变了。
++        let legacy = r#"{
++            "server_url": "wss://example.com",
++            "account_id": "acct",
++            "psk_secret": "secret",
++            "auto_inject": false,
++            "allow_insecure_tls": true
++        }"#;
++        let parsed: AppSettings = serde_json::from_str(legacy).expect("反序列化失败");
++        assert_eq!(parsed.effective_trust_mode(), TlsTrustMode::Insecure);
++    }
++
++    #[test]
++    fn explicit_mode_wins_over_legacy_flag() {
++        // 新键在就以新键为准——老 bool 只是它的投影，不该反过来干扰。
++        let json = r#"{
++            "server_url": "wss://example.com",
++            "account_id": "acct",
++            "psk_secret": "secret",
++            "auto_inject": false,
++            "allow_insecure_tls": true,
++            "tls_trust_mode": "public_ca"
++        }"#;
++        let parsed: AppSettings = serde_json::from_str(json).expect("反序列化失败");
++        assert_eq!(parsed.effective_trust_mode(), TlsTrustMode::PublicCa);
++    }
++
++    #[test]
++    fn normalize_keeps_legacy_flag_in_sync() {
++        let mut s = AppSettings::default_config();
++
++        // Pinned 在旧版本上落成 false（= 严格校验）而连不上：
++        // 安全方向的失败，正是降级时想要的形态。
++        s.tls_trust_mode = Some(TlsTrustMode::Pinned);
++        s.normalize_tls_trust();
++        assert!(!s.legacy_allow_insecure_tls);
++
++        s.tls_trust_mode = Some(TlsTrustMode::Insecure);
++        s.normalize_tls_trust();
++        assert!(s.legacy_allow_insecure_tls, "降级回旧版本时必须仍是关校验");
++
++        s.tls_trust_mode = Some(TlsTrustMode::PublicCa);
++        s.normalize_tls_trust();
++        assert!(!s.legacy_allow_insecure_tls);
++    }
++
++    #[test]
++    fn pinned_mode_requires_at_least_one_fingerprint() {
++        let mut s = AppSettings::default_config();
++        s.tls_trust_mode = Some(TlsTrustMode::Pinned);
++        assert!(s.tls_trust_config().is_err(), "空指纹的 Pinned 档等于没有任何信任来源");
++    }
++
++    #[test]
++    fn malformed_pin_is_rejected() {
++        let mut s = AppSettings::default_config();
++        s.tls_trust_mode = Some(TlsTrustMode::Pinned);
++        s.pinned_cert_sha256 = vec!["not-a-fingerprint".to_string()];
++        assert!(s.tls_trust_config().is_err());
++    }
++
++    #[test]
++    fn openssl_style_fingerprint_is_accepted() {
++        // 用户最可能直接粘 openssl 的整行输出，连前缀带冒号。
++        let mut s = AppSettings::default_config();
++        s.tls_trust_mode = Some(TlsTrustMode::Pinned);
++        s.pinned_cert_sha256 = vec![
++            "SHA256 Fingerprint=AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:\
++             AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89"
++                .to_string(),
++        ];
++        assert!(s.tls_trust_config().is_ok(), "openssl 原样输出必须能直接粘进来");
+     }
+ }
+diff --git a/client/src-tauri/src/core/connection_actor.rs b/client/src-tauri/src/core/connection_actor.rs
+index 7c44fdc..7bd104e 100644
+--- a/client/src-tauri/src/core/connection_actor.rs
++++ b/client/src-tauri/src/core/connection_actor.rs
+@@ -8,6 +8,7 @@ use tauri::Emitter;
+ use tokio_tungstenite::tungstenite::Message;
+ use uuid::Uuid;
+ 
++use crate::core::tls_trust::{self, create_tls_connector};
+ use crate::protocol::{ActionType, AuthChallengePayload, AuthRequestPayload, AuthResponsePayload, ControlEnvelope};
+ 
+ type HmacSha256 = Hmac<Sha256>;
+@@ -22,118 +23,12 @@ pub struct ConnectionConfig {
+     pub os_type: String,
+     pub app_version: String,
+ 
+-    /// 跳过 TLS 服务器证书校验。默认 false。
++    /// TLS 信任策略。默认只信任公共根证书库。
+     ///
+-    /// 见 `create_tls_connector`：打开它就等于接受任何出示证书的中间人。
+-    pub allow_insecure_tls: bool,
++    /// 见 `tls_trust::create_tls_connector`：Insecure 档等于接受任何出示证书的中间人。
++    pub tls_trust: tls_trust::TlsTrustConfig,
+ }
+ 
+-/// 一个**不校验服务器身份**的证书校验器。
+-///
+-/// `verify_server_cert` 无条件返回成功：它不看证书链、不看域名、不看有效期。
+-/// 后果要说清楚——启用之后，任何位于中间的人只要出示一张自签证书就能接管
+-/// 这条连接，读走经由它传输的剪贴板明文与文件字节。TLS 仍在加密，但加密的
+-/// 对端是谁不再有任何保证。
+-///
+-/// 它只在用户显式勾选「允许不安全连接」时才被装上，用于自签证书、IP 直连、
+-/// 或证书由非公共 CA 签发的内网部署。下面两个签名校验函数是真的——
+-/// 握手本身仍需自洽，只是「对方是不是你要找的那台服务器」不再被验证。
+-///
+-/// 改名自 `CustomServerCertVerifier`：原名听起来像是某种定制策略，
+-/// 而它实际做的事只有「跳过」。
+-#[derive(Debug)]
+-pub struct InsecureServerCertVerifier(pub Arc<rustls::crypto::CryptoProvider>);
+-
+-impl rustls::client::danger::ServerCertVerifier for InsecureServerCertVerifier {
+-    fn verify_server_cert(
+-        &self,
+-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+-        _server_name: &rustls::pki_types::ServerName<'_>,
+-        _ocsp_response: &[u8],
+-        _now: rustls::pki_types::UnixTime,
+-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+-        Ok(rustls::client::danger::ServerCertVerified::assertion())
+-    }
+-
+-    fn verify_tls12_signature(
+-        &self,
+-        message: &[u8],
+-        cert: &rustls::pki_types::CertificateDer<'_>,
+-        dss: &rustls::DigitallySignedStruct,
+-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+-    }
+-
+-    fn verify_tls13_signature(
+-        &self,
+-        message: &[u8],
+-        cert: &rustls::pki_types::CertificateDer<'_>,
+-        dss: &rustls::DigitallySignedStruct,
+-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+-    }
+-
+-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+-        self.0.signature_verification_algorithms.supported_schemes()
+-    }
+-}
+-
+-/// 构造 WebSocket 的 TLS 连接器。
+-///
+-/// `allow_insecure = false`（默认）时返回 `None`，由 tokio-tungstenite 走它
+-/// 自带的 webpki 根证书校验。刻意**不**在这里手搓 `ClientConfig`：
+-/// `rustls-tls-webpki-roots` 是 tokio-tungstenite 的 feature，它不会把
+-/// `webpki_roots` 这个 crate 注入本包，自己构造就得额外声明一条依赖，
+-/// 而交给它自己加载既省依赖、也少一处可能配错的地方。
+-///
+-/// `allow_insecure = true` 时才装上 `InsecureServerCertVerifier`——
+-/// 读那个类型上的注释，它说明了代价。
+-///
+-/// 改造前这里**无条件**装载那个跳过校验的 verifier，也就是说即便连的是
+-/// `wss://`，中间人也照样能接管连接。默认走真实校验是本轮的目的之一。
+-pub fn create_tls_connector(allow_insecure: bool) -> Option<tokio_tungstenite::Connector> {
+-    // 两档都要装 provider，即便默认档马上就 return None。
+-    //
+-    // 返回 None 之后由 tokio-tungstenite 自己构建 ClientConfig，而 rustls 0.23
+-    // 在依赖树里同时存在 ring 与 aws-lc-rs 时（本项目正是如此）无法自动选定
+-    // provider，会直接 panic 而不是返回 Err——发生在连接 actor 的 task 里，
+-    // 整个重连循环就此死掉。
+-    //
+-    // 今天 lib.rs 的 run() 开头已经装过一次，所以这行是冗余的；写在这里是因为
+-    // 默认档不该依赖一个远在别处的副作用才能不 panic。insecure 档本来就自带
+-    // 初始化，只有默认档赤裸着——而它恰恰是绝大多数用户走的那条路。
+-    let _ = rustls::crypto::ring::default_provider().install_default();
+-
+-    if !allow_insecure {
+-        return None;
+-    }
+-
+-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+-    let client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
+-        .with_safe_default_protocol_versions()
+-        .expect("valid tls protocol versions")
+-        .dangerous()
+-        .with_custom_certificate_verifier(Arc::new(InsecureServerCertVerifier(provider)))
+-        .with_no_client_auth();
+-
+-    Some(tokio_tungstenite::Connector::Rustls(Arc::new(client_config)))
+-}
+-
+-/// 判断一个 tungstenite 错误是否为 TLS 证书校验失败。
+-///
+-/// rustls 把证书问题归到 `rustls::Error::InvalidCertificate`，经 tungstenite
+-/// 包装后只剩下 IO/Tls 层的字符串，因此这里按错误文本匹配。这不优雅，也不够
+-/// 稳固——rustls 改文案就会漏判——但漏判的后果只是退回到通用的「连接失败」
+-/// 提示，不会误导用户去关掉校验，所以这个不精确是可接受的方向。
+-fn is_cert_error(err: &tokio_tungstenite::tungstenite::Error) -> bool {
+-    let text = err.to_string();
+-    text.contains("certificate")
+-        || text.contains("CertificateError")
+-        || text.contains("UnknownIssuer")
+-        || text.contains("NotValidForName")
+-        || text.contains("invalid peer certificate")
+-}
+ 
+ pub struct ConnectionActor {
+     config: Arc<RwLock<ConnectionConfig>>,
+@@ -198,7 +93,10 @@ impl ConnectionActor {
+             };
+             log::info!("Connecting to control server: {}", ws_url);
+ 
+-            let connector = create_tls_connector(current_cfg.allow_insecure_tls);
++            // 控制面装证书观察器：证书失败时要把实际看到的指纹报给用户，
++            // 让他能跟服务器上那张证书核对。数据面不装（见 create_tls_connector）。
++            let observer = tls_trust::CertObserver::new();
++            let connector = create_tls_connector(&current_cfg.tls_trust, Some(observer.clone()));
+             match tokio_tungstenite::connect_async_tls_with_config(&ws_url, None, false, connector).await {
+                 Ok((ws_stream, _)) => {
+                     log::info!("Connected to control server");
+@@ -358,21 +256,22 @@ impl ConnectionActor {
+                 }
+                 Err(err) => {
+                     // 证书失败要单独报，否则用户只会看到反复重连，
+-                    // 完全无从知道是「证书不受信任」还是服务端没起来——
+-                    // 而这正是本轮默认开启校验之后，自签证书部署升级时的第一现场。
+-                    if is_cert_error(&err) && !current_cfg.allow_insecure_tls {
+-                        log::warn!("TLS certificate verification failed: {}", err);
+-                        let _ = app_handle.emit(
+-                            "tls-cert-failed",
+-                            format!(
+-                                "无法验证服务器证书：{}。\n\
+-                                 若服务端使用自签证书、直连 IP，或证书由非公共 CA 签发，\
+-                                 请在「设置」中勾选「允许不安全连接」。",
++                    // 完全无从知道是证书问题还是服务端没起来。
++                    //
++                    // 发的是结构化的分类结果而不是一句拼好的话：处置动作因档而异，
++                    // 拼字符串的做法逼着所有档共用一句建议，而那句建议
++                    // （「勾选允许不安全连接」）对其中几档是错的。
++                    match tls_trust::classify(&err) {
++                        Some(mut failure) if !current_cfg.tls_trust.skips_verification() => {
++                            failure.observed_cert_sha256 = observer.observed();
++                            log::warn!(
++                                "TLS certificate verification failed [{}]: {}",
++                                failure.kind.tag(),
+                                 err
+-                            ),
+-                        );
+-                    } else {
+-                        log::warn!("Connection failed: {}, retrying...", err);
++                            );
++                            let _ = app_handle.emit("tls-cert-failed", &failure);
++                        }
++                        _ => log::warn!("Connection failed: {}, retrying...", err),
+                     }
+                 }
+             }
+diff --git a/client/src-tauri/src/core/mod.rs b/client/src-tauri/src/core/mod.rs
+index 8fcc0b1..bf14b59 100644
+--- a/client/src-tauri/src/core/mod.rs
++++ b/client/src-tauri/src/core/mod.rs
+@@ -6,6 +6,7 @@ pub mod path_guard;
+ pub mod retention;
+ pub mod sliding_window;
+ pub mod startup;
++pub mod tls_trust;
+ pub mod transfer_engine;
+ 
+ pub use cache_manager::*;
+@@ -16,4 +17,5 @@ pub use path_guard::*;
+ pub use retention::*;
+ pub use sliding_window::*;
+ pub use startup::*;
++pub use tls_trust::*;
+ pub use transfer_engine::*;
+diff --git a/client/src-tauri/src/core/transfer_engine.rs b/client/src-tauri/src/core/transfer_engine.rs
+index ac9aff9..fd9eaa0 100644
+--- a/client/src-tauri/src/core/transfer_engine.rs
++++ b/client/src-tauri/src/core/transfer_engine.rs
+@@ -16,7 +16,7 @@ use uuid::Uuid;
+ 
+ use crate::app_state::AppState;
+ use crate::core::cache_manager::CacheManager;
+-use crate::core::connection_actor::create_tls_connector;
++use crate::core::tls_trust::create_tls_connector;
+ use crate::core::path_guard::PathGuard;
+ use crate::core::sliding_window::SlidingWindow;
+ use crate::platform::show_transfer_notification;
+@@ -47,6 +47,29 @@ pub enum TransferSource {
+     Memory(Vec<u8>),
+ }
+ 
++/// 把 URL 查询串里的 `token=` 值抹掉，供日志输出使用。
++///
++/// 数据面 URL 把一次性会话令牌拼在查询串里，而这两条连接日志是 `info` 级别。
++/// 在日志只走 stderr、且默认级别是 `Error` 的年代这不构成问题——什么都没输出。
++/// 接入落盘日志后它就变成了「每传一次文件，令牌写一次磁盘」，
++/// 所以脱敏必须与日志改造同批次落地，不能分开做。
++///
++/// 只处理 `token`：同在查询串里的 session_id / device_id 都不是凭据，
++/// 而它们恰恰是排查时最需要看到的东西。
++fn redact_query_token(url: &str) -> String {
++    let Some(start) = url.find("token=") else {
++        return url.to_string();
++    };
++    let value_start = start + "token=".len();
++    // 令牌是查询串末位参数，但不能假定它一直是——否则哪天换了顺序，
++    // 脱敏会静默地把后面所有参数一起吃掉。
++    let value_end = url[value_start..]
++        .find('&')
++        .map(|i| value_start + i)
++        .unwrap_or(url.len());
++    format!("{}<redacted>{}", &url[..value_start], &url[value_end..])
++}
++
+ /// Best-effort history status update; failures are logged only.
+ ///
+ /// 注意 `conn` guard 的作用域**就是本函数体**。任何需要再次取 `db_conn` 锁的动作
+@@ -259,7 +282,7 @@ impl TransferEngine {
+         server_url: String,
+         // 与 server_url 同路取自设置：数据面必须与控制面用同一套 TLS 策略，
+         // 否则用户在界面上关掉的校验会在这条连接上悄悄恢复（反之亦然）。
+-        allow_insecure_tls: bool,
++        tls_trust: crate::core::tls_trust::TlsTrustConfig,
+         session_id: String,
+         token: String,
+         from_device: String,
+@@ -288,7 +311,7 @@ impl TransferEngine {
+             )
+         };
+ 
+-        log::info!("Sender connecting to data plane: {}", ws_data_url);
++        log::info!("Sender connecting to data plane: {}", redact_query_token(&ws_data_url));
+ 
+         // 与控制面同一套 TLS 策略：默认校验证书，勾选后才跳过。
+         //
+@@ -299,7 +322,7 @@ impl TransferEngine {
+             &ws_data_url,
+             None,
+             false,
+-            create_tls_connector(allow_insecure_tls),
++            create_tls_connector(&tls_trust, None),
+         )
+         .await
+         {
+@@ -602,7 +625,7 @@ impl TransferEngine {
+     /// Connects to /ws/data as Receiver, writes chunks into sandbox, verifies SHA256 and sends ACKs (P0-3, P1-6).
+     pub async fn start_receiver_task(
+         server_url: String,
+-        allow_insecure_tls: bool,
++        tls_trust: crate::core::tls_trust::TlsTrustConfig,
+         session_id: String,
+         token: String,
+         from_device: String,
+@@ -646,7 +669,7 @@ impl TransferEngine {
+             )
+         };
+ 
+-        log::info!("Receiver connecting to data plane: {}", ws_data_url);
++        log::info!("Receiver connecting to data plane: {}", redact_query_token(&ws_data_url));
+ 
+         // 与控制面同一套 TLS 策略：默认校验证书，勾选后才跳过。
+         //
+@@ -657,7 +680,7 @@ impl TransferEngine {
+             &ws_data_url,
+             None,
+             false,
+-            create_tls_connector(allow_insecure_tls),
++            create_tls_connector(&tls_trust, None),
+         )
+         .await
+         {
+@@ -1193,6 +1216,31 @@ mod tests {
+     use crate::protocol::MAX_PAYLOAD_LENGTH;
+     use std::io::Write;
+ 
++    #[test]
++    fn redacts_token_at_end_of_query_string() {
++        let url = "wss://h/ws/data?session_id=abc&role=sender&device_id=d1&token=secret-tok";
++        let out = redact_query_token(url);
++        assert!(!out.contains("secret-tok"), "令牌泄漏进日志: {out}");
++        assert!(out.ends_with("token=<redacted>"));
++        // 排查需要的字段必须原样保留
++        assert!(out.contains("session_id=abc"));
++        assert!(out.contains("device_id=d1"));
++    }
++
++    #[test]
++    fn redacts_token_in_middle_and_keeps_trailing_params() {
++        // 今天 token 恰好在末位，这条钉的是「换了顺序也不会把后面的参数一起吃掉」。
++        let url = "wss://h/ws/data?token=secret-tok&session_id=abc";
++        let out = redact_query_token(url);
++        assert_eq!(out, "wss://h/ws/data?token=<redacted>&session_id=abc");
++    }
++
++    #[test]
++    fn url_without_token_is_unchanged() {
++        let url = "wss://h/ws/control?device_id=d1";
++        assert_eq!(redact_query_token(url), url);
++    }
++
+     #[test]
+     fn test_prepare_offer_aligns_valid_paths_and_skips_dirs() {
+         let temp_dir = std::env::temp_dir().join(format!("unidrop_test_{}", Uuid::new_v4()));
+diff --git a/client/src-tauri/src/lib.rs b/client/src-tauri/src/lib.rs
+index 6ab23ce..59c9a9c 100644
+--- a/client/src-tauri/src/lib.rs
++++ b/client/src-tauri/src/lib.rs
+@@ -59,9 +59,20 @@ fn derive_key_for(
+ }
+ 
+ pub fn run() {
+-    env_logger::init();
+     let _ = rustls::crypto::ring::default_provider().install_default();
+ 
++    // 启动期日志缓冲。
++    //
++    // tauri-plugin-log 要到 `tauri::Builder::run()` 才把 logger 挂上去，而下面的
++    // 建库、设置反序列化、存量历史认领全发生在那之前——直接 log! 会写进一个
++    // 还没人接管的 logger，整条丢掉。其中就包括「设置解析失败、用户配置被全量
++    // 重置」那一条，恰恰是本文件里后果最严重、也最需要事后排查的一条。
++    //
++    // 所以这一段先攒着，进 `.setup()` 后原样重放。用缓冲而不是把 init_database /
++    // AppState::new 整体搬进 .setup()，是因为后者要动 .manage() 的构造顺序，
++    // 风险与收益不成比例。
++    let mut startup_log: Vec<(log::Level, String)> = Vec::new();
++
+     // 1. Initialize SQLite local database and persistent identity (P1-4, P1-5)
+     let db = init_database(None).expect("Failed to initialize SQLite database");
+     let device_id = storage::db::get_or_create_device_id(&db).expect("Failed to get/create device_id");
+@@ -70,7 +81,10 @@ pub fn run() {
+         let mut loaded = serde_json::from_str::<commands::settings_cmd::AppSettings>(&json_str)
+             .unwrap_or_else(|e| {
+                 // 走到这里意味着用户已存的配置会被全量丢弃，必须留下痕迹
+-                log::warn!("Failed to parse persisted settings ({}), falling back to defaults", e);
++                startup_log.push((
++                    log::Level::Warn,
++                    format!("Failed to parse persisted settings ({}), falling back to defaults", e),
++                ));
+                 commands::settings_cmd::AppSettings::default_config()
+             });
+         if loaded.server_url == "ws://127.0.0.1:8080" {
+@@ -99,11 +113,20 @@ pub fn run() {
+     if commands::settings_cmd::validate_account_id(&initial_settings.account_id).is_ok() {
+         match storage::db::claim_unowned_history(&db, &initial_settings.account_id) {
+             Ok(0) => {}
+-            Ok(n) => log::info!("Claimed {} legacy history rows for account {}", n, initial_settings.account_id),
+-            Err(e) => log::warn!("Failed to claim legacy history rows: {}", e),
++            Ok(n) => startup_log.push((
++                log::Level::Info,
++                format!("Claimed {} legacy history rows for account {}", n, initial_settings.account_id),
++            )),
++            Err(e) => startup_log.push((
++                log::Level::Warn,
++                format!("Failed to claim legacy history rows: {}", e),
++            )),
+         }
+     } else {
+-        log::warn!("Skipped claiming legacy history: current account id is invalid");
++        startup_log.push((
++            log::Level::Warn,
++            "Skipped claiming legacy history: current account id is invalid".to_string(),
++        ));
+     }
+ 
+     let config = ConnectionConfig {
+@@ -114,7 +137,15 @@ pub fn run() {
+         hostname: app_state::whoami_hostname(),
+         os_type: std::env::consts::OS.to_string(),
+         app_version: app_state::APP_VERSION.to_string(),
+-        allow_insecure_tls: initial_settings.allow_insecure_tls,
++        // 指纹解析失败不能让应用起不来：回落到最安全的一档，
++        // 用户进设置页改指纹时会再看到一次精确的报错。
++        tls_trust: initial_settings.tls_trust_config().unwrap_or_else(|e| {
++            startup_log.push((
++                log::Level::Warn,
++                format!("证书指纹配置无效（{e}），本次启动按「仅信任公共 CA」处理"),
++            ));
++            core::tls_trust::TlsTrustConfig::public_ca()
++        }),
+     };
+ 
+     let config_actor = Arc::new(tokio::sync::RwLock::new(config));
+@@ -143,6 +174,29 @@ pub fn run() {
+     let start_minimized_on_launch = initial_settings.start_minimized;
+ 
+     tauri::Builder::default()
++        // 日志插件放在最前：它之后注册的插件若有启动期日志，才有人接得住。
++        //
++        // 级别压到 Info；tungstenite 两个 crate 单独压到 Warn——它们在 Debug/Info
++        // 级别会把每一帧 WebSocket 都打出来，落盘后正常传一次文件就能刷掉几 MB，
++        // 把真正要看的那几行冲走。
++        .plugin(
++            tauri_plugin_log::Builder::new()
++                .level(log::LevelFilter::Info)
++                .level_for("tokio_tungstenite", log::LevelFilter::Warn)
++                .level_for("tungstenite", log::LevelFilter::Warn)
++                .target(tauri_plugin_log::Target::new(
++                    tauri_plugin_log::TargetKind::LogDir { file_name: Some("unidrop".into()) },
++                ))
++                .target(tauri_plugin_log::Target::new(
++                    tauri_plugin_log::TargetKind::Stdout,
++                ))
++                // 上限与 KeepOne 是刻意的：日志和缓存争同一块磁盘，而本仓库对
++                // 缓存已经立了「按量按时清理」的规矩（见 cache_max_size_mb），
++                // 日志不该是那条规矩之外的例外。最坏占用 2 个文件 4 MB。
++                .max_file_size(2 * 1024 * 1024)
++                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
++                .build(),
++        )
+         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+             // 系统拉起的第二实例（带 --silent）不该抢焦点；用户双击图标的必须唤起
+             if !core::startup::should_focus_second_instance(&args) {
+@@ -163,6 +217,11 @@ pub fn run() {
+         .plugin(tauri_plugin_dialog::init())
+         .manage(app_state)
+         .setup(move |app| {
++            // logger 此时才真正就绪，把启动期攒下的日志原样放出来。
++            for (level, msg) in startup_log.drain(..) {
++                log::log!(level, "{}", msg);
++            }
++
+             let app_handle = app.handle().clone();
+             let outgoing_tx_actor = outgoing_tx.clone();
+             let app_handle_for_actor = app_handle.clone();
+@@ -307,9 +366,13 @@ pub fn run() {
+ 
+                                         if let Some((offer, source)) = outbound_entry {
+                                             log::info!("Starting Sender task for session {}", answer.session_id);
+-                                            let (active_server_url, allow_insecure_tls, psk, acct) = {
++                                            let (active_server_url, tls_trust, psk, acct) = {
+                                                 let s = settings_ref.lock().await;
+-                                                (s.server_url.clone(), s.allow_insecure_tls,
++                                                // 数据面必须与控制面用同一套信任策略。
++                                                // 解析失败时同样回落到最严的一档——绝不能
++                                                // 因为指纹写错就让这条连接比控制面更宽松。
++                                                (s.server_url.clone(),
++                                                 s.tls_trust_config().unwrap_or_default(),
+                                                  s.psk_secret.clone(), s.account_id.clone())
+                                             };
+                                             // offer.encrypted 是发 OFFER 时就定下的，这里按它派生。
+@@ -328,7 +391,7 @@ pub fn run() {
+                                             };
+                                             tokio::spawn(TransferEngine::start_sender_task(
+                                                 active_server_url,
+-                                                allow_insecure_tls,
++                                                tls_trust,
+                                                 answer.session_id.clone(),
+                                                 token.clone(),
+                                                 self_device_id.clone(),
+@@ -347,9 +410,10 @@ pub fn run() {
+                                             };
+ 
+                                             if let Some((offer, sender_device)) = inbound_entry {
+-                                                let (auto_inject, active_server_url, allow_insecure_tls, psk, acct) = {
++                                                let (auto_inject, active_server_url, tls_trust, psk, acct) = {
+                                                     let s = settings_ref.lock().await;
+-                                                    (s.auto_inject, s.server_url.clone(), s.allow_insecure_tls,
++                                                    (s.auto_inject, s.server_url.clone(),
++                                                     s.tls_trust_config().unwrap_or_default(),
+                                                      s.psk_secret.clone(), s.account_id.clone())
+                                                 };
+                                                 let receiver_key = if offer.encrypted {
+@@ -366,7 +430,7 @@ pub fn run() {
+                                                 log::info!("Starting Receiver task for session {}, auto_inject={}", answer.session_id, auto_inject);
+                                                 tokio::spawn(TransferEngine::start_receiver_task(
+                                                     active_server_url,
+-                                                    allow_insecure_tls,
++                                                    tls_trust,
+                                                     answer.session_id.clone(),
+                                                     token,
+                                                     sender_device,
+diff --git a/client/src/App.test.tsx b/client/src/App.test.tsx
+index 1636991..e4fe10e 100644
+--- a/client/src/App.test.tsx
++++ b/client/src/App.test.tsx
+@@ -31,6 +31,8 @@ const baseSettings: AppSettings = {
+   cache_max_size_mb: 10240,
+   cache_sweep_interval_minutes: 60,
+   allow_insecure_tls: false,
++  tls_trust_mode: "public_ca",
++  pinned_cert_sha256: [],
+   e2ee_enabled: true,
+ };
+ 
+@@ -183,6 +185,32 @@ describe("完成卡片自动消失（需求 5）", () => {
+ 
+ describe("TLS 证书失败提示", () => {
+   // 这条守的是「事件发了但没人接」这一整类缺陷。
++  // 与 Rust 侧 core::tls_trust::TlsCertFailure 同形。
++  // 事故现场那一档单独造一个，因为它恰恰是「证书完全合法、错的是地址」
++  // 这种最容易被提示误导的情形。
++  const nameMismatchFailure = {
++    kind: "name_mismatch" as const,
++    expected: "120.26.54.84",
++    presented: ["www.leafun.xyz"],
++    title: "服务器证书有效，但不是签发给 120.26.54.84 的",
++    detail: [
++      "证书签发给：www.leafun.xyz",
++      "你连接的是：120.26.54.84",
++      "请把「服务器地址」改为证书上的域名，端口保持不变。",
++      "这张证书本身是受信任的。不要为此关闭证书校验——那会让任何中间人都能冒充服务器。",
++    ],
++    raw: 'IO error: invalid peer certificate: certificate not valid for name "120.26.54.84"; certificate is only valid for www.leafun.xyz',
++    observed_cert_sha256: null,
++  };
++
++  const unknownIssuerFailure = {
++    kind: "unknown_issuer" as const,
++    title: "服务器证书由未知的签发者签发",
++    detail: ["公共根证书库里没有这个签发者，因此无法确认对端身份。"],
++    raw: "IO error: invalid peer certificate: UnknownIssuer",
++    observed_cert_sha256: null,
++  };
++
+   // 后端 connection_actor 在证书校验失败时 emit tls-cert-failed，
+   // 若前端不监听，默认开启校验后自签/IP/内部 CA 三类部署升级即进入
+   // 无提示的静默重连——而 USER_GUIDE 已经向用户许诺了这个提示。
+@@ -195,14 +223,139 @@ describe("TLS 证书失败提示", () => {
+     await renderApp();
+ 
+     await act(async () => {
+-      emitEvent("tls-cert-failed", "无法验证服务器证书：UnknownIssuer。请在「设置」中勾选「允许不安全连接」。");
++      emitEvent("tls-cert-failed", unknownIssuerFailure);
+     });
+ 
+-    expect(screen.getByText(/无法验证服务器证书/)).toBeInTheDocument();
++    expect(screen.getByText(/未知的签发者/)).toBeInTheDocument();
+     // 文案不得沿用鉴权失败那套：证书问题改密钥没有用
+     expect(screen.queryByText(/鉴权失败/)).not.toBeInTheDocument();
+     expect(screen.getByRole("button", { name: "检查连接设置" })).toBeInTheDocument();
+-    expect(screen.getByText("证书不受信任")).toBeInTheDocument();
++    expect(screen.getByText("证书签发者未知")).toBeInTheDocument();
++  });
++
++  // 本次事故的回归测试。证书是合法的 Let's Encrypt 证书，只是签发给了域名
++  // 而用户填的是 IP——此时「证书不受信任」是假话，而引导用户关校验
++  // 等于为了一张完全合法的证书废掉整条链路的身份验证。
++  it("名称不匹配时不说「证书不受信任」，也不建议关闭校验", async () => {
++    await renderApp();
++
++    await act(async () => {
++      emitEvent("tls-cert-failed", nameMismatchFailure);
++    });
++
++    expect(screen.getByText("证书域名不匹配")).toBeInTheDocument();
++    expect(screen.queryByText("证书不受信任")).not.toBeInTheDocument();
++
++    await act(async () => {
++      screen.getByRole("button", { name: "详情" }).click();
++    });
++    expect(screen.queryByText(/允许不安全连接/)).not.toBeInTheDocument();
++  });
++
++  // 截断是这次用户只看到 "invalid peer ..." 的直接原因：
++  // 后端拼好的多行处置建议一个字都没露出来。
++  it("展开详情后逐行显示完整处置建议，不被截断", async () => {
++    await renderApp();
++
++    await act(async () => {
++      emitEvent("tls-cert-failed", nameMismatchFailure);
++    });
++
++    // 收起时只有标题
++    expect(screen.queryByText(nameMismatchFailure.detail[2])).not.toBeInTheDocument();
++
++    await act(async () => {
++      screen.getByRole("button", { name: "详情" }).click();
++    });
++
++    for (const line of nameMismatchFailure.detail) {
++      const el = screen.getByText(line);
++      expect(el).toBeInTheDocument();
++      // truncate 会把多行建议压成一行再截断，这正是要防的
++      expect(el.className).not.toContain("truncate");
++    }
++    // 分类错了的时候原始错误是唯一的现场，必须也能看到
++    expect(screen.getByText(nameMismatchFailure.raw)).toBeInTheDocument();
++  });
++
++  // 重连每 ≤30s 重发一次事件。跟着事件复位展开状态的话，
++  // 用户刚点开的详情会自己合上，而那看起来像渲染 bug。
++  it("重发事件不会把已展开的详情合上", async () => {
++    await renderApp();
++
++    await act(async () => {
++      emitEvent("tls-cert-failed", nameMismatchFailure);
++    });
++    await act(async () => {
++      screen.getByRole("button", { name: "详情" }).click();
++    });
++    expect(screen.getByText(nameMismatchFailure.detail[0])).toBeInTheDocument();
++
++    for (let i = 0; i < 3; i++) {
++      await act(async () => {
++        emitEvent("tls-cert-failed", nameMismatchFailure);
++      });
++    }
++
++    expect(screen.getByText(nameMismatchFailure.detail[0])).toBeInTheDocument();
++    expect(screen.getByRole("button", { name: "收起" })).toBeInTheDocument();
++  });
++
++  // 不给「信任这张证书」一键按钮是刻意的：警告下方的一键信任
++  // 正是训练用户无脑点确认的经典形态。只给指纹，逼他至少看一眼。
++  it("展示实际看到的证书指纹，但不提供一键信任", async () => {
++    await renderApp();
++
++    const fp = "ab".repeat(32);
++    await act(async () => {
++      emitEvent("tls-cert-failed", { ...unknownIssuerFailure, observed_cert_sha256: fp });
++    });
++    await act(async () => {
++      screen.getByRole("button", { name: "详情" }).click();
++    });
++
++    expect(screen.getByText(fp)).toBeInTheDocument();
++    expect(screen.getByRole("button", { name: "复制" })).toBeInTheDocument();
++    expect(screen.getByText(/核对一致，再填入设置/)).toBeInTheDocument();
++    expect(screen.queryByRole("button", { name: /信任这张证书/ })).not.toBeInTheDocument();
++  });
++
++  it("后端没给指纹时不显示指纹区块", async () => {
++    await renderApp();
++
++    await act(async () => {
++      emitEvent("tls-cert-failed", unknownIssuerFailure);
++    });
++    await act(async () => {
++      screen.getByRole("button", { name: "详情" }).click();
++    });
++
++    expect(screen.queryByRole("button", { name: "复制" })).not.toBeInTheDocument();
++  });
++
++  it("各档失败给出各自的状态栏文案", async () => {
++    await renderApp();
++
++    const cases: Array<[Record<string, unknown>, string]> = [
++      [{ kind: "expired" }, "证书已过期"],
++      [{ kind: "not_yet_valid" }, "证书尚未生效"],
++      [{ kind: "revoked" }, "证书已被吊销"],
++      [{ kind: "unsupported_version" }, "证书格式不受支持"],
++      [{ kind: "other" }, "证书校验失败"],
++    ];
++
++    for (const [kind, expected] of cases) {
++      await act(async () => {
++        emitEvent("tls-cert-failed", {
++          ...kind,
++          title: "t",
++          detail: ["d"],
++          raw: "r",
++          observed_cert_sha256: null,
++        });
++      });
++      expect(screen.getByText(expected)).toBeInTheDocument();
++    }
+   });
+ 
+   // 连接 actor 每次退避重试都会重发该事件，横幅必须幂等而不是越堆越多
+@@ -211,11 +364,11 @@ describe("TLS 证书失败提示", () => {
+ 
+     for (let i = 0; i < 3; i++) {
+       await act(async () => {
+-        emitEvent("tls-cert-failed", "无法验证服务器证书：UnknownIssuer");
++        emitEvent("tls-cert-failed", unknownIssuerFailure);
+       });
+     }
+ 
+-    expect(screen.getAllByText(/无法验证服务器证书/)).toHaveLength(1);
++    expect(screen.getAllByText(/未知的签发者/)).toHaveLength(1);
+   });
+ 
+   it("E2EE 回落时以 toast 提示，而不是常驻横幅", async () => {
+@@ -252,14 +405,14 @@ describe("TLS 证书失败提示", () => {
+     await renderApp();
+ 
+     await act(async () => {
+-      emitEvent("tls-cert-failed", "无法验证服务器证书：UnknownIssuer");
++      emitEvent("tls-cert-failed", unknownIssuerFailure);
+     });
+-    expect(screen.getByText(/无法验证服务器证书/)).toBeInTheDocument();
++    expect(screen.getByText(/未知的签发者/)).toBeInTheDocument();
+ 
+     await act(async () => {
+       emitEvent("devices-updated", []);
+     });
+-    expect(screen.queryByText(/无法验证服务器证书/)).not.toBeInTheDocument();
++    expect(screen.queryByText(/未知的签发者/)).not.toBeInTheDocument();
+   });
+ });
+ 
+diff --git a/client/src/App.tsx b/client/src/App.tsx
+index 11ef7ce..a5b1144 100644
+--- a/client/src/App.tsx
++++ b/client/src/App.tsx
+@@ -12,7 +12,14 @@ import {
+   AlertCircle,
+   X,
+ } from "lucide-react";
+-import { OnlineDevice, AppSettings, ActiveTransfer , ServerLimits } from "./types";
++import {
++  OnlineDevice,
++  AppSettings,
++  ActiveTransfer,
++  ServerLimits,
++  TlsCertFailure,
++  certFailureStatusText,
++} from "./types";
+ import { DeviceList } from "./components/DeviceList";
+ import { TransferProgress } from "./components/TransferProgress";
+ import { SettingsModal } from "./components/SettingsModal";
+@@ -32,6 +39,8 @@ const defaultSettings: AppSettings = {
+   cache_max_size_mb: 10240,
+   cache_sweep_interval_minutes: 60,
+   allow_insecure_tls: false,
++  tls_trust_mode: "public_ca",
++  pinned_cert_sha256: [],
+   e2ee_enabled: true,
+ };
+ 
+@@ -45,9 +54,21 @@ export const App: React.FC = () => {
+   const [selectedDeviceForSend, setSelectedDeviceForSend] = useState<OnlineDevice | null>(null);
+   /// 连接层错误横幅。kind 决定文案与引导按钮：
+   /// "auth" 是 PSK / 账号格式被服务端拒绝，"tls" 是服务器证书校验失败。
+-  /// 两者的修复动作不同——前者改密钥或账号，后者要么换受信任的证书、
+-  /// 要么显式勾选「允许不安全连接」——所以不能共用一句「检查密钥」。
+-  const [connError, setConnError] = useState<{ kind: "auth" | "tls"; message: string } | null>(null);
++  /// 两者的修复动作不同——前者改密钥或账号，后者按证书失败的**具体档位**而定——
++  /// 所以不能共用一句「检查密钥」。
++  ///
++  /// tls 一支带的是整个结构化的分类结果而不是一句拼好的话：证书失败有好几种，
++  /// 处置互不相同（改地址 / 续期 / 重签 / 换 CA），拼字符串会逼着它们共用一句建议。
++  const [connError, setConnError] = useState<
++    { kind: "auth"; message: string } | { kind: "tls"; failure: TlsCertFailure } | null
++  >(null);
++  /// 证书错误详情是否展开。
++  ///
++  /// **必须独立于 connError，且只在 connError 清空时复位。** 连接 actor 每次
++  /// 退避重试（≤30s）都会重发 tls-cert-failed，若跟着事件一起复位，
++  /// 用户刚展开的详情会每隔几秒自己合上——而那个现象看起来像渲染 bug，
++  /// 没人会想到是重连在后面推事件。
++  const [certDetailExpanded, setCertDetailExpanded] = useState(false);
+   // 服务端下发的限额。null = 尚未拿到（未连接，或老服务端不发这个字段）。
+   // 不要用默认值顶上——那会让用户以为看到的就是实际生效的值。
+   const [serverLimits, setServerLimits] = useState<ServerLimits | null>(null);
+@@ -56,6 +77,16 @@ export const App: React.FC = () => {
+     text: string;
+   } | null>(null);
+ 
++  // 横幅消失时才收起详情。
++  //
++  // 放在 effect 里而不是跟着三处 setConnError(null) 各写一遍，是为了让
++  // 「展开状态只由横幅的生死决定」这件事只有一个落点——将来再多一处清空点，
++  // 也不会漏掉复位。反过来也重要：**不能**在收到 tls-cert-failed 时复位，
++  // 那个事件每次重连都会重发，会把用户刚展开的详情反复合上。
++  useEffect(() => {
++    if (!connError) setCertDetailExpanded(false);
++  }, [connError]);
++
+   const showNotification = (text: string, type: "info" | "success" | "error" = "info") => {
+     setNotification({ text, type });
+     setTimeout(() => {
+@@ -174,8 +205,8 @@ export const App: React.FC = () => {
+     //
+     // 刻意**不弹 toast**：连接 actor 每次退避重试（≤30s）都会重新 emit，
+     // 弹 toast 会堆成一串。常驻横幅天然幂等——重复 set 同一内容不产生新 UI。
+-    const unlistenTlsPromise = listen<string>("tls-cert-failed", (event) => {
+-      setConnError({ kind: "tls", message: event.payload });
++    const unlistenTlsPromise = listen<TlsCertFailure>("tls-cert-failed", (event) => {
++      setConnError({ kind: "tls", failure: event.payload });
+     });
+ 
+     // E2EE 回落：本次传输没能加密。
+@@ -373,19 +404,95 @@ export const App: React.FC = () => {
+ 
+       {/* Connection Error Banner */}
+       {connError && (
+-        <div className="bg-rose-950/80 border-b border-rose-800/80 px-4 py-2 flex items-center justify-between text-xs text-rose-300">
+-          <div className="flex items-center space-x-2 truncate">
+-            <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0" />
+-            <span className="truncate">
+-              {connError.kind === "tls" ? connError.message : `鉴权失败: ${connError.message}`}
+-            </span>
++        <div className="bg-rose-950/80 border-b border-rose-800/80 px-4 py-2 text-xs text-rose-300">
++          <div className="flex items-start justify-between gap-2">
++            {/*
++              min-w-0 是这里的关键，不是随手加的：flex 子项的 min-width 默认是 auto，
++              不加它，无论去掉 truncate 还是换成 break-words 都不会换行，
++              只会变成横向溢出。改造前这里是 `flex items-center` + `truncate`，
++              两个问题叠在一起，结果把后端拼好的多行处置建议整段吃掉——
++              用户只看到「无法验证服务器证书：IO error: invalid peer ...」，
++              而省略号后面那个词恰恰是唯一能决定怎么修的信息。
++            */}
++            <div className="flex items-start gap-2 min-w-0">
++              <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
++              <div className="min-w-0">
++                <p className="font-medium break-words">
++                  {connError.kind === "tls"
++                    ? connError.failure.title
++                    : `鉴权失败: ${connError.message}`}
++                </p>
++                {connError.kind === "tls" && certDetailExpanded && (
++                  <div className="mt-1.5 space-y-1.5 text-rose-300/90">
++                    {/*
++                      窗口只有约 760px 宽、高度也有限，而通配符证书的 SAN 可能几十条。
++                      不封顶会把下面的设备列表整个挤出视口。
++                    */}
++                    <ul className="space-y-0.5 max-h-32 overflow-y-auto">
++                      {connError.failure.detail.map((line, i) => (
++                        <li key={i} className="break-words">
++                          {line}
++                        </li>
++                      ))}
++                    </ul>
++                    {connError.failure.observed_cert_sha256 && (
++                      /*
++                        实际看到的证书指纹。
++                        刻意**不给**「信任这张证书」的一键按钮：错误横幅下方的
++                        一键信任，恰恰是训练用户对中间人警告无脑点确认的经典形态，
++                        而这一整轮改造的目的就是拆掉这类捷径。这里只给出指纹和
++                        核对方法，多出来的那点摩擦正是它的价值——它逼用户至少
++                        看一眼那串 hex，也留出了带外核对的时机。
++                      */
++                      <div className="pt-1 border-t border-rose-800/50">
++                        <p className="text-[10px] text-rose-300/80">客户端实际看到的证书指纹：</p>
++                        <div className="flex items-start gap-2 mt-0.5">
++                          <code className="text-[10px] font-mono break-all text-rose-200/90 flex-1 min-w-0">
++                            {connError.failure.observed_cert_sha256}
++                          </code>
++                          <button
++                            type="button"
++                            onClick={() =>
++                              navigator.clipboard
++                                ?.writeText(connError.failure.observed_cert_sha256 ?? "")
++                                .catch(() => {})
++                            }
++                            className="text-[10px] underline hover:text-rose-200 shrink-0"
++                          >
++                            复制
++                          </button>
++                        </div>
++                        <p className="text-[10px] text-rose-300/70 mt-0.5">
++                          请先在服务器上执行 openssl x509 -fingerprint -sha256 -noout -in
++                          &lt;证书文件&gt; 核对一致，再填入设置
++                        </p>
++                      </div>
++                    )}
++                    {/* 分类错了的时候，原始错误是唯一的现场，必须能看到。 */}
++                    <p className="text-[10px] text-rose-400/70 break-all font-mono">
++                      {connError.failure.raw}
++                    </p>
++                  </div>
++                )}
++              </div>
++            </div>
++            <div className="shrink-0 flex items-center gap-3">
++              {connError.kind === "tls" && (
++                <button
++                  onClick={() => setCertDetailExpanded((v) => !v)}
++                  className="text-[11px] underline hover:text-rose-200 font-medium"
++                >
++                  {certDetailExpanded ? "收起" : "详情"}
++                </button>
++              )}
++              <button
++                onClick={() => setIsSettingsOpen(true)}
++                className="text-[11px] underline hover:text-rose-200 font-medium"
++              >
++                {connError.kind === "tls" ? "检查连接设置" : "检查密钥"}
++              </button>
++            </div>
+           </div>
+-          <button
+-            onClick={() => setIsSettingsOpen(true)}
+-            className="text-[11px] underline hover:text-rose-200 font-medium shrink-0 ml-2"
+-          >
+-            {connError.kind === "tls" ? "检查连接设置" : "检查密钥"}
+-          </button>
+         </div>
+       )}
+ 
+@@ -444,7 +551,13 @@ export const App: React.FC = () => {
+         <div className={`flex items-center space-x-1 ${connError ? "text-rose-400" : "text-teal-500/90"}`}>
+           {connError ? <ShieldAlert className="w-3.5 h-3.5" /> : <ShieldCheck className="w-3.5 h-3.5" />}
+           <span>
+-            {connError ? (connError.kind === "tls" ? "证书不受信任" : "连接未授权") : "PSK 接入安全就绪"}
++            {connError
++              ? connError.kind === "tls"
++                // 不再一律说「证书不受信任」：名字不匹配那一档里证书**是**受信任的，
++                // 说成不受信任会把用户推去关校验，而正确动作是改地址。
++                ? certFailureStatusText(connError.failure.kind)
++                : "连接未授权"
++              : "PSK 接入安全就绪"}
+           </span>
+         </div>
+         <span>支持跨设备秒级同步</span>
+diff --git a/client/src/components/SettingsModal.test.tsx b/client/src/components/SettingsModal.test.tsx
+index 4152eae..cc874c3 100644
+--- a/client/src/components/SettingsModal.test.tsx
++++ b/client/src/components/SettingsModal.test.tsx
+@@ -21,6 +21,8 @@ const baseSettings: AppSettings = {
+   cache_max_size_mb: 10240,
+   cache_sweep_interval_minutes: 60,
+   allow_insecure_tls: false,
++  tls_trust_mode: "public_ca",
++  pinned_cert_sha256: [],
+   e2ee_enabled: true,
+ };
+ 
+@@ -340,4 +342,82 @@ describe("账号标识校验", () => {
+     await user.click(toggle);
+     expect(screen.getByText(/将以明文经过中继服务器/)).toBeInTheDocument();
+   });
++
++  describe("连接安全三档", () => {
++    const modeRadio = (name: RegExp) => screen.getByRole("radio", { name });
++
++    it("默认选中「校验公共 CA 证书」，且不显示任何警告", () => {
++      setup();
++      expect(modeRadio(/校验公共 CA 证书/)).toBeChecked();
++      expect(screen.queryByText(/已关闭证书校验/)).not.toBeInTheDocument();
++      // 指纹输入框只在中间档出现
++      expect(screen.queryByLabelText("证书 SHA-256 指纹")).not.toBeInTheDocument();
++    });
++
++    it("选到「允许不安全连接」才出现中间人警告", async () => {
++      const { user } = setup();
++      await user.click(modeRadio(/允许不安全连接/));
++      expect(screen.getByText(/任何中间人都可冒充服务器/)).toBeInTheDocument();
++    });
++
++    it("选到「信任指定证书」时出现指纹输入框与域名提醒", async () => {
++      const { user } = setup();
++      await user.click(modeRadio(/信任指定证书/));
++
++      expect(screen.getByLabelText("证书 SHA-256 指纹")).toBeInTheDocument();
++      // 这一条是该档放弃掉的保证，不写出来用户无从判断风险
++      expect(screen.getByText(/不再检查域名与有效期/)).toBeInTheDocument();
++    });
++
++    it("中间档不填指纹时拒绝保存", async () => {
++      const { onSave, user } = setup();
++      await user.click(modeRadio(/信任指定证书/));
++      await user.click(submit());
++
++      expect(await screen.findByText(/至少要填一条证书指纹/)).toBeInTheDocument();
++      expect(onSave).not.toHaveBeenCalled();
++    });
++
++    it("指纹格式错误时拒绝保存并指出是哪一条", async () => {
++      const { onSave, user } = setup();
++      await user.click(modeRadio(/信任指定证书/));
++      await user.type(screen.getByLabelText("证书 SHA-256 指纹"), "not-a-fingerprint");
++      await user.click(submit());
++
++      expect(await screen.findByText(/指纹格式不对/)).toBeInTheDocument();
++      expect(onSave).not.toHaveBeenCalled();
++    });
++
++    it("接受 openssl 原样输出，并把档位与老字段一起提交", async () => {
++      const { onSave, user } = setup();
++      const hexed = "ab".repeat(32);
++      const colonized = hexed.toUpperCase().match(/.{2}/g)!.join(":");
++
++      await user.click(modeRadio(/信任指定证书/));
++      await user.type(
++        screen.getByLabelText("证书 SHA-256 指纹"),
++        `SHA256 Fingerprint=${colonized}`
++      );
++      await user.click(submit());
++
++      await waitFor(() => expect(onSave).toHaveBeenCalled());
++      const saved = onSave.mock.calls[0][0];
++      expect(saved.tls_trust_mode).toBe("pinned");
++      // 老字段必须跟着走，否则降级回旧版本会读出错误的信任状态
++      expect(saved.allow_insecure_tls).toBe(false);
++      expect(saved.pinned_cert_sha256).toHaveLength(1);
++    });
++
++    it("切到不校验档时老字段同步为 true", async () => {
++      const { onSave, user } = setup();
++      await user.click(modeRadio(/允许不安全连接/));
++      await user.click(submit());
++
++      await waitFor(() => expect(onSave).toHaveBeenCalled());
++      expect(onSave.mock.calls[0][0]).toMatchObject({
++        tls_trust_mode: "insecure",
++        allow_insecure_tls: true,
++      });
++    });
++  });
+ });
+diff --git a/client/src/components/SettingsModal.tsx b/client/src/components/SettingsModal.tsx
+index 73cd9e0..88b3a84 100644
+--- a/client/src/components/SettingsModal.tsx
++++ b/client/src/components/SettingsModal.tsx
+@@ -1,7 +1,7 @@
+ import React, { useState, useEffect } from "react";
+ import { invoke } from "@tauri-apps/api/core";
+ import { X, Save, Shield, AlertCircle, Server as ServerIcon } from "lucide-react";
+-import { AppSettings, ServerLimits } from "../types";
++import { AppSettings, ServerLimits, TlsTrustMode } from "../types";
+ 
+ /**
+  * 把一项限额格式化成可读文案。
+@@ -117,6 +117,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
+   serverLimits = null,
+ }) => {
+   const [form, setForm] = useState<AppSettings>(settings);
++
++  // 档位从 form 派生，而不是另开一个会和 form 走散的 state。
++  // 老库里 tls_trust_mode 可能是 null，此时按老的 allow_insecure_tls 推——
++  // 与后端 effective_trust_mode() 同一套规则，两边必须一致。
++  const trustMode: TlsTrustMode =
++    form.tls_trust_mode ?? (form.allow_insecure_tls ? "insecure" : "public_ca");
++  const setTrustMode = (mode: TlsTrustMode) =>
++    setForm((f) => ({
++      ...f,
++      tls_trust_mode: mode,
++      // 老字段跟着走，保持与后端 normalize_tls_trust 一致的投影关系
++      allow_insecure_tls: mode === "insecure",
++    }));
+   const [saving, setSaving] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+ 
+@@ -237,6 +250,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
+     }
+     setFieldErrors({});
+ 
++    // 指纹在前端先校一遍。后端也会校（那一层才是约束），但错误从 invoke
++    // 抛回来只剩一句笼统的保存失败，用户看不出是哪一行写错了。
++    // 「前后端各校验一次」是本文件既有的惯例，见 cache_sweep_interval_minutes。
++    const pins = form.pinned_cert_sha256.map((p) => p.trim()).filter(Boolean);
++    if (trustMode === "pinned") {
++      if (pins.length === 0) {
++        setError("选择「信任指定证书」时至少要填一条证书指纹");
++        return;
++      }
++      const bad = pins.find((p) => !/^[0-9a-f]{64}$/i.test(p.replace(/^.*=/, "").replace(/[\s:]/g, "")));
++      if (bad) {
++        setError(`指纹格式不对（应为 64 位十六进制的 SHA-256）：${bad}`);
++        return;
++      }
++    }
++
+     let cleanUrl = form.server_url.replace(/\s+/g, "");
+     if (cleanUrl && !cleanUrl.startsWith("ws://") && !cleanUrl.startsWith("wss://")) {
+       cleanUrl = `wss://${cleanUrl}`;
+@@ -255,6 +284,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
+         cache_ttl_hours: (ttl as { value: number }).value,
+         cache_max_size_mb: (size as { value: number }).value,
+         cache_sweep_interval_minutes: (interval as { value: number }).value,
++        tls_trust_mode: trustMode,
++        allow_insecure_tls: trustMode === "insecure",
++        pinned_cert_sha256: pins,
+       });
+       onClose(); // 只有保存成功才关窗，失败时保留用户已填内容
+     } catch (err: any) {
+@@ -329,29 +361,100 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
+             />
+           </div>
+ 
+-          {/* 文案要说清后果，而不是只说「允许自签证书」：用户据此做的是
+-              一个安全取舍，不告诉他代价就等于替他做了决定。
+-              三类场景都要列全——少写「非公共 CA」那一类，用内部 CA 的用户会
+-              以为这个开关与自己无关，最后仍然被引导来勾选它。 */}
+-          <div className="flex items-center justify-between pt-2">
+-            <div className="pr-3">
+-              <span className="font-medium text-slate-200">允许不安全连接</span>
+-              <p className="text-[11px] text-slate-500">
+-                跳过服务器证书校验，用于自签证书、IP 直连或非公共 CA 签发的部署
+-              </p>
+-              {form.allow_insecure_tls && (
+-                <p className="mt-1 text-[11px] text-amber-400">
+-                  已关闭证书校验：任何中间人都可冒充服务器读取你传输的内容
++          {/* 三档而不是一个开关。
++              改造前只有「允许不安全连接」一个勾选框，于是「证书合法但名字对不上」
++              和「企业内部 CA 签发」这两类部署，唯一出路就是把校验整个关掉——
++              一个本该收窄到单台服务器的例外，被迫放大成对所有中间人敞开。
++              中间那一档就是为它们补的。
++
++              文案要说清每一档的后果：用户在这里做的是安全取舍，
++              不告诉他代价就等于替他做了决定。 */}
++          <fieldset className="pt-2 space-y-2">
++            <legend className="font-medium text-slate-200">连接安全</legend>
++
++            <label className="flex items-start gap-2 cursor-pointer">
++              <input
++                type="radio"
++                name="tls_trust_mode"
++                value="public_ca"
++                checked={trustMode === "public_ca"}
++                onChange={() => setTrustMode("public_ca")}
++                className="mt-0.5 w-4 h-4 text-teal-500 focus:ring-teal-400 bg-slate-800 border-slate-700"
++              />
++              <span>
++                <span className="text-slate-200">校验公共 CA 证书（推荐）</span>
++                <p className="text-[11px] text-slate-500">
++                  确认连上的确实是目标服务器。证书需由公共 CA 签发，且地址要与证书上的域名一致
+                 </p>
+-              )}
+-            </div>
+-            <input
+-              type="checkbox"
+-              checked={form.allow_insecure_tls}
+-              onChange={(e) => setForm({ ...form, allow_insecure_tls: e.target.checked })}
+-              className="w-4 h-4 rounded text-teal-500 focus:ring-teal-400 bg-slate-800 border-slate-700"
+-            />
+-          </div>
++              </span>
++            </label>
++
++            <label className="flex items-start gap-2 cursor-pointer">
++              <input
++                type="radio"
++                name="tls_trust_mode"
++                value="pinned"
++                checked={trustMode === "pinned"}
++                onChange={() => setTrustMode("pinned")}
++                className="mt-0.5 w-4 h-4 text-teal-500 focus:ring-teal-400 bg-slate-800 border-slate-700"
++              />
++              <span>
++                <span className="text-slate-200">信任指定证书</span>
++                <p className="text-[11px] text-slate-500">
++                  先按公共 CA 校验；不通过时再比对下面的指纹。用于自签证书或 IP 直连
++                </p>
++              </span>
++            </label>
++
++            {trustMode === "pinned" && (
++              <div className="ml-6 space-y-1">
++                <textarea
++                  aria-label="证书 SHA-256 指纹"
++                  value={form.pinned_cert_sha256.join("\n")}
++                  onChange={(e) =>
++                    setForm({
++                      ...form,
++                      // 保留用户粘进来的原样（含冒号大写），规范化交给后端保存时做：
++                      // 这里当场改写会让他看到一串跟自己粘的不一样的东西。
++                      pinned_cert_sha256: e.target.value.split("\n"),
++                    })
++                  }
++                  rows={3}
++                  placeholder="证书 SHA-256 指纹，每行一条"
++                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-[11px] font-mono text-slate-200 focus:outline-none focus:border-teal-500"
++                />
++                <p className="text-[11px] text-slate-500">
++                  在服务器上执行 openssl x509 -fingerprint -sha256 -noout -in
++                  &lt;证书文件&gt; 获取，可直接粘贴整行输出
++                </p>
++                {/* 这一条必须写出来：它既是这一档能用于 IP 直连的原因，
++                    也是它与「校验公共 CA」相比放弃掉的那部分保证。 */}
++                <p className="text-[11px] text-amber-400">
++                  指纹匹配的证书将被信任，不再检查域名与有效期——请务必先在服务器上核对指纹
++                </p>
++              </div>
++            )}
++
++            <label className="flex items-start gap-2 cursor-pointer">
++              <input
++                type="radio"
++                name="tls_trust_mode"
++                value="insecure"
++                checked={trustMode === "insecure"}
++                onChange={() => setTrustMode("insecure")}
++                className="mt-0.5 w-4 h-4 text-teal-500 focus:ring-teal-400 bg-slate-800 border-slate-700"
++              />
++              <span>
++                <span className="text-slate-200">允许不安全连接（不校验）</span>
++                <p className="text-[11px] text-slate-500">完全跳过服务器证书校验</p>
++                {trustMode === "insecure" && (
++                  <p className="mt-1 text-[11px] text-amber-400">
++                    已关闭证书校验：任何中间人都可冒充服务器读取你传输的内容
++                  </p>
++                )}
++              </span>
++            </label>
++          </fieldset>
+ 
+           {/* 与上面的 TLS 开关相对：那个默认关闭（安全值是 false），
+               这个默认开启（安全值是 true）。文案同样要说清它保证什么、
+diff --git a/client/src/types/index.ts b/client/src/types/index.ts
+index f9d869c..1e8d303 100644
+--- a/client/src/types/index.ts
++++ b/client/src/types/index.ts
+@@ -23,8 +23,24 @@ export interface AppSettings {
+   cache_max_size_mb: number;
+   /** 后台清理间隔（分钟），最小 1。 */
+   cache_sweep_interval_minutes: number;
+-  /** 跳过 TLS 服务器证书校验；默认 false（= 校验）。 */
++  /**
++   * 【迁移专用】跳过 TLS 服务器证书校验的老开关。
++   *
++   * 真正生效的是 tls_trust_mode，这个字段只是它的投影，单独读会得出错误结论
++   * （pinned 档下它是 false，但那不等于走的是纯公共 CA 校验）。
++   * 保留它是为了读得懂老库、以及用户降级回旧版本时旧版仍能读到正确的值。
++   */
+   allow_insecure_tls: boolean;
++  /**
++   * TLS 信任档位。null = 老库里没有这个键，按 allow_insecure_tls 推。
++   *
++   * 三档而不是一个开关：改造前「证书合法但名字对不上」和「企业内部 CA」
++   * 这两类部署，唯一出路是把校验整个关掉——本该收窄到单台服务器的例外，
++   * 被迫放大成对所有中间人敞开。
++   */
++  tls_trust_mode: TlsTrustMode | null;
++  /** 「信任指定证书」档下用户填的证书 SHA-256 指纹，每条一项。 */
++  pinned_cert_sha256: string[];
+   /**
+    * 对传输内容做端到端加密；默认 **true**。
+    *
+@@ -79,3 +95,59 @@ export interface TransferHistoryEntry {
+   completed_at: string | null;
+   cached_count: number;
+ }
++
++/** TLS 信任档位。与 Rust 侧 `core::tls_trust::TlsTrustMode` 一一对应。 */
++export type TlsTrustMode = "public_ca" | "pinned" | "insecure";
++
++/**
++ * TLS 证书校验失败的分类。与 Rust 侧 `core::tls_trust::CertFailureKind`
++ * 的 `#[serde(tag = "kind")]` 一一对应，改一边必须改另一边。
++ *
++ * 分这么细不是为了好看：每一档的**正确处置动作都不一样**，
++ * 而改造之前它们共用一句「勾选允许不安全连接」——那句话对其中几档是错的。
++ */
++export type CertFailureKind =
++  /** 证书有效，只是签发给了别的名字（典型：用 IP 直连一台只为域名签证书的服务器）。 */
++  | { kind: "name_mismatch"; expected: string; presented: string[] }
++  /** 公共根证书库里没有这个签发者：自签或企业内部 CA。 */
++  | { kind: "unknown_issuer" }
++  | { kind: "expired" }
++  | { kind: "not_yet_valid" }
++  | { kind: "revoked" }
++  /** X.509 v1：rustls 在解析阶段就拒绝，跳过校验也救不回来。 */
++  | { kind: "unsupported_version" }
++  | { kind: "other" };
++
++/** `tls-cert-failed` 事件的载荷。 */
++export type TlsCertFailure = CertFailureKind & {
++  /** 横幅收起时显示的一行。 */
++  title: string;
++  /** 展开后逐行显示，已经是对症的处置建议。 */
++  detail: string[];
++  /** 原始错误串。分类错了的时候这是唯一的现场，所以界面上也要能看到。 */
++  raw: string;
++  /** 实际观察到的证书指纹；目前后端恒为 null，留给后续的证书观察器。 */
++  observed_cert_sha256: string | null;
++};
++
++/** 各档失败对应的状态栏文案。 */
++export function certFailureStatusText(kind: CertFailureKind["kind"]): string {
++  switch (kind) {
++    // 「证书不受信任」在这一档是**假话**：证书可能完全合法，
++    // 错的是我们连的地址。说错了会把用户推去关校验。
++    case "name_mismatch":
++      return "证书域名不匹配";
++    case "unknown_issuer":
++      return "证书签发者未知";
++    case "expired":
++      return "证书已过期";
++    case "not_yet_valid":
++      return "证书尚未生效";
++    case "revoked":
++      return "证书已被吊销";
++    case "unsupported_version":
++      return "证书格式不受支持";
++    default:
++      return "证书校验失败";
++  }
++}
+diff --git a/docs/USER_GUIDE.md b/docs/USER_GUIDE.md
+index a321d1a..e177fb0 100644
+--- a/docs/USER_GUIDE.md
++++ b/docs/USER_GUIDE.md
+@@ -69,20 +69,60 @@ UniDrop 与传统文件传输工具（如网盘、微信文件传输助手、隔
+      合法账号并保存后会立刻补做，老历史当场回来，不需要重启。
+ 4. **预共享密钥 (PSK Secret Key)**：
+    * 填入中继服务器预设的高强度密钥字符串。
+-5. **允许不安全连接**（默认关闭，**请尽量保持关闭**）：
+-   * 关闭时，客户端会校验服务器的 TLS 证书，确认连上的确实是目标服务器。
+-   * 需要勾选的情况有三类：服务端使用**自签证书**、直接用 **IP 地址**连接
+-     （证书上没有对应的名字）、或证书由**企业内部 CA** 签发（公共根证书库里没有它）。
+-   * 勾选的代价要清楚：一旦关闭校验，任何位于网络中间的人只要出示一张自签
+-     证书就能冒充服务器，读取经由它传输的剪贴板内容与文件。连接仍然是加密的，
+-     但**加密的对端是谁不再有保证**。
+-   * 若升级后突然连不上，且界面提示「无法验证服务器证书」，说明你的部署属于
+-     上述三类之一。首选做法是给服务器换一张受信任的证书，其次才是勾选此项。
+-   * **自签证书必须是 X.509 v3**——这一条勾选与否都绕不过：客户端在**解析**
+-     阶段就会拒绝 v1 证书，那一步早于任何校验逻辑，所以勾选本项也救不回来。
++5. **连接安全**（三档，默认第一档，**请尽量保持默认**）：
++
++   **① 校验公共 CA 证书（推荐）**
++
++   校验服务器的 TLS 证书，确认连上的确实是目标服务器。证书需由公共 CA 签发，
++   并且你填的地址要与证书上的域名一致。
++
++   **② 信任指定证书**
++
++   先按公共 CA 校验；不通过时再比对你填入的证书 SHA-256 指纹，命中即放行。
++   用于**自签证书**与 **IP 直连**这两类部署——它们的证书是合法的，
++   只是公共根证书库不认识、或者名字对不上。
++
++   在服务器上取指纹：
++
++   ```bash
++   openssl x509 -fingerprint -sha256 -noout -in cert.pem
++   ```
++
++   整行输出可以直接粘贴进设置（带 `SHA256 Fingerprint=` 前缀和冒号都能识别）。
++   连接失败时，错误横幅的「详情」里会显示**客户端实际看到的**指纹——
++   请与服务器上那一串核对一致后再填入。**两者不一致就意味着中间有人**，
++   这一步核对正是这一档的安全性所在。
++
++   代价要说清：**指纹匹配的证书将被信任，不再检查域名与有效期**。
++   这正是它能用于 IP 直连的原因，也是它相对第一档放弃掉的那部分保证。
++   但对固定的一台服务器而言，"钉住这张证书"比"接受任意公共 CA 签发的任意证书"
++   其实更严格。
++
++   **③ 允许不安全连接（不校验）**
++
++   完全跳过证书校验。代价：任何位于网络中间的人只要出示一张自签证书就能冒充
++   服务器，读取经由它传输的剪贴板内容与文件。连接仍然是加密的，
++   但**加密的对端是谁不再有任何保证**。绝大多数情况下第二档就够了，
++   不需要用到这一档。
++
++   **连不上时先看错误提示说的是哪一种**——四种成因的正确处置完全不同：
++
++   | 提示 | 含义 | 正确处置 |
++   | --- | --- | --- |
++   | 证书域名不匹配 | 证书**有效**，只是签发给了别的名字 | 把地址改成证书上的域名。**不要**为此关校验 |
++   | 证书签发者未知 | 自签或企业内部 CA | 换受信任 CA 的证书，或用第二档填指纹 |
++   | 证书已过期 | 证书到期了 | 服务端续期（`certbot renew`） |
++   | 证书尚未生效 | 多半是**本机系统时间**不对 | 先校对本机时间 |
++   | 证书格式不受支持 | X.509 v1 | 必须重签，见下 |
++
++   最常见的一种是第一行：用 **IP 地址**连一台证书只签给域名的服务器。
++   这时证书本身完全受信任，换成域名就能连上，**不需要降低任何安全设置**。
++
++   * **自签证书必须是 X.509 v3**——这一条选哪一档都绕不过：客户端在**解析**
++     阶段就会拒绝 v1 证书，那一步早于任何校验逻辑。
+      实测报错为 `invalid peer certificate: ... UnsupportedCertVersion`。
+-   * **SAN（主机名）只有不勾选本项时才需要**：它服务于主机名校验，而勾选后
+-     客户端根本不查名称。不过下面这条命令一次把两个条件都满足，两种情况都适用。
++   * **SAN（主机名）只有在第一档下才需要**：它服务于主机名校验，
++     而第二、三档都不查名称。不过下面这条命令一次把两个条件都满足。
+    * macOS 自带的 LibreSSL 用 `openssl req -x509` 默认生成的正是 v1，需要显式加
+      扩展：
+ 
+@@ -94,6 +134,7 @@ UniDrop 与传统文件传输工具（如网盘、微信文件传输助手、隔
+ 
+      用 `openssl x509 -in cert.pem -noout -text | grep Version` 确认输出是
+      `Version: 3 (0x2)`。
++
+ 6. **端到端加密**（默认**开启**，建议保持开启）：
+    * 开启后，内容在本机加密后才交给中继服务器转发，**服务器、云厂商或拿到服务器
+      权限的人都看不到明文**。传输的文件名、内容哈希与预览摘要同样被加密。
+@@ -198,3 +239,23 @@ UniDrop 与传统文件传输工具（如网盘、微信文件传输助手、隔
+ 
+ ### Q3: 传输超大文件（数 GB）会不会把内存撑爆？
+ * 不会。UniDrop 无论在服务端还是客户端，均采用 **4MB 分块流式管道（Streaming Pipeline）** 和固定大小的滑动窗口设计，零磁盘内存透传。传输时内存开销平稳受控在 30MB~50MB 左右，支持大文件稳定无损流转。
++
++### Q4: 升级后连不上，横幅提示证书有问题？
++
++先展开横幅上的 **「详情」**——各档失败的正确处置完全不同，详见
++[第 2 节「连接安全」](#2-首次配置与偏好设置)的对照表。
++
++最常见的一种是 **「证书域名不匹配」**：你在地址栏填的是 **IP**，
++而证书是签给**域名**的。此时证书本身完全有效，把地址改成证书上的域名即可，
++**不需要关闭证书校验**。
++
++### Q5: 反馈问题时需要提供什么？
++
++客户端日志，它会告诉我们连接是在哪一步失败的：
++
++* **macOS**：`~/Library/Logs/com.unidrop.client/unidrop.log`
++* **Windows**：`%LOCALAPPDATA%\com.unidrop.client\logs\unidrop.log`
++* **Linux**：`~/.local/share/com.unidrop.client/logs/unidrop.log`
++
++日志会自动轮转，最多占用约 4 MB。其中的会话令牌已做脱敏（显示为
++`token=<redacted>`），但 **服务器地址与账号标识是明文**，介意的话发送前请自行裁剪。
+diff --git a/docs/需求.md b/docs/需求.md
+index 2dc47fa..153f462 100644
+--- a/docs/需求.md
++++ b/docs/需求.md
+@@ -123,9 +123,19 @@
+    连带发现一个会让人查很久的坑：**自签证书必须是 X.509 v3**，这一条勾选与否
+    都绕不过——rustls 在解析阶段就拒绝 v1，早于「是否校验签发者」的判断，
+    而 macOS 自带 LibreSSL 的 `openssl req -x509` 默认生成的正是 v1。
+-   **SAN 是另一个条件，只在不勾选本项时才需要**：它服务于主机名校验，
+-   勾选后客户端根本不查名称。此前这里把两者并列成同一个必要条件，机制上不对。
++   **SAN 是另一个条件，只在走公共 CA 校验时才需要**：它服务于主机名校验，
++   另外两档都不查名称。此前这里把两者并列成同一个必要条件，机制上不对。
+    已写进 USER_GUIDE。
++   **信任模型于 2026-09-14 扩成三档**（tls-trust-modes）。起因是一次实际故障：
++   用户用 `wss://<IP>` 连一台证书只签给域名的服务器，rustls 报 `NotValidForName`，
++   而当时的提示一律引导去勾「允许不安全连接」——那张证书其实是**完全合法**的
++   Let's Encrypt 证书，正确处置只是把地址换成域名。原来的两档设计
++   （全信任公共 CA / 全不校验）逼着这类部署在「连不上」和「对所有中间人敞开」
++   之间二选一，中间档 `Pinned`（比对证书 SHA-256 指纹，公共 CA 校验不过时才回退）
++   就是为它和自签部署补的。同时把证书失败按 rustls 的具体成因分成六档，
++   各给各的处置：名称不匹配引导改地址并**明确劝阻**关校验，过期引导续期，
++   X.509 v1 直说关校验也无效。横幅原先用 `truncate` 把多行建议压成一行，
++   关键信息全被截断，一并修掉。
+    **E2EE 已实现**（2026-09-14，e2ee-payload-encryption）。此前占位的协议位
+    （`FLAG_ENCRYPTED`、`encrypted`、帧头预留的 12 字节 `Nonce`）全部启用：
+    数据块走 AES-256-GCM，会话密钥由 `HKDF-SHA256(psk, salt=session_id,
+diff --git a/client/src-tauri/src/core/tls_trust.rs b/client/src-tauri/src/core/tls_trust.rs
+new file mode 100644
+index 0000000..14ddbcc
+--- /dev/null
++++ b/client/src-tauri/src/core/tls_trust.rs
+@@ -0,0 +1,1231 @@
++//! TLS 信任策略与证书失败分类。
++//!
++//! 从 `connection_actor` 拆出来的原因有二：那个模块已经同时管着握手、鉴权、
++//! 重连与心跳；而证书这块接下来还要长出信任档位与自定义 verifier。
++//!
++//! 本模块的立场，一句话：**证书校验失败有很多种，它们的正确处置互不相同，
++//! 把它们统一引导到「关掉校验」是错的。** 这不是洁癖——其中至少两种关了也没用
++//! （X.509 v1 在解析阶段就被拒、过期证书该去续期），而「名字不匹配」那一种，
++//! 关校验等于为了一张**完全合法**的证书把整个传输链路的身份验证废掉。
++
++use std::sync::Arc;
++
++use serde::Serialize;
++use sha2::{Digest, Sha256};
++use tokio_tungstenite::tungstenite;
++
++/// 证书失败的分类。每一档对应一种完全不同的处置动作。
++#[derive(Debug, Clone, PartialEq, Serialize)]
++#[serde(tag = "kind", rename_all = "snake_case")]
++pub enum CertFailureKind {
++    /// 证书本身有效，但签发给了别的名字。典型成因是用 IP 直连一个只对域名
++    /// 签发的证书——证书完全受信任，错的是我们连的地址。
++    NameMismatch {
++        expected: String,
++        presented: Vec<String>,
++    },
++    /// 公共根证书库里没有这个签发者：自签证书或企业内部 CA。
++    UnknownIssuer,
++    Expired,
++    NotYetValid,
++    Revoked,
++    /// X.509 v1。rustls 在**解析**阶段就拒绝，早于任何校验逻辑，
++    /// 因此跳过校验对它无效——这一点必须让用户知道，否则他会一直试错。
++    UnsupportedVersion,
++    /// 分类不出来的证书错误。`raw` 是唯一的现场，必须原样带走。
++    Other,
++}
++
++impl CertFailureKind {
++    /// 给日志用的短标签。前端不依赖它（前端读 serde 的 `kind`）。
++    pub fn tag(&self) -> &'static str {
++        match self {
++            Self::NameMismatch { .. } => "name_mismatch",
++            Self::UnknownIssuer => "unknown_issuer",
++            Self::Expired => "expired",
++            Self::NotYetValid => "not_yet_valid",
++            Self::Revoked => "revoked",
++            Self::UnsupportedVersion => "unsupported_version",
++            Self::Other => "other",
++        }
++    }
++}
++
++/// 发给前端的载荷。
++///
++/// `observed_cert_sha256` 目前恒为 `None`：它留给后续的证书观察器。
++/// 字段现在就定下来，是为了让那一步不必再改一次事件契约、
++/// 也不必让前端测试为同一件事红第二次。
++#[derive(Debug, Clone, PartialEq, Serialize)]
++pub struct TlsCertFailure {
++    #[serde(flatten)]
++    pub kind: CertFailureKind,
++    /// 横幅收起时显示的一行。
++    pub title: String,
++    /// 展开后逐行显示，已经是对症的处置建议。
++    pub detail: Vec<String>,
++    /// 原始错误串。永远保留：分类错了的时候这是唯一的现场。
++    pub raw: String,
++    pub observed_cert_sha256: Option<String>,
++}
++
++/// 从 tungstenite 的错误里取出 rustls 的错误本体。
++///
++/// **为什么不用 `source()` 链**——试过，走不通，这里写清楚免得后人再"简化"回去：
++///
++/// - `tokio-tungstenite` 的 rustls 分支把握手失败包成 `Error::Io`（不是 `Error::Tls`，
++///   这正是用户看到的 `IO error:` 前缀的由来）；
++/// - `tokio-rustls` 用 `io::Error::new(InvalidData, rustls_err)` 包装，未转字符串，
++///   所以类型信息其实还在；
++/// - 但 `std::io::Error::source()` 返回的是**内层错误的 source**，不是内层错误本身，
++///   而 `rustls::Error::source()` 是 `None`。链子到这里就断了。
++///
++/// 所以只能 `get_ref()` 拿到 `&dyn Error` 再 downcast。
++///
++/// **唯一的脆弱点**：downcast 成立的前提是本包依赖的 `rustls` 与 `tokio-rustls`
++/// 依赖的那个解析成**同一个 crate 实例**。今天 Cargo.lock 里只有 rustls 0.23.44
++/// 一份，成立。若将来分裂成两份（例如 tokio-tungstenite 升到依赖 rustls 0.24），
++/// 这里会静默返回 `None`，分类能力随之消失——退化成通用提示，方向是安全的，
++/// 但会悄无声息。`classify_survives_real_handshake` 那条测试就是钉这一点的。
++fn extract_rustls_error(err: &tungstenite::Error) -> Option<&rustls::Error> {
++    match err {
++        tungstenite::Error::Io(io_err) => io_err.get_ref()?.downcast_ref::<rustls::Error>(),
++        // 本项目走不到这一支（用的是 rustls feature），留着是为了将来万一换成
++        // native-tls 之外的其他 TLS 后端时，这里不至于无声漏判。
++        tungstenite::Error::Tls(tungstenite::error::TlsError::Rustls(e)) => Some(e),
++        _ => None,
++    }
++}
++
++/// 按错误文本判断"是不是证书问题"。
++///
++/// 只在 `extract_rustls_error` 拿不到类型时兜底，所以它只回答是与不是，
++/// 不回答是哪一种——分类交给类型化的那条路。
++fn is_cert_error_by_text(text: &str) -> bool {
++    text.contains("certificate")
++        || text.contains("CertificateError")
++        || text.contains("UnknownIssuer")
++        || text.contains("NotValidForName")
++        || text.contains("invalid peer certificate")
++}
++
++/// 把 rustls 给的一条 SAN 项还原成人能读的名字。
++///
++/// **不要以为 `presented` 里是裸域名。** webpki 填这个字段时用的是
++/// `format!("{:?}", GeneralName)`（rustls-webpki 的 dns_name.rs），
++/// 所以实际拿到的形如 `DnsName("www.leafun.xyz")`、`IpAddress(1.2.3.4)`、
++/// `UniformResourceIdentifier("...")`。直接显示出去，用户看到的就是
++/// 一行 `证书签发给：DnsName("www.leafun.xyz")`。
++///
++/// 这个坑是真机验证抓到的：单元测试里手工构造的 `presented` 是裸字符串，
++/// 怎么测都不会暴露它。
++///
++/// 认不出的形态原样返回——宁可显示得难看一点，也不要为了好看把信息吃掉。
++fn humanize_san(raw: &str) -> String {
++    for prefix in ["DnsName(", "IpAddress(", "UniformResourceIdentifier("] {
++        if let Some(rest) = raw.strip_prefix(prefix) {
++            if let Some(inner) = rest.strip_suffix(')') {
++                return inner.trim_matches('"').to_string();
++            }
++        }
++    }
++    raw.to_string()
++}
++
++/// SAN 列表在界面上最多列几个。超出的折叠掉——横幅在一个约 760px 宽的窗口里，
++/// 而通配符证书的 SAN 动辄几十条，全列出来会把设备列表整个挤出视口。
++const MAX_PRESENTED_NAMES: usize = 5;
++
++fn format_presented(presented: &[String]) -> String {
++    if presented.is_empty() {
++        return "（证书没有声明任何适用名称）".to_string();
++    }
++    // 这里拿到的已经是 classify 清洗过的名字，不必再剥一次。
++    if presented.len() <= MAX_PRESENTED_NAMES {
++        return presented.join("、");
++    }
++    format!(
++        "{}…等 {} 个",
++        presented[..MAX_PRESENTED_NAMES].join("、"),
++        presented.len()
++    )
++}
++
++/// 把 rustls 的证书错误翻译成用户能照着做的处置建议。
++///
++/// 非证书类错误返回 `None`——连不上、DNS 失败之类不该套上证书的壳。
++pub fn classify(err: &tungstenite::Error) -> Option<TlsCertFailure> {
++    let raw = err.to_string();
++
++    let kind = match extract_rustls_error(err) {
++        Some(rustls::Error::InvalidCertificate(ce)) => classify_certificate_error(ce),
++        // 拿到了 rustls 错误，但不是证书类（握手失败、协议不兼容等）。
++        Some(_) => return None,
++        // downcast 不成立：退回文本判定，只回答"是不是证书问题"。
++        None => {
++            if !is_cert_error_by_text(&raw) {
++                return None;
++            }
++            CertFailureKind::Other
++        }
++    };
++
++    let (title, detail) = describe(&kind);
++    Some(TlsCertFailure {
++        kind,
++        title,
++        detail,
++        raw,
++        observed_cert_sha256: None,
++    })
++}
++
++fn classify_certificate_error(ce: &rustls::CertificateError) -> CertFailureKind {
++    use rustls::CertificateError as CE;
++    match ce {
++        CE::NotValidForNameContext {
++            expected,
++            presented,
++        } => CertFailureKind::NameMismatch {
++            expected: expected.to_str().to_string(),
++            // 在这里清洗而不是留到格式化时：这个字段会经 serde 发给前端，
++            // 存着 Debug 包装等于把脏数据一路带到界面上。
++            presented: presented.iter().map(|p| humanize_san(p)).collect(),
++        },
++        // 没有上下文的老形态：知道是名字不匹配，但不知道两边分别是什么。
++        CE::NotValidForName => CertFailureKind::NameMismatch {
++            expected: String::new(),
++            presented: Vec::new(),
++        },
++        CE::UnknownIssuer => CertFailureKind::UnknownIssuer,
++        CE::Expired | CE::ExpiredContext { .. } => CertFailureKind::Expired,
++        CE::NotValidYet | CE::NotValidYetContext { .. } => CertFailureKind::NotYetValid,
++        CE::Revoked => CertFailureKind::Revoked,
++        // X.509 v1 没有专门的变体，落在 Other 里，只能看文本。
++        // 只在这一支做字符串匹配是刻意的：为它引 rustls-webpki 直接依赖去 downcast
++        // 同样受"同一 crate 实例"的约束，收益为零。
++        CE::Other(o) if o.to_string().contains("UnsupportedCertVersion") => {
++            CertFailureKind::UnsupportedVersion
++        }
++        // CertificateError 是 #[non_exhaustive]，这一支不能省。
++        _ => CertFailureKind::Other,
++    }
++}
++
++/// 各档的标题与处置建议。
++///
++/// 这里是本次改造真正的交付物。改动之前，**所有**档位共用一句
++/// 「请在设置中勾选『允许不安全连接』」——对名字不匹配那一档来说，
++/// 那是在教用户为了一张合法证书关掉全部身份验证。
++fn describe(kind: &CertFailureKind) -> (String, Vec<String>) {
++    match kind {
++        CertFailureKind::NameMismatch {
++            expected,
++            presented,
++        } if !expected.is_empty() => (
++            format!("服务器证书有效，但不是签发给 {expected} 的"),
++            vec![
++                format!("证书签发给：{}", format_presented(presented)),
++                format!("你连接的是：{expected}"),
++                "请把「服务器地址」改为证书上的域名，端口保持不变。".to_string(),
++                "这张证书本身是受信任的。不要为此关闭证书校验——那会让任何中间人都能冒充服务器。"
++                    .to_string(),
++            ],
++        ),
++        // 退化形态：rustls 没给出上下文，只能说清方向。
++        CertFailureKind::NameMismatch { .. } => (
++            "服务器证书上的名称与你填的地址不匹配".to_string(),
++            vec![
++                "常见成因是用 IP 直连一台只为域名签发证书的服务器。".to_string(),
++                "请把「服务器地址」改为证书上的域名，端口保持不变。".to_string(),
++                "证书本身可能完全有效，不要为此关闭证书校验。".to_string(),
++            ],
++        ),
++        CertFailureKind::UnknownIssuer => (
++            "服务器证书由未知的签发者签发".to_string(),
++            vec![
++                "公共根证书库里没有这个签发者，因此无法确认对端身份。".to_string(),
++                "常见于自签证书或企业内部 CA。".to_string(),
++                "若这是你自己的服务器，建议改用受信任 CA 签发的证书（Let's Encrypt 可免费签发）。"
++                    .to_string(),
++            ],
++        ),
++        CertFailureKind::Expired => (
++            "服务器证书已过期".to_string(),
++            vec![
++                "请在服务端续期证书；使用 Let's Encrypt 时执行 certbot renew。".to_string(),
++                "关闭证书校验也能连上，但那会同时放弃对所有中间人的防护——续期是几分钟的事。"
++                    .to_string(),
++            ],
++        ),
++        CertFailureKind::NotYetValid => (
++            "服务器证书尚未生效".to_string(),
++            vec![
++                "证书的生效时间还没到。".to_string(),
++                "先检查本机系统时间是否正确——时间跑偏是这个错误最常见的原因，而不是证书真有问题。"
++                    .to_string(),
++            ],
++        ),
++        CertFailureKind::Revoked => (
++            "服务器证书已被吊销".to_string(),
++            vec![
++                "签发者已声明这张证书作废，通常意味着私钥泄漏。".to_string(),
++                "在查清原因之前不要继续连接，更不要关闭证书校验。".to_string(),
++            ],
++        ),
++        CertFailureKind::UnsupportedVersion => (
++            "服务器证书是 X.509 v1，客户端无法解析".to_string(),
++            vec![
++                "rustls 在解析阶段就会拒绝 v1 证书，这一步早于任何校验逻辑——关闭证书校验对它无效。"
++                    .to_string(),
++                "必须重新签发带扩展的 v3 证书。用 openssl 自签时要带上 -addext subjectAltName=...，"
++                    .to_string(),
++                "macOS 自带的 LibreSSL 不加这个参数会默认产出 v1 证书。".to_string(),
++            ],
++        ),
++        CertFailureKind::Other => (
++            "无法验证服务器证书".to_string(),
++            vec![
++                "证书校验没有通过，但客户端无法判断具体原因。".to_string(),
++                "下方的原始错误信息可用于排查。".to_string(),
++            ],
++        ),
++    }
++}
++
++/// 三档信任策略。
++///
++/// 改造前只有一个 `allow_insecure_tls: bool`，于是「合法证书但名字对不上」
++/// 和「企业内部 CA 签发」这类部署，唯一的出路就是把校验整个关掉——
++/// 一个本该收窄到单台服务器的例外，被迫放大成对所有中间人敞开。
++/// 中间那一档就是为这两种情形补的。
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum TlsTrustMode {
++    /// 默认：只信任公共根证书库。
++    ///
++    /// `#[default]` 不只是省掉一个 impl：它让「三档里哪一档是安全默认」
++    /// 写在枚举定义上，而不是藏在别处的 impl 里。
++    #[default]
++    PublicCa,
++    /// 公共根校验不过时，再比对用户指定的证书指纹。
++    Pinned,
++    /// 完全不校验。任何出示证书的中间人都能接管连接。
++    Insecure,
++}
++
++/// 把用户填的指纹规范化成 32 字节。
++///
++/// 接受 `openssl x509 -fingerprint -sha256` 的原样输出（带冒号、大写），
++/// 也接受裸 hex。**在保存设置时调用**，不在重连循环里——格式错了要当场
++/// 以精确原因回给用户，而不是变成一次次查不出原因的连接失败。
++pub fn normalize_fingerprint(raw: &str) -> Result<[u8; 32], String> {
++    // openssl 的输出形如 "SHA256 Fingerprint=AB:CD:..."，把前缀也一并吃掉，
++    // 省得用户还要手工裁剪——那一步最容易连带把首字节删掉。
++    let body = raw.rsplit('=').next().unwrap_or(raw);
++    let cleaned: String = body
++        .chars()
++        .filter(|c| !c.is_whitespace() && *c != ':')
++        .collect();
++
++    if cleaned.len() != 64 {
++        return Err(format!(
++            "指纹应为 64 个十六进制字符（SHA-256），当前为 {} 个：{}",
++            cleaned.len(),
++            raw.trim()
++        ));
++    }
++    let bytes = hex::decode(&cleaned).map_err(|e| format!("指纹不是合法的十六进制：{e}"))?;
++    let mut out = [0u8; 32];
++    out.copy_from_slice(&bytes);
++    Ok(out)
++}
++
++/// 连接层真正使用的信任配置。
++#[derive(Debug, Clone, Default)]
++pub struct TlsTrustConfig {
++    pub mode: TlsTrustMode,
++    pins: Vec<[u8; 32]>,
++}
++
++impl TlsTrustConfig {
++    /// 由设置构造。指纹解析失败直接报错——见 `normalize_fingerprint` 的理由。
++    pub fn new(mode: TlsTrustMode, raw_pins: &[String]) -> Result<Self, String> {
++        let mut pins = Vec::new();
++        for raw in raw_pins {
++            if raw.trim().is_empty() {
++                continue;
++            }
++            pins.push(normalize_fingerprint(raw)?);
++        }
++        if mode == TlsTrustMode::Pinned && pins.is_empty() {
++            return Err("选择「信任指定证书」时至少要填一条证书指纹".to_string());
++        }
++        Ok(Self { mode, pins })
++    }
++
++    pub fn public_ca() -> Self {
++        Self::default()
++    }
++
++    /// 这一档是否根本不做身份校验。用于决定要不要把证书失败报给用户——
++    /// 用户自己关掉的校验，不该再拿校验失败去打扰他。
++    pub fn skips_verification(&self) -> bool {
++        self.mode == TlsTrustMode::Insecure
++    }
++}
++
++/// 公共根证书库。
++///
++/// 内容与 tokio-tungstenite 在 `rustls-tls-webpki-roots` feature 下自建的
++/// 完全一致（同一个 `webpki_roots::TLS_SERVER_ROOTS`）——这一点是默认档
++/// 行为不变的依据，改动这里等于改动所有用户的信任集。
++///
++/// 顺带修掉一处浪费：上游那段在**每次 connect 时**都重建一遍根存储，
++/// ~150 个锚点，每次重连都做。这里只建一次。
++fn public_root_store() -> &'static Arc<rustls::RootCertStore> {
++    static ROOTS: std::sync::OnceLock<Arc<rustls::RootCertStore>> = std::sync::OnceLock::new();
++    ROOTS.get_or_init(|| {
++        let mut store = rustls::RootCertStore::empty();
++        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
++        Arc::new(store)
++    })
++}
++
++/// 记录握手中实际看到的服务器证书指纹。
++///
++/// 存在的理由只有一个：让用户能核对"客户端看到的证书"与"服务器上那张证书"
++/// 是不是同一张。指纹对不上就意味着中间有人——而这恰恰是填指纹之前
++/// 唯一该做的一步。
++///
++/// 为什么在握手过程中取而不是事后再连一次去探：事后探测既多一次握手，
++/// 又可能探到另一台机器（负载均衡、DNS 轮询），拿回来的指纹和刚才失败的
++/// 那次根本不是同一张证书——那比不显示更糟，因为它看起来是可信的。
++#[derive(Debug, Default)]
++pub struct CertObserver {
++    seen: std::sync::Mutex<Option<String>>,
++}
++
++impl CertObserver {
++    pub fn new() -> Arc<Self> {
++        Arc::new(Self::default())
++    }
++
++    pub fn observed(&self) -> Option<String> {
++        self.seen.lock().ok().and_then(|g| g.clone())
++    }
++
++    fn record(&self, der: &[u8]) {
++        let digest = Sha256::digest(der);
++        if let Ok(mut g) = self.seen.lock() {
++            *g = Some(hex::encode(digest));
++        }
++    }
++}
++
++/// 只做一件事：把叶子证书的指纹记下来，然后把判定**原样**交给 inner。
++///
++/// **它不改变任何校验结果。** 这一点必须保持——因为装它的时候用的是
++/// `.dangerous().with_custom_certificate_verifier()`，那个 API 名字会让
++/// 后来读代码的人以为默认档的安全性被削弱了。没有：inner 就是
++/// `WebPkiServerVerifier`，与 `with_root_certificates()` 内部构造的是同一个东西。
++///
++/// 改这个类型的时候请想清楚：任何一处提前返回 `Ok`，都会让默认档静默失去校验。
++#[derive(Debug)]
++struct ObservingVerifier {
++    inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
++    observer: Arc<CertObserver>,
++}
++
++impl rustls::client::danger::ServerCertVerifier for ObservingVerifier {
++    fn verify_server_cert(
++        &self,
++        end_entity: &rustls::pki_types::CertificateDer<'_>,
++        intermediates: &[rustls::pki_types::CertificateDer<'_>],
++        server_name: &rustls::pki_types::ServerName<'_>,
++        ocsp_response: &[u8],
++        now: rustls::pki_types::UnixTime,
++    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
++        // 先记录再判定：失败路径才是最需要拿到指纹的那一条。
++        self.observer.record(end_entity.as_ref());
++        self.inner
++            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
++    }
++
++    fn verify_tls12_signature(
++        &self,
++        message: &[u8],
++        cert: &rustls::pki_types::CertificateDer<'_>,
++        dss: &rustls::DigitallySignedStruct,
++    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
++        self.inner.verify_tls12_signature(message, cert, dss)
++    }
++
++    fn verify_tls13_signature(
++        &self,
++        message: &[u8],
++        cert: &rustls::pki_types::CertificateDer<'_>,
++        dss: &rustls::DigitallySignedStruct,
++    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
++        self.inner.verify_tls13_signature(message, cert, dss)
++    }
++
++    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
++        self.inner.supported_verify_schemes()
++    }
++}
++
++/// 公共 CA 校验不过时，回退比对用户指定的证书指纹。
++///
++/// **是并集，不是纯指纹**，这一点是刻意的：中间档的目的是让一个连不上的
++/// 合法部署连上，不是收紧。纯指纹模式下，服务端换成 Let's Encrypt 证书之后
++/// 用户会被自己锁在门外——手里拿着一张完全合法的证书却连不上，
++/// 而那个体验会把他推回「允许不安全连接」，正好是这一整轮要消灭的路径。
++///
++/// 安全性上这不是削弱：对固定的一台服务器，"钉住这张证书"比
++/// "接受任意公共 CA 签发的任意证书"更强。
++#[derive(Debug)]
++struct PinnedCertVerifier {
++    inner: Arc<rustls::client::WebPkiServerVerifier>,
++    pins: Vec<[u8; 32]>,
++}
++
++impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
++    fn verify_server_cert(
++        &self,
++        end_entity: &rustls::pki_types::CertificateDer<'_>,
++        intermediates: &[rustls::pki_types::CertificateDer<'_>],
++        server_name: &rustls::pki_types::ServerName<'_>,
++        ocsp_response: &[u8],
++        now: rustls::pki_types::UnixTime,
++    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
++        match self
++            .inner
++            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
++        {
++            Ok(v) => Ok(v),
++            Err(e) => {
++                let fp: [u8; 32] = Sha256::digest(end_entity.as_ref()).into();
++                // 定长比较，不走 == 之外的早退分支。指纹不是秘密（它公开可得），
++                // 所以这里不需要恒定时间比较，但也没理由写得更花哨。
++                if self.pins.iter().any(|p| p == &fp) {
++                    // 指纹命中后**刻意**不再补校验域名与有效期。
++                    // 这一档服务的正是「证书上的名字对不上」和「自签证书过期了
++                    // 但密钥没换」这两种情形——在这里把那两项检查加回来，
++                    // 整档就失去存在意义了。
++                    return Ok(rustls::client::danger::ServerCertVerified::assertion());
++                }
++                Err(e)
++            }
++        }
++    }
++
++    // 签名校验一律走真实实现。
++    //
++    // 这不是可选项：**跳过签名校验的话，指纹就完全失去意义**——
++    // 任何人都能出示一份从别处抄来的证书副本，指纹当然对得上，
++    // 而他并不持有对应的私钥。是签名校验在证明"出示者确实拥有这张证书"。
++    fn verify_tls12_signature(
++        &self,
++        message: &[u8],
++        cert: &rustls::pki_types::CertificateDer<'_>,
++        dss: &rustls::DigitallySignedStruct,
++    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
++        self.inner.verify_tls12_signature(message, cert, dss)
++    }
++
++    fn verify_tls13_signature(
++        &self,
++        message: &[u8],
++        cert: &rustls::pki_types::CertificateDer<'_>,
++        dss: &rustls::DigitallySignedStruct,
++    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
++        self.inner.verify_tls13_signature(message, cert, dss)
++    }
++
++    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
++        self.inner.supported_verify_schemes()
++    }
++}
++
++/// 跳过服务器证书校验的 verifier。
++///
++/// `verify_server_cert` 无条件返回成功：它不看证书链、不看域名、不看有效期。
++/// 后果要说清楚——启用之后，任何位于中间的人只要出示一张自签证书就能接管
++/// 这条连接，读走经由它传输的剪贴板明文与文件字节。TLS 仍在加密，但加密的
++/// 对端是谁不再有任何保证。
++///
++/// 下面两个签名校验函数是真的——握手本身仍需自洽，
++/// 只是「对方是不是你要找的那台服务器」不再被验证。
++#[derive(Debug)]
++pub struct InsecureServerCertVerifier(pub Arc<rustls::crypto::CryptoProvider>);
++
++impl rustls::client::danger::ServerCertVerifier for InsecureServerCertVerifier {
++    fn verify_server_cert(
++        &self,
++        _end_entity: &rustls::pki_types::CertificateDer<'_>,
++        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
++        _server_name: &rustls::pki_types::ServerName<'_>,
++        _ocsp_response: &[u8],
++        _now: rustls::pki_types::UnixTime,
++    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
++        Ok(rustls::client::danger::ServerCertVerified::assertion())
++    }
++
++    fn verify_tls12_signature(
++        &self,
++        message: &[u8],
++        cert: &rustls::pki_types::CertificateDer<'_>,
++        dss: &rustls::DigitallySignedStruct,
++    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
++        rustls::crypto::verify_tls12_signature(
++            message,
++            cert,
++            dss,
++            &self.0.signature_verification_algorithms,
++        )
++    }
++
++    fn verify_tls13_signature(
++        &self,
++        message: &[u8],
++        cert: &rustls::pki_types::CertificateDer<'_>,
++        dss: &rustls::DigitallySignedStruct,
++    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
++        rustls::crypto::verify_tls13_signature(
++            message,
++            cert,
++            dss,
++            &self.0.signature_verification_algorithms,
++        )
++    }
++
++    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
++        self.0.signature_verification_algorithms.supported_schemes()
++    }
++}
++
++/// 构造 WebSocket 的 TLS 连接器。
++///
++/// `observer` 只由控制面传入：它与信任档位正交，装不装都不影响判定，
++/// 所以数据面传 `None` 不会造成两条链路信任集不一致。
++///
++/// **返回 `None` 的含义**是"交给 tokio-tungstenite 自己建 ClientConfig"。
++/// 改造前默认档一律走这条；现在只有「公共 CA 且不需要观察指纹」才走——
++/// 数据面的两条连接正是这种情况，于是它们的行为与改造前逐字节相同。
++///
++/// 控制面因为要观察指纹而改走自建。等价性依据：上游那段（tls.rs:91-115）做的是
++/// `RootCertStore::empty()` + `extend(webpki_roots::TLS_SERVER_ROOTS)` +
++/// `ClientConfig::builder().with_root_certificates(..).with_no_client_auth()`，
++/// 这里逐行一致，provider 同为进程默认的 ring，两边都不设 ALPN。
++pub fn create_tls_connector(
++    trust: &TlsTrustConfig,
++    observer: Option<Arc<CertObserver>>,
++) -> Option<tokio_tungstenite::Connector> {
++    // 三档都要装 provider，即便默认档马上就 return None。
++    //
++    // 返回 None 之后由 tokio-tungstenite 自己构建 ClientConfig，而 rustls 0.23
++    // 在依赖树里同时存在 ring 与 aws-lc-rs 时（本项目正是如此）无法自动选定
++    // provider，会直接 panic 而不是返回 Err——发生在连接 actor 的 task 里，
++    // 整个重连循环就此死掉。
++    //
++    // 今天 lib.rs 的 run() 开头已经装过一次，所以这行是冗余的；写在这里是因为
++    // 默认档不该依赖一个远在别处的副作用才能不 panic。
++    let _ = rustls::crypto::ring::default_provider().install_default();
++
++    // 默认档 + 不观察 = 完全维持原样，一行 ClientConfig 都不自己碰。
++    if trust.mode == TlsTrustMode::PublicCa && observer.is_none() {
++        return None;
++    }
++
++    let provider = Arc::new(rustls::crypto::ring::default_provider());
++
++    let base: Arc<dyn rustls::client::danger::ServerCertVerifier> = match trust.mode {
++        TlsTrustMode::Insecure => Arc::new(InsecureServerCertVerifier(provider.clone())),
++        TlsTrustMode::PublicCa => rustls::client::WebPkiServerVerifier::builder_with_provider(
++            public_root_store().clone(),
++            provider.clone(),
++        )
++        .build()
++        .expect("webpki verifier from static roots"),
++        TlsTrustMode::Pinned => Arc::new(PinnedCertVerifier {
++            inner: rustls::client::WebPkiServerVerifier::builder_with_provider(
++                public_root_store().clone(),
++                provider.clone(),
++            )
++            .build()
++            .expect("webpki verifier from static roots"),
++            pins: trust.pins.clone(),
++        }),
++    };
++
++    let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> = match observer {
++        Some(observer) => Arc::new(ObservingVerifier {
++            inner: base,
++            observer,
++        }),
++        None => base,
++    };
++
++    let client_config = rustls::ClientConfig::builder_with_provider(provider)
++        .with_safe_default_protocol_versions()
++        .expect("valid tls protocol versions")
++        .dangerous()
++        .with_custom_certificate_verifier(verifier)
++        .with_no_client_auth();
++
++    Some(tokio_tungstenite::Connector::Rustls(Arc::new(client_config)))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use rustls::pki_types::ServerName;
++    use rustls::CertificateError as CE;
++    use std::error::Error as _;
++    use std::io;
++
++    /// 造一个与 tokio-rustls 实际产出形状相同的错误：
++    /// rustls::Error 被 io::Error 包住，再被 tungstenite 包成 Io。
++    fn wrap(e: rustls::Error) -> tungstenite::Error {
++        tungstenite::Error::Io(io::Error::new(io::ErrorKind::InvalidData, e))
++    }
++
++    #[test]
++    fn rustls_error_survives_tungstenite_io_wrapping() {
++        // 钉的是 downcast 机制本身：类型信息必须能穿过两层包装。
++        let err = wrap(rustls::Error::InvalidCertificate(CE::UnknownIssuer));
++        let f = classify(&err).expect("应识别为证书错误");
++        assert_eq!(f.kind, CertFailureKind::UnknownIssuer);
++    }
++
++    #[test]
++    fn source_chain_does_not_expose_rustls_error() {
++        // 这条测试看着怪，但它锁住的是一个反直觉的事实：source() 链在
++        // io::Error 这一层就断了。没有它，后人很容易把 get_ref()+downcast
++        // "简化"成 source() 链，而那会让所有分类静默失效。
++        let err = wrap(rustls::Error::InvalidCertificate(CE::UnknownIssuer));
++        let via_source = err.source().and_then(|s| s.source());
++        assert!(
++            via_source.is_none(),
++            "source() 链居然通了——若 rustls 加了 source()，可以简化 extract_rustls_error"
++        );
++    }
++
++    #[test]
++    fn name_mismatch_carries_both_names() {
++        let err = wrap(rustls::Error::InvalidCertificate(
++            CE::NotValidForNameContext {
++                expected: ServerName::try_from("120.26.54.84").unwrap().to_owned(),
++                // 注意这里刻意用 webpki 的真实格式，不是裸域名——
++                // 早先这条测试用裸字符串，正因如此漏掉了 DnsName(..) 包装。
++                presented: vec![r#"DnsName("www.leafun.xyz")"#.to_string()],
++            },
++        ));
++        let f = classify(&err).expect("应识别为证书错误");
++        assert_eq!(
++            f.kind,
++            CertFailureKind::NameMismatch {
++                expected: "120.26.54.84".to_string(),
++                // 进来时是 DnsName("..")，分类后必须已经是干净名字
++                presented: vec!["www.leafun.xyz".to_string()],
++            }
++        );
++
++        let all = format!("{} {}", f.title, f.detail.join(" "));
++        assert!(all.contains("120.26.54.84"), "缺少实连地址: {all}");
++        assert!(all.contains("www.leafun.xyz"), "缺少证书名称: {all}");
++
++        // 本次改造的核心诉求，反向钉死：证书合法时绝不能引导用户去关校验。
++        assert!(
++            !all.contains("允许不安全连接"),
++            "名字不匹配时不得建议关闭证书校验: {all}"
++        );
++    }
++
++    #[test]
++    fn name_mismatch_without_context_still_advises_address_change() {
++        let err = wrap(rustls::Error::InvalidCertificate(CE::NotValidForName));
++        let f = classify(&err).expect("应识别为证书错误");
++        let all = format!("{} {}", f.title, f.detail.join(" "));
++        assert!(all.contains("服务器地址"), "应引导改地址: {all}");
++        assert!(!all.contains("允许不安全连接"));
++    }
++
++    #[test]
++    fn san_debug_wrapper_is_stripped() {
++        // webpki 给的是 Debug 格式，直接显示会让用户看到 DnsName("...")。
++        assert_eq!(humanize_san(r#"DnsName("www.leafun.xyz")"#), "www.leafun.xyz");
++        assert_eq!(humanize_san("IpAddress(1.2.3.4)"), "1.2.3.4");
++        assert_eq!(
++            humanize_san(r#"UniformResourceIdentifier("https://x/")"#),
++            "https://x/"
++        );
++        // 认不出的原样返回，不吃信息
++        assert_eq!(humanize_san("Unsupported(0x07)"), "Unsupported(0x07)");
++        assert_eq!(humanize_san("DirectoryName"), "DirectoryName");
++    }
++
++    #[test]
++    fn many_presented_names_are_folded() {
++        let names: Vec<String> = (0..9)
++            .map(|i| format!(r#"DnsName("h{i}.example.com")"#))
++            .collect();
++        let err = wrap(rustls::Error::InvalidCertificate(
++            CE::NotValidForNameContext {
++                expected: ServerName::try_from("other.example.com").unwrap().to_owned(),
++                presented: names,
++            },
++        ));
++        let f = classify(&err).unwrap();
++        let joined = f.detail.join(" ");
++        assert!(joined.contains("等 9 个"), "SAN 列表未折叠: {joined}");
++    }
++
++    #[test]
++    fn unsupported_cert_version_detected_from_other() {
++        #[derive(Debug)]
++        struct WebpkiLike;
++        impl std::fmt::Display for WebpkiLike {
++            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++                write!(f, "UnsupportedCertVersion")
++            }
++        }
++        impl std::error::Error for WebpkiLike {}
++
++        let err = wrap(rustls::Error::InvalidCertificate(CE::Other(
++            rustls::OtherError(Arc::new(WebpkiLike)),
++        )));
++        let f = classify(&err).expect("应识别为证书错误");
++        assert_eq!(f.kind, CertFailureKind::UnsupportedVersion);
++        // 关校验救不回来这一档，提示必须说清，否则用户会反复试错。
++        assert!(f.detail.join(" ").contains("无效"));
++    }
++
++    #[test]
++    fn expired_and_not_yet_valid_are_distinguished() {
++        let e = classify(&wrap(rustls::Error::InvalidCertificate(CE::Expired))).unwrap();
++        assert_eq!(e.kind, CertFailureKind::Expired);
++
++        let n = classify(&wrap(rustls::Error::InvalidCertificate(CE::NotValidYet))).unwrap();
++        assert_eq!(n.kind, CertFailureKind::NotYetValid);
++        // 时钟跑偏比证书本身有问题常见得多，提示要先指向这一点。
++        assert!(n.detail.join(" ").contains("系统时间"));
++    }
++
++    #[test]
++    fn non_cert_errors_are_not_classified() {
++        let io_err = tungstenite::Error::Io(io::Error::new(
++            io::ErrorKind::ConnectionRefused,
++            "connection refused",
++        ));
++        assert!(classify(&io_err).is_none());
++
++        let proto = tungstenite::Error::Protocol(
++            tungstenite::error::ProtocolError::HandshakeIncomplete,
++        );
++        assert!(classify(&proto).is_none());
++    }
++
++    /// 端到端：真起一个自签 TLS 监听器，真握一次手，验证分类活着。
++    ///
++    /// **上面那些用手工构造的错误跑的测试，证明不了这一条。** 它们自己造
++    /// `rustls::Error` 再自己 downcast，两头用的必然是同一个类型；
++    /// 而真实链路里错误是 `tokio-rustls` 造的，downcast 是本包做的，
++    /// 中间隔着一次「两处 rustls 必须解析成同一个 crate 实例」的赌注。
++    /// 那正是分类唯一可能静默失效的地方——依赖树一分裂，前面九条测试
++    /// 全绿，而用户那边的提示悄悄退回通用文案。
++    ///
++    /// 所以这条测试钉的不是分类逻辑，是**依赖树的形状**。
++    #[tokio::test]
++    async fn classify_survives_real_handshake() {
++        use tokio::io::AsyncWriteExt;
++        use tokio_rustls::TlsAcceptor;
++
++        let _ = rustls::crypto::ring::default_provider().install_default();
++
++        // 自签证书 → 客户端用公共根校验必然是 UnknownIssuer。
++        let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
++        let cert_der = ck.cert.der().clone();
++        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
++            ck.signing_key.serialize_der().into(),
++        );
++
++        let server_cfg = rustls::ServerConfig::builder()
++            .with_no_client_auth()
++            .with_single_cert(vec![cert_der], key_der)
++            .unwrap();
++        let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
++
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let port = listener.local_addr().unwrap().port();
++
++        tokio::spawn(async move {
++            // 握手会被客户端拒掉，这里 accept 失败是预期的，不要 unwrap。
++            if let Ok((stream, _)) = listener.accept().await {
++                if let Ok(mut tls) = acceptor.accept(stream).await {
++                    let _ = tls.shutdown().await;
++                }
++            }
++        });
++
++        let url = format!("wss://localhost:{port}/ws/control");
++        let err = tokio_tungstenite::connect_async_tls_with_config(
++            &url,
++            None,
++            false,
++            // 默认档：交给 tokio-tungstenite 用 webpki 根校验，正是用户走的那条路。
++            create_tls_connector(&TlsTrustConfig::public_ca(), None),
++        )
++        .await
++        .expect_err("自签证书必须握手失败");
++
++        let failure = classify(&err).unwrap_or_else(|| {
++            panic!("真实握手错误没被识别为证书错误，原始错误：{err}")
++        });
++        assert_eq!(
++            failure.kind,
++            CertFailureKind::UnknownIssuer,
++            "真实握手错误分类失败——多半是依赖树里出现了两份 rustls。原始错误：{err}"
++        );
++    }
++
++    /// 起一个本地自签 TLS 监听器，返回 (端口, 证书 DER)。
++    ///
++    /// 用真握手而不是直接调 verifier，是因为这一档真正要证明的是
++    /// 「自签服务器能连上」这个端到端结果，而不是某个函数的返回值。
++    async fn spawn_self_signed_server(san: &str) -> (u16, Vec<u8>) {
++        use tokio::io::AsyncWriteExt;
++        use tokio_rustls::TlsAcceptor;
++
++        let _ = rustls::crypto::ring::default_provider().install_default();
++
++        let ck = rcgen::generate_simple_self_signed(vec![san.to_string()]).unwrap();
++        let cert_der = ck.cert.der().clone();
++        let cert_bytes = cert_der.to_vec();
++        let key_der =
++            rustls::pki_types::PrivateKeyDer::Pkcs8(ck.signing_key.serialize_der().into());
++
++        let server_cfg = rustls::ServerConfig::builder()
++            .with_no_client_auth()
++            .with_single_cert(vec![cert_der], key_der)
++            .unwrap();
++        let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
++
++        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
++        let port = listener.local_addr().unwrap().port();
++
++        tokio::spawn(async move {
++            loop {
++                let Ok((stream, _)) = listener.accept().await else {
++                    return;
++                };
++                let acceptor = acceptor.clone();
++                tokio::spawn(async move {
++                    if let Ok(mut tls) = acceptor.accept(stream).await {
++                        let _ = tls.shutdown().await;
++                    }
++                });
++            }
++        });
++
++        (port, cert_bytes)
++    }
++
++    fn fingerprint_of(der: &[u8]) -> String {
++        hex::encode(Sha256::digest(der))
++    }
++
++    #[allow(clippy::result_large_err)] // 测试辅助，装箱只会让断言更绕
++    async fn try_connect(port: u16, trust: &TlsTrustConfig) -> Result<(), tungstenite::Error> {
++        let url = format!("wss://localhost:{port}/ws/control");
++        tokio_tungstenite::connect_async_tls_with_config(
++            &url,
++            None,
++            false,
++            create_tls_connector(trust, None),
++        )
++        .await
++        // 握手过了就够了：服务端随即关闭连接，WebSocket 升级失败是预期的，
++        // 而那已经是 TLS 之上的事。这里只关心证书这一关。
++        .map(|_| ())
++    }
++
++    #[tokio::test]
++    async fn pinned_mode_accepts_matching_self_signed_cert() {
++        let (port, cert) = spawn_self_signed_server("localhost").await;
++
++        // 默认档连不上——自签证书不在公共根里。这是对照组，
++        // 没有它就无法确认下面那次成功真的是指纹起的作用。
++        let err = try_connect(port, &TlsTrustConfig::public_ca())
++            .await
++            .expect_err("自签证书不该通过公共 CA 校验");
++        assert_eq!(classify(&err).map(|f| f.kind), Some(CertFailureKind::UnknownIssuer));
++
++        let trust =
++            TlsTrustConfig::new(TlsTrustMode::Pinned, &[fingerprint_of(&cert)]).unwrap();
++        let res = try_connect(port, &trust).await;
++        // 证书这一关必须过。之后的 WebSocket 握手失败与证书无关，不算数。
++        if let Err(e) = &res {
++            assert!(
++                classify(e).is_none(),
++                "指纹匹配却仍报证书错误: {e}"
++            );
++        }
++    }
++
++    #[tokio::test]
++    async fn pinned_mode_rejects_other_cert() {
++        let (port, _) = spawn_self_signed_server("localhost").await;
++        // 另造一张证书的指纹：形状完全合法，只是不是这一台的。
++        let (_, other_cert) = spawn_self_signed_server("localhost").await;
++
++        let trust =
++            TlsTrustConfig::new(TlsTrustMode::Pinned, &[fingerprint_of(&other_cert)]).unwrap();
++        let err = try_connect(port, &trust)
++            .await
++            .expect_err("指纹不匹配必须拒绝");
++        assert_eq!(
++            classify(&err).map(|f| f.kind),
++            Some(CertFailureKind::UnknownIssuer),
++            "拒绝的理由应当仍是公共 CA 那一关，而不是被指纹放行后另生枝节"
++        );
++    }
++
++    #[tokio::test]
++    async fn observer_records_fingerprint_even_when_verification_fails() {
++        // 失败路径才是最需要指纹的那一条：用户要拿它跟服务器上的证书核对。
++        let (port, cert) = spawn_self_signed_server("localhost").await;
++        let observer = CertObserver::new();
++
++        let url = format!("wss://localhost:{port}/ws/control");
++        let _ = tokio_tungstenite::connect_async_tls_with_config(
++            &url,
++            None,
++            false,
++            create_tls_connector(&TlsTrustConfig::public_ca(), Some(observer.clone())),
++        )
++        .await;
++
++        assert_eq!(
++            observer.observed().as_deref(),
++            Some(fingerprint_of(&cert).as_str()),
++            "握手失败时也必须记下实际看到的证书指纹"
++        );
++    }
++
++    #[tokio::test]
++    async fn observing_verifier_does_not_weaken_default_mode() {
++        // 装了观察器的默认档，判定必须与不装时逐字一致——
++        // 它用的是 .dangerous() 那个 API，很容易被误读成"放宽了"。
++        let (port, _) = spawn_self_signed_server("localhost").await;
++
++        let url = format!("wss://localhost:{port}/ws/control");
++        let err = tokio_tungstenite::connect_async_tls_with_config(
++            &url,
++            None,
++            false,
++            create_tls_connector(&TlsTrustConfig::public_ca(), Some(CertObserver::new())),
++        )
++        .await
++        .expect_err("装了观察器也不能放行自签证书");
++        assert_eq!(
++            classify(&err).map(|f| f.kind),
++            Some(CertFailureKind::UnknownIssuer)
++        );
++    }
++
++    #[test]
++    fn fingerprint_normalization_accepts_openssl_output() {
++        let want = [0xABu8; 32];
++        let hexed = hex::encode(want);
++
++        assert_eq!(normalize_fingerprint(&hexed).unwrap(), want);
++        assert_eq!(normalize_fingerprint(&hexed.to_uppercase()).unwrap(), want);
++
++        let colonized = hexed
++            .as_bytes()
++            .chunks(2)
++            .map(|c| std::str::from_utf8(c).unwrap())
++            .collect::<Vec<_>>()
++            .join(":");
++        assert_eq!(normalize_fingerprint(&colonized).unwrap(), want);
++        assert_eq!(
++            normalize_fingerprint(&format!("SHA256 Fingerprint={colonized}")).unwrap(),
++            want
++        );
++
++        // 长度错了要报长度，而不是丢一句"不是合法十六进制"——
++        // 少粘一个字节是最常见的手误。
++        let err = normalize_fingerprint("ab:cd").unwrap_err();
++        assert!(err.contains("64"), "报错应指出长度要求: {err}");
++    }
++
++    #[test]
++    fn public_ca_mode_ignores_pins() {
++        // 填了指纹但档位是 PublicCa：指纹不该悄悄生效。
++        let trust = TlsTrustConfig::new(TlsTrustMode::PublicCa, &[hex::encode([0u8; 32])]).unwrap();
++        assert_eq!(trust.mode, TlsTrustMode::PublicCa);
++        assert!(!trust.skips_verification());
++    }
++
++    // ───────────────────────────────────────────────────────────────
++    // 真机验证。默认 `cargo test` 不跑（需要外网），用
++    // `cargo test -- --ignored --nocapture live_` 手动执行。
++    //
++    // 存在的理由：上面所有测试用的都是本地自签证书，走的全是**失败**路径。
++    // 而自建 ClientConfig 改的是**所有用户都在走的成功路径**——
++    // 「默认档仍然连得上一张正常的公共 CA 证书」这件事，本地自签测不出来。
++    //
++    // **断言必须以 observer 有值为前提。** 第一版写成「握手报错但 classify
++    // 返回 None 就算通过」，那是假的：TCP 连不上时 classify 同样返回 None，
++    // 于是「根本没连上」被当成了「证书校验通过」。实测确实踩中——
++    // 本机 DNS 走 fake-ip 代理，域名解析出 198.18.3.51，Rust 直连必然失败，
++    // 而那条测试当时显示为绿。observer 有值才证明服务器真的出示了证书、
++    // 校验逻辑真的跑过。
++    // ───────────────────────────────────────────────────────────────
++
++    /// 一次真实握手的结果：证书这一关过没过，以及实际看到的指纹。
++    struct LiveOutcome {
++        cert_error: Option<CertFailureKind>,
++        fingerprint: Option<String>,
++        raw: Option<String>,
++    }
++
++    async fn live_probe(addr: &str, port: u16, trust: &TlsTrustConfig) -> LiveOutcome {
++        let observer = CertObserver::new();
++        let url = format!("wss://{addr}:{port}/ws/control");
++        let res = tokio_tungstenite::connect_async_tls_with_config(
++            &url,
++            None,
++            false,
++            create_tls_connector(trust, Some(observer.clone())),
++        )
++        .await;
++
++        let err = res.err();
++        LiveOutcome {
++            cert_error: err.as_ref().and_then(classify).map(|f| f.kind),
++            fingerprint: observer.observed(),
++            raw: err.map(|e| e.to_string()),
++        }
++    }
++
++    impl LiveOutcome {
++        /// 证书这一关确实跑过并且通过了。
++        ///
++        /// WebSocket 升级失败不算数——那已经是 TLS 之上的事。
++        fn assert_cert_accepted(&self, what: &str) {
++            assert!(
++                self.fingerprint.is_some(),
++                "{what}：服务器没出示证书，握手没走到校验那一步（raw={:?}）。\
++                 这不是「通过」，是没连上——检查网络 / DNS / 代理",
++                self.raw
++            );
++            assert!(
++                self.cert_error.is_none(),
++                "{what}：证书校验被拒（{:?}），raw={:?}",
++                self.cert_error,
++                self.raw
++            );
++        }
++    }
++
++    /// 最高风险的一条：自建 ClientConfig 之后，默认档还认不认公共 CA 的证书。
++    ///
++    /// 用 badssl.com 而不是自己的部署：它 DNS 正常、证书正常，
++    /// 且不会因为某台机器的代理配置而变成假阳性。
++    #[tokio::test]
++    #[ignore = "需要外网"]
++    async fn live_public_ca_accepts_normal_public_cert() {
++        let out = live_probe("sha256.badssl.com", 443, &TlsTrustConfig::public_ca()).await;
++        out.assert_cert_accepted("默认档 + 正常公共 CA 证书");
++    }
++
++    /// 默认档必须拒绝过期证书——自建之后这条不能松。
++    #[tokio::test]
++    #[ignore = "需要外网"]
++    async fn live_public_ca_rejects_expired_cert() {
++        let out = live_probe("expired.badssl.com", 443, &TlsTrustConfig::public_ca()).await;
++        assert!(out.fingerprint.is_some(), "没连上，raw={:?}", out.raw);
++        assert_eq!(out.cert_error, Some(CertFailureKind::Expired));
++    }
++
++    /// 事故现场的形态：证书有效，但签发给了别的名字。
++    #[tokio::test]
++    #[ignore = "需要外网"]
++    async fn live_public_ca_reports_name_mismatch() {
++        let out = live_probe("wrong.host.badssl.com", 443, &TlsTrustConfig::public_ca()).await;
++        assert!(out.fingerprint.is_some(), "没连上，raw={:?}", out.raw);
++        match &out.cert_error {
++            Some(CertFailureKind::NameMismatch { expected, presented }) => {
++                assert_eq!(expected, "wrong.host.badssl.com");
++                // 真机才能验到的一点：这里必须已经是干净名字，
++                // 不能是 webpki 原样给的 DnsName("...")
++                assert!(
++                    presented.iter().all(|n| !n.starts_with("DnsName(")),
++                    "SAN 的 Debug 包装没剥掉：{presented:?}"
++                );
++                assert!(!presented.is_empty());
++            }
++            other => panic!("分类错了：{other:?}，raw={:?}", out.raw),
++        }
++    }
++
++    /// 自签证书在默认档下被拒，在填对指纹后放行。
++    #[tokio::test]
++    #[ignore = "需要外网"]
++    async fn live_pinned_accepts_self_signed_by_fingerprint() {
++        let host = "self-signed.badssl.com";
++
++        // 默认档：拒绝，同时把指纹给出来（这正是用户拿指纹的路径）
++        let out = live_probe(host, 443, &TlsTrustConfig::public_ca()).await;
++        assert_eq!(
++            out.cert_error,
++            Some(CertFailureKind::UnknownIssuer),
++            "raw={:?}",
++            out.raw
++        );
++        let fp = out.fingerprint.expect("失败路径也必须拿到指纹");
++
++        // 填对指纹：放行
++        let trust = TlsTrustConfig::new(TlsTrustMode::Pinned, std::slice::from_ref(&fp)).unwrap();
++        live_probe(host, 443, &trust)
++            .await
++            .assert_cert_accepted("中间档 + 正确指纹");
++
++        // 指纹错一位就必须拒绝，否则这一档等于没校验
++        let mut wrong = fp.clone();
++        let last = wrong.pop().unwrap();
++        wrong.push(if last == '0' { '1' } else { '0' });
++        let bad_trust = TlsTrustConfig::new(TlsTrustMode::Pinned, &[wrong]).unwrap();
++        let out = live_probe(host, 443, &bad_trust).await;
++        assert_eq!(
++            out.cert_error,
++            Some(CertFailureKind::UnknownIssuer),
++            "错误指纹被放行了"
++        );
++    }
++
++    /// 不校验档：自签证书也照连不误。
++    #[tokio::test]
++    #[ignore = "需要外网"]
++    async fn live_insecure_accepts_anything() {
++        let trust = TlsTrustConfig::new(TlsTrustMode::Insecure, &[]).unwrap();
++        live_probe("self-signed.badssl.com", 443, &trust)
++            .await
++            .assert_cert_accepted("不校验档 + 自签证书");
++    }
++
++    #[test]
++    fn unclassifiable_cert_text_falls_back_to_other() {
++        // downcast 拿不到类型时（rustls 版本分裂的情形）走文本兜底。
++        let err = tungstenite::Error::Io(io::Error::other(
++            "invalid peer certificate: something brand new",
++        ));
++        let f = classify(&err).expect("文本兜底应识别为证书错误");
++        assert_eq!(f.kind, CertFailureKind::Other);
++        // 原始错误必须原样带走——分类失败时这是唯一的现场。
++        assert!(f.raw.contains("something brand new"));
++    }
++}

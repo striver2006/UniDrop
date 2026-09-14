@@ -1,0 +1,174 @@
+{
+  "schema": "trivium.run.v1",
+  "run_id": "20260914T000047Z",
+  "topic": "tls-trust-modes",
+  "stage": "code",
+  "rerun_index": 1,
+  "command": "trivium review --start --stage code",
+  "prompt_hint": "本轮把 TLS 信任从单个 allow_insecure_tls 开关改成三档（PublicCa / Pinned / Insecure），新增证书失败分类与结构化事件，并接入落盘日志。请重点核验以下几处，且独立核验，不要被代码注释说服——注释是我写的，它们在为设计辩护，正是最需要被挑战的部分。 一、默认档的等价性（最高风险）。改造前 allow_insecure=false 直接返回 None、由 tokio-tungstenite 自建 ClientConfig；现在控制面因为要装证书观察器而改走自建。我声称二者逐行等价（同一份 webpki_roots::TLS_SERVER_ROOTS、同为 ring provider、两边都不设 ALPN）。请对着 tokio-tungstenite 0.23.1 src/tls.rs 的自建代码逐项比对，看有没有被我漏掉的差异（会话缓存、ALPN、证书压缩、协议版本集合等）。这条路径今天所有用户都在走，错了就是全员连不上或全员静默降级。 二、ObservingVerifier 是否真的零判定。它用 dangerous().with_custom_certificate_verifier() 装在默认档上，语义必须是纯委派。请确认四个 trait 方法全部原样转交 inner、没有任何提前返回 Ok 的分支，也没有吞掉错误再转成成功的路径。 三、PinnedCertVerifier 的并集回退是否被正确实现。设计意图：先走公共 CA 完整校验，失败后才比对指纹，命中则跳过域名与有效期。请确认 (a) 签名校验 tls12/tls13 在任何档下都走真实实现——若被跳过，指纹就毫无意义，任何人出示一份抄来的证书副本都能通过；(b) pins 为空时不会误放行；(c) 指纹比对的是叶子证书而非链上任意一张。 四、设置迁移。AppSettings 从 bool 改成枚举加保留 legacy 字段，effective_trust_mode() 是唯一读取入口。请验证所有迁移路径都不会让老用户变得比升级前更宽松，特别是：老库缺键、老库 allow_insecure_tls=true、新键与老键冲突、以及降级回旧版本时 normalize_tls_trust() 的回写是否仍然正确。 五、SAN 内容是攻击者可控的不受信任输入。证书里的 SAN 经 humanize_san 剥掉 Debug 包装后直接显示到错误横幅上。请评估视觉欺骗风险：Unicode 同形字、RTL 覆写、SAN 里塞入形似系统提示的文本，以及剥离逻辑本身会不会被构造出的名字骗过（例如名字里本就含 DnsName（ 这样的前缀）。 六、日志脱敏是否完整。默认级别从 Error 提到 Info 并落盘，redact_query_token 只处理了数据面 URL 的 token。请全量排查提级后新暴露的写盘内容里还有没有凭据、密钥或可复用的令牌。 七、测试里的假绿。我自己已经踩过一次：真机验证最初写成「握手报错但不是证书错误就算通过」，而 TCP 连不上时同样不是证书错误，于是没连上被记成了校验通过。请按同样的思路审视其余测试——尤其是断言「没有错误」而非「确实发生了预期行为」的那些，以及本地自签测试能否真正覆盖它们声称覆盖的路径。",
+  "task_goal": "修复「证书合法但地址用 IP 导致校验失败时，提示反而引导用户关闭证书校验」这一缺陷，并补上介于全信任公共 CA 与全关校验之间的信任档位",
+  "entry": "C",
+  "snapshot": {
+    "git_head": "ab2f75e49e29799b20e0514add9de4f1eb7a8c38",
+    "tree_hash": "bdac6b4457f8fc82d0cd58eb491849518147ed79",
+    "dirty": true,
+    "subject_sha256": "116fb18badda31e3167cc92977a63fe9ae347a8669b09bea54f0414e7663be03",
+    "drift": {
+      "changed": false,
+      "files": [],
+      "policy": "warn"
+    }
+  },
+  "started_at": "2026-09-14T00:00:48.629Z",
+  "finished_at": "2026-09-14T00:09:15.846Z",
+  "review_mode": "dual",
+  "degraded_reason": null,
+  "critics": {
+    "gemini": {
+      "vendor": "antigravity",
+      "cli_version": "1.2.2",
+      "model_requested": "gemini-3.8-flash-high",
+      "model_effective": "gemini-3.8-flash-high",
+      "model_effective_source": "envelope",
+      "effort": "high",
+      "status": "ok",
+      "exit_code": 0,
+      "duration_s": 164.403,
+      "tool_calls": {
+        "read": 26,
+        "grep": 2,
+        "glob": 1,
+        "run_command": 0,
+        "project_reads": 16
+      },
+      "evidence_ok": true,
+      "usage": {
+        "input_tokens": 309401,
+        "output_tokens": 38159,
+        "thinking_tokens": 33247,
+        "cache_read_tokens": 2918651,
+        "total_tokens": 347560
+      },
+      "heterogeneous": true,
+      "fail_reason": null,
+      "empty_review": false,
+      "parse_fallback": false,
+      "session_id": "26cecb84-ddbf-41a2-9a25-2b91a22dda5e",
+      "peer_deny_applied": false
+    },
+    "glm": {
+      "vendor": "zcode",
+      "cli_version": "0.16.5",
+      "model_requested": "GLM-5.3",
+      "model_effective": "bigmodel-coding-plan/GLM-5.3",
+      "model_effective_source": "trace",
+      "model_route": "config_copy",
+      "status": "ok",
+      "exit_code": 0,
+      "duration_s": 507.065,
+      "tool_calls": {
+        "read": 9,
+        "grep": 13,
+        "glob": 5,
+        "run_command": 0,
+        "project_reads": 9
+      },
+      "evidence_ok": true,
+      "usage": {
+        "source": "provider",
+        "modelRequestCount": 16,
+        "inputTokens": 1647965,
+        "outputTokens": 33386,
+        "totalTokens": 1681351,
+        "cacheReadTokens": 1519552,
+        "cacheWriteTokens": 0,
+        "reasoningTokens": 0,
+        "webFetchRequests": 0,
+        "webSearchRequests": 0
+      },
+      "heterogeneous": true,
+      "fail_reason": null,
+      "empty_review": false,
+      "parse_fallback": false,
+      "session_id": "sess_f240cc33-5053-4ea0-a36d-61c70ae4e35a",
+      "peer_deny_applied": false
+    }
+  },
+  "deny_paths": [
+    ".reviews/autostart-single-instance/code/2026-09-13-autostart-single-instance-glm.md",
+    ".reviews/autostart-single-instance/code/_meta/review-glm-20260912T173028Z.json",
+    ".reviews/autostart-single-instance/plan/2026-09-13-autostart-single-instance-glm.md",
+    ".reviews/autostart-single-instance/plan/_meta/review-glm-20260912T171855Z.json",
+    ".reviews/cache-cleanup-configurable/code/2026-09-13-cache-cleanup-configurable-glm.md",
+    ".reviews/cache-cleanup-configurable/code/_meta/review-glm-20260913T024250Z.json",
+    ".reviews/cache-cleanup-configurable/plan/2026-09-13-cache-cleanup-configurable-glm.md",
+    ".reviews/cache-cleanup-configurable/plan/_meta/review-glm-20260913T021317Z.json",
+    ".reviews/e2ee-payload-encryption/code/2026-09-14-e2ee-payload-encryption-glm.md",
+    ".reviews/e2ee-payload-encryption/code/_meta/review-glm-20260913T163647Z.json",
+    ".reviews/e2ee-payload-encryption/plan/2026-09-14-e2ee-payload-encryption-glm.md",
+    ".reviews/e2ee-payload-encryption/plan/_meta/review-glm-20260913T160634Z.json",
+    ".reviews/history-retention-autodismiss/code/2026-09-13-history-retention-autodismiss-glm.md",
+    ".reviews/history-retention-autodismiss/code/_meta/review-glm-20260913T002939Z.json",
+    ".reviews/history-retention-autodismiss/plan/2026-09-13-history-retention-autodismiss-glm.md",
+    ".reviews/history-retention-autodismiss/plan/_meta/review-glm-20260912T234849Z.json",
+    ".reviews/local-store-account-scope/code/2026-09-13-local-store-account-scope-glm.md",
+    ".reviews/local-store-account-scope/code/_meta/review-glm-20260913T111246Z.json",
+    ".reviews/local-store-account-scope/plan/2026-09-13-local-store-account-scope-glm.md",
+    ".reviews/local-store-account-scope/plan/_meta/review-glm-20260913T103846Z.json",
+    ".reviews/multi-account-hardening/code/2026-09-13-multi-account-hardening-glm.md",
+    ".reviews/multi-account-hardening/code/_meta/review-glm-20260913T093116Z.json",
+    ".reviews/multi-account-hardening/plan/2026-09-13-multi-account-hardening-glm.md",
+    ".reviews/multi-account-hardening/plan/_meta/review-glm-20260913T082750Z.json",
+    ".reviews/server-transfer-limits/code/2026-09-13-server-transfer-limits-glm.md",
+    ".reviews/server-transfer-limits/code/_meta/review-glm-20260913T065303Z.json",
+    ".reviews/server-transfer-limits/plan/2026-09-13-server-transfer-limits-glm.md",
+    ".reviews/server-transfer-limits/plan/_meta/review-glm-20260913T033609Z.json",
+    ".trivium",
+    "/Users/chenzhenbo/.trivium/runs"
+  ],
+  "guard": {
+    "readonly_breach": false,
+    "peer_artifact_read": false,
+    "peer_deny_applied": {
+      "gemini": false,
+      "glm": false
+    },
+    "forged_role_file": false,
+    "breached_files": []
+  },
+  "artifacts": [
+    {
+      "path": "tls-trust-modes/code/_meta/changes-20260914T000047Z.diff",
+      "sha256": "116fb18badda31e3167cc92977a63fe9ae347a8669b09bea54f0414e7663be03"
+    },
+    {
+      "path": "tls-trust-modes/code/_meta/brief-gemini-20260914T000047Z.md",
+      "sha256": "7d5396964d19b319a1e2b2017962bd183305b2fd8979cb3ea86be7d8d0aab9cd"
+    },
+    {
+      "path": "tls-trust-modes/code/_meta/brief-glm-20260914T000047Z.md",
+      "sha256": "1e3255514d33cf3395c095dca1c3b5d4d8236e18c8c2790537910dd249ae517f"
+    },
+    {
+      "path": "tls-trust-modes/code/_meta/review-gemini-20260914T000047Z.json",
+      "sha256": "e92f8225c735eb53dc1932ae9940843660afa2e648c04d731062a3c1adfa7991"
+    },
+    {
+      "path": "tls-trust-modes/code/_meta/review-glm-20260914T000047Z.json",
+      "sha256": "456989097a7a3c25d73c026a82a3a00c6cdabd5bd40ad8adb56d8bc03ed7d386"
+    },
+    {
+      "path": "tls-trust-modes/code/2026-09-14-tls-trust-modes-gemini.md",
+      "sha256": "1dd72419b3bc93b91aef5bce36632b81f7b6b268f3d05863c8b8986392cc3d46"
+    },
+    {
+      "path": "tls-trust-modes/code/2026-09-14-tls-trust-modes-glm.md",
+      "sha256": "ad36b45e7eb56ca1839c72b6168aa5577c1490d125d21dfd64f2913b2fc2038c"
+    }
+  ],
+  "gate": {
+    "adjudication_complete": false,
+    "state": "review_done_awaiting_disposition"
+  },
+  "status": "success"
+}
