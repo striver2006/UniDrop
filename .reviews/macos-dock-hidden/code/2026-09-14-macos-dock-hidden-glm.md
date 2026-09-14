@@ -1,0 +1,137 @@
+---
+schema: trivium.review.v1
+topic: macos-dock-hidden
+stage: code
+role: glm
+vendor: zcode
+agent_cli: zcode/0.16.5
+model_requested: GLM-5.3
+model_effective: bigmodel-coding-plan/GLM-5.3
+model_effective_source: trace
+model_route: config_copy
+run_id: 20260914T103457Z
+rerun_index: 1
+snapshot_hash: sha256:9b39b859c63e76ee5d231781d07fefd3858817a34175bbfece199961418d592d
+blind: true
+started_at: 2026-09-14T10:34:59.640Z
+finished_at: 2026-09-14T10:52:59.570Z
+duration_s: 1080
+tool_calls:
+  read: 30
+  grep: 16
+  glob: 5
+  run_command: 0
+  project_reads: 15
+evidence_ok: true
+verdict: approve-with-nits
+findings_count:
+  blocker: 0
+  major: 0
+  minor: 3
+  nit: 0
+degraded: false
+parse_fallback: false
+peer_deny: false
+drift: false
+heterogeneous: true
+session_id: sess_4e1bbfeb-39e4-49b7-9c8c-6d2efea943db
+---
+
+# 代码审查：macos-dock-hidden
+
+> Critic-B · 智谱 ZCode ｜ 模型 `bigmodel-coding-plan/GLM-5.3`
+> ｜ 运行 `20260914T103457Z`
+> ｜ 本轮审核者 gemini、glm
+
+> ⚠️ **路径级 deny 未生效**：本机该侧 CLI 不支持路径级读取拒绝，对方历史产出的屏蔽仅依赖任务书禁读清单与事后轨迹核验。
+
+## 总判断
+
+三个焦点经源码级核验均成立。焦点一：tao 在 applicationDidFinishLaunching 无条件按 aux state（默认 Regular）apply 策略（tao app_state.rs:285→:455，aux 默认在 app_delegate.rs:106），故 LSUIElement 单独必被覆盖、setup 内设置又晚于 launched()（tauri app.rs:1423 证实 setup 跑在 Ready），run() 前经 App::set_activation_policy 写 aux state（tauri-runtime-wry lib.rs:3155→tao macos.rs:343）是唯一零闪烁路径——「互补且缺一不可」论证为真。焦点二：删两处 return 的理由成立（Dock 改为按需放出后，运行期 Placed→Rejected 必须有常驻者再放图标），双速轮询成本可控、CURRENT_POLICY 单写者无竞态、apply 先于 handle_not_placed 的顺序经消息队列排序成立。焦点三：Unknown「放图标但不打扰」三处口径一致且有测试钉住；默认 macOS 菜单未被关闭（含 Edit 子菜单），Accessory 下 key equivalent 有依托。三条 minor：LAUNCH_DOCK_POLICY 注释的「无 28 秒无入口窗口期」断言在 opted-out 角落不成立；start_minimized 启动期快照随 loop 永生化导致语义漂移；被改段落中「启动几秒后自动打开」实为最长 28 秒。
+
+**结论**：`approve-with-nits`
+
+## 审查意见（共 3 条：次要 3）
+
+### GLM-01 · 次要（minor）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `client/src-tauri/src/platform/tray_placement_macos.rs:489-492` |
+| 类别 | maintainability ｜ 层次 code |
+| 置信度 | high |
+
+**问题**：LAUNCH_DOCK_POLICY 的文档注释断言「那一刻 handle_not_placed 会同时把窗口唤起来——Dock 图标和窗口是一起出现的，不存在『28 秒里彻底没有入口』的窗口期」，作为乐观押 Accessory 的安全性论据。但该断言在 start_minimized=true 且 force_reveal_optout=true（guidance_shown 必已置位）的角落不成立：handle_not_placed 中 !guidance_shown 分支被跳过、should_force_reveal 因 opted_out 为 false，窗口不会被唤起，28 秒时刻只有 Dock 图标单独出现。注释把一条只对部分用户成立的行为写成了不变量，后来者（或未来改这段的人）会据此推理「窗口必弹，无需另留入口」。
+
+**依据**：tray_placement_macos.rs:751-793（handle_not_placed：768 行 !guidance_shown 才通知+唤窗，786 行 !revealed && should_force_reveal 才兜底唤窗）；435 行 should_force_reveal = Rejected && start_minimized && !opted_out；638-640 行 mark_force_reveal_optout 由 cmd_dismiss_tray_guidance 落库（commands/window_cmd.rs:40-48）。opt-out 只出现在横幅上（MenuBarHiddenBanner.tsx:78），能点它的用户必然已置 guidance_shown。
+
+**建议**：把这句不变量改弱：说明 opted-out 用户在结论时刻只有 Dock 图标（入口 = Dock 图标 + 访达/启动台再打开，见 USER_GUIDE 2.2 新增条目），或直接在该角落也给出某种可见信号。不需要改行为，行为本身可接受。
+
+### GLM-02 · 次要（minor）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `client/src-tauri/src/platform/tray_placement_macos.rs:679,744,786` |
+| 类别 | correctness ｜ 层次 code |
+| 置信度 | medium |
+
+**问题**：spawn_placement_watchdog 在 setup 时把 start_minimized 拍成快照。旧代码下这个快照的寿命是有限的（定论 Placed 即 return，loop 退出）；本 diff 删掉两处 return 改成常驻 loop 后，快照寿命变成整个进程生命期。运行期发生 Placed→Rejected 翻转时，should_force_reveal 与 build_payload 用的是启动期值：用户后来关掉了「启动即最小化」仍会被强制弹窗，后来开启了它的用户反而拿不到安全唤起。同时拉通道 current_payload 读的是实时设置，推/拉两通道对 start_minimized 的口径会分叉。
+
+**依据**：tray_placement_macos.rs:679（fn spawn_placement_watchdog(app, start_minimized) 快照入参）、705-746（常驻 loop 每次翻转都把快照传给 handle_not_placed / build_payload）、786（should_force_reveal 用快照）；对照 622-629 current_payload 从 state.settings 实时读取 start_minimized；lib.rs:335,864-868 传的是 initial_settings.start_minimized；commands 层 cmd_save_settings 运行期可改该设置。
+
+**建议**：在 handle_not_placed 内实时读 settings（照 current_payload 的取法）替代快照参数，或至少在 loop 翻转分支里重新取一次。改动小，且能顺带统一推/拉两通道的 payload 口径。
+
+### GLM-03 · 次要（minor）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `docs/INSTALL.md:146` |
+| 类别 | maintainability ｜ 层次 code |
+| 置信度 | high |
+
+**问题**：本次改写的 INSTALL.md 段落与 MenuBarHiddenBanner.tsx:63、docs/USER_GUIDE.md:55 均保留/沿用了「（应用/窗口）会在启动几秒后自动打开」的说法，但对这段文字的全部受众（被拒 + 启动即最小化用户）而言，自动打开发生在阶段一定论之后：FIRST_PROBE_DELAY=3s 起探、RETRY_INTERVAL=5s、MAX_RETRIES=6，Rejected 结论固定在 ~28s——代码自己的注释（tray_placement_macos.rs:490）都按 28s 计。用户按「几秒」的预期等不到窗口，会误判为又坏了一层。
+
+**依据**：tray_placement_macos.rs:659-664（3s/5s/6 次常量）、685-691（非 Placed 必探满 6 次）、490（注释自算 28s 上限）；docs/INSTALL.md:146（本 diff 改写的整段中保留「应用会在启动几秒后自动打开主窗口」）；docs/USER_GUIDE.md:55、MenuBarHiddenBanner.tsx:63 同句式。
+
+**建议**：三处文案把「几秒后」改为「约半分钟内（最长约 28 秒）」或「启动后短时间内」，与后端 28s 上限对齐；顺带可把横幅里 start_minimized 那句的时序描述一并校准。
+
+## 认为正确的部分
+
+- 焦点一整套论证经依赖源码逐行核验为真：tauri app.rs:1423 证实 setup 跑在 RuntimeRunEvent::Ready（即 tao launched() 之后）；tao app_state.rs:284-285→455-469 证实 launched() 无条件按 aux state apply 策略；app_delegate.rs:106-108 证实 aux 默认 Regular/dock_visibility=true——所以单靠 Info.plist 的 LSUIElement 必被 Regular 覆盖，而 run() 前的 App::set_activation_policy（app.rs:1286，经 tauri-runtime-wry lib.rs:3155→tao macos.rs:341-345）只写 aux state、由 launched() 统一 apply，零闪烁。两者互补、缺一不可的结论成立。
+- Cargo.lock 版本与注释引用完全一致（tauri 2.11.5 / tauri-runtime 2.11.3 / tauri-runtime-wry 2.11.4 / tauri-utils 2.9.3 / tao 0.35.3），且 send_user_message 主线程特判（tauri-runtime-wry lib.rs:235-255）、set_dock_visibility 的 1 秒去抖（tao dock.rs:13,52-58）、set_focus 守卫与 activateIgnoringOtherApps（tao window.rs:677-685 / util/async.rs:231-238）、Reopen 注册（tao app_delegate.rs:79）全部核实无误——不用 set_dock_visibility、不另包 run_on_main_thread、保留 Reopen 分支的三个决策都有真实依据。
+- tauri-utils config.rs:662-666 证实 bundler 会自动合并 tauri.conf.json 同目录的 Info.plist，tauri.conf.json 无需改动的说法正确。
+- 焦点二：删两处 return 的理由成立——Dock 图标改为由本模块按结论放出后，「已放置的图标不会被单方面收回」的前提确实不再保证有 Dock 兜底，常驻双速轮询是必要修复；STEADY_INTERVAL=300s 把常驻成本压到可接受，apply_activation_policy 在 loop 内每轮调用但靠 policy_transition 去重，稳态不真调；CURRENT_POLICY 单写者（仅 watchdog 任务）、仅 Ok 才落缓存、Err 下轮重试，无竞态无泄漏。
+- 钩子 A（apply_activation_policy）先于 handle_not_placed 的顺序经核验站得住：两者从同一 async 任务先后经 send_user_message 投递主线程，策略变更必然先于 reveal 的 show/set_focus 落地，先激活后切策略会被吞的规避方向正确。
+- 焦点三：Unknown 的三处口径（should_warn_user=false / should_force_reveal=false / 前端横幅只认 rejected）与「放 Dock 图标但不打扰」的设计一致，unknown_takes_the_dock_but_never_warns 是能真失败的有价值测试；policy_transition 的首次必落语义（current=None 强制走一次运行时路径）与两路径状态分离的事实相符，相关测试均能失败、非永真。
+- Accessory 下窗口焦点与 key equivalent 无死角：reveal_main_window 的 unminimize→show→set_focus 顺序与 tao set_focus 前置守卫（!is_minimized && is_visible）精确互补；项目未调 enable_macos_default_menu(false) 也未设自定义 app menu，tauri 默认菜单（app.rs:2245）含 Edit 子菜单 cut/copy/paste/select_all（menu/menu.rs:214-227），NSApp.mainMenu 的 key equivalent 派发不依赖菜单栏可见性。
+- 新增文档口径（USER_GUIDE 2.2 / INSTALL / 横幅）对「Dock 图标是临时兜底、恢复后自动收回」与新行为一致，「访达或启动台再打开唤回窗口」有代码支撑（RunEvent::Reopen 分支 + single-instance 插件非 --silent 即 reveal）。
+
+## 未覆盖范围（本侧盲区）
+
+- 纯静态审查：未构建、未运行应用，未在 macOS 26 上实测 Dock 闪烁、Accessory 下菜单栏可见性、「先激活再切策略会丢激活」的实测断言、以及首次结论为 Placed 时同值 setActivationPolicy(Accessory) 的运行时副作用（代码路径已核，行为未实证）。
+- 未审查前端 App 层对 PLACEMENT_EVENT 的 listener 接线与 fetchInitialData 拉通道的调用点（只读了 MenuBarHiddenBanner 组件与后端 cmd_get_tray_placement）。
+- 探测判据本身（CGWindowList 名字判据、looks_parked 几何、kCGWindowName 在无屏幕录制权限机器上的 Unreadable 回退占比）未被本 diff 修改，未重新复核其真实系统准确性；「控制中心连坐定案」无法静态验证，按模块头定案采信。
+- Windows/Linux 构建仅静态核对了 cfg 门控（#[cfg_attr(not(macos), allow(unused_mut))]、RunEvent::Reopen 的 #[cfg(target_os = "macos")] 门控与非 macOS 的 let _ 兜底），未做跨平台编译验证。
+- Info.plist 与生成 plist 的实际合并产物未跑 tauri build 验证（采信 tauri-utils 源码注释）。
+
+## 实际查阅的项目文件
+
+- `client/src-tauri/src/platform/tray_placement_macos.rs`
+- `client/src-tauri/src/lib.rs`
+- `client/src-tauri/Info.plist`
+- `client/src-tauri/tauri.conf.json`
+- `client/src-tauri/Cargo.lock`
+- `client/src-tauri/src/commands/window_cmd.rs`
+- `client/src-tauri/src/core/startup.rs`
+- `client/src/components/MenuBarHiddenBanner.tsx`
+- `docs/USER_GUIDE.md`
+- `docs/INSTALL.md`
+- `CLAUDE.md`
+- `README.md`
+
+> 编排器从工具轨迹中记录到的读取次数：{"read":30,"grep":16,"glob":5,"run_command":0,"project_reads":15}
+
+---
+
+*本文档由 TriviumCode 编排器从 `glm` 侧的结构化输出渲染而成。
+审查员无写仓库权限，全部落盘由编排器完成。*
