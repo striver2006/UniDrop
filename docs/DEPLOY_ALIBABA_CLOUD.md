@@ -164,7 +164,24 @@ curl http://127.0.0.1:18080/healthz
 
 ---
 
-## 第五阶段：获取 SSL 域名证书 (Let's Encrypt)
+## 第五阶段：准备 SSL 证书
+
+**先确定走哪条路。** 两条路的后续配置不同，选错要返工：
+
+| 你的情况 | 走哪条 | 客户端连接安全档位 |
+| --- | --- | --- |
+| 有已备案域名，能解析到这台 ECS | **路径 A**：Let's Encrypt | 「校验公共 CA 证书」（默认档） |
+| 域名未备案，或干脆只想用 IP 连 | **路径 B**：长期自签证书 | 「信任指定证书」（填指纹） |
+
+> **为什么未备案会卡住路径 A**：阿里云大陆节点对未备案域名的 80 / 443 访问会
+> 施加拦截。UniDrop 自身走 58921 非标端口，通常不受影响——**用 IP 连是能正常
+> 工作的**。卡住的是证书签发：Let's Encrypt 的 HTTP-01 验证要带着**域名**访问
+> 80 端口，那一步会被拦下，于是签不出证书。
+>
+> 这种情况下不必绕弯子（申请备案、换境外节点、折腾 DNS-01），直接走路径 B——
+> 客户端的「信任指定证书」档就是为这个场景设计的。
+
+### 路径 A：域名 + Let's Encrypt
 
 ```bash
 # 1. 安装 Certbot
@@ -181,13 +198,53 @@ sudo certbot certonly --standalone -d drop.yourdomain.com
 # 私钥：  /etc/letsencrypt/live/你的真实域名/privkey.pem
 ```
 
+`--standalone` 需要 80 端口**从公网可达**（Let's Encrypt 要来访问它），且续期时
+同样需要。若安全组或防火墙关闭了 80，续期会在到期前 30 天静默失败。
+
+### 路径 B：IP 直连 + 长期自签证书
+
+客户端用 IP 连接时，公共 CA 证书本来就派不上用场（证书签给域名，IP 连接过不了
+名称校验），只能靠指纹。既然如此，直接签一张十年期的自签证书，指纹十年不变，
+省掉 certbot 与续期维护：
+
+```bash
+sudo mkdir -p /etc/nginx/ssl
+sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+  -keyout /etc/nginx/ssl/unidrop.key \
+  -out /etc/nginx/ssl/unidrop.crt \
+  -subj "/CN=UniDrop" \
+  -addext "subjectAltName=IP:你的公网IP"
+sudo chmod 600 /etc/nginx/ssl/unidrop.key
+sudo chmod 644 /etc/nginx/ssl/unidrop.crt
+
+# 必须确认是 X.509 v3——客户端在解析阶段就会拒绝 v1 证书，
+# 那一步早于任何校验逻辑，选哪个档位都绕不过
+openssl x509 -in /etc/nginx/ssl/unidrop.crt -noout -text | grep Version
+# 必须输出 Version: 3 (0x2)
+
+# 取指纹，填进客户端「设置 → 连接安全 → 信任指定证书」
+sudo openssl x509 -fingerprint -sha256 -noout -in /etc/nginx/ssl/unidrop.crt
+```
+
+走路径 B 时，第一阶段安全组里的 **80 端口可以一并关掉**——它只服务于
+Let's Encrypt 的验证，而路径 B 不需要。
+
+> 自签证书在这个用法下并不比公共 CA 弱。公共 CA 证明的是「对方拥有那个域名」，
+> 而你要确认的是「对方是我那台服务器」——指纹直接钉住了后者。前提是**在服务器上**
+> 取指纹，而不是从客户端看到什么就信什么。
+>
+> 指纹的日常维护、轮换与核对方式，见
+> [用户手册第 6 节「证书指纹的维护」](USER_GUIDE.md#6-证书指纹的维护只有信任指定证书档需要)。
+
 ---
 
 ## 第六阶段：配置 Nginx 监听非标端口 (`58921`)
 
 在 Alibaba Cloud Linux 下，Nginx 配置文件存放在 `/etc/nginx/conf.d/*.conf` 下即自动载入生效。
 
-创建配置文件 `/etc/nginx/conf.d/unidrop.conf`（**注意将配置中的 `drop.yourdomain.com` 替换为您申请成功的真实域名**）：
+创建配置文件 `/etc/nginx/conf.d/unidrop.conf`。**证书那两行按你在第五阶段选的
+路径填**：路径 A 用 `/etc/letsencrypt/live/你的域名/` 下的，路径 B 用
+`/etc/nginx/ssl/` 下的（模板里已标出）。
 
 ```bash
 sudo tee /etc/nginx/conf.d/unidrop.conf > /dev/null <<'EOF'
@@ -197,16 +254,48 @@ map $http_upgrade $connection_upgrade {
     ''      close;
 }
 
+# ── 访问日志脱敏 ──────────────────────────────────────────────
+# 数据面 URL 形如 /ws/data?session_id=..&device_id=..&token=..，
+# 而 nginx 默认的 combined 格式记录完整 $request——一次性会话令牌
+# 会跟着落盘，而 access.log 权限通常较宽，还会被日志收集与备份带走。
+#
+# 只抹 token：session_id 与 device_id 是排查传输问题的主要线索，不能一起丢。
+map $args $args_safe {
+    # 必须用命名捕获组：map 里 $1/$2 不是有效变量，
+    # 写成 $1 会让 nginx 报 unknown "1" variable 而拒绝启动。
+    ~^(?<pre>.*)token=[^&]*(?<post>.*)$  "${pre}token=<redacted>${post}";
+    default                              $args;
+}
+
+# 没有查询串时不要留下一个光秃秃的问号
+map $args $query_suffix {
+    ""      "";
+    default "?$args_safe";
+}
+
+log_format unidrop '$remote_addr - $remote_user [$time_local] '
+                   '"$request_method $uri$query_suffix $server_protocol" '
+                   '$status $body_bytes_sent "$http_referer" "$http_user_agent"';
+# ─────────────────────────────────────────────────────────────
+
 server {
     # 直接监听高位非标加密端口，启用 HTTP/2 与 SSL
     listen 58921 ssl http2;
+
+    # 路径 A 填你的域名；路径 B（IP 直连）保留下划线即可，表示匹配任意主机名
     server_name drop.yourdomain.com;
 
-    # 替换为您的真实域名路径
+    # ↓↓ 路径 A：Let's Encrypt 证书
     ssl_certificate /etc/letsencrypt/live/drop.yourdomain.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/drop.yourdomain.com/privkey.pem;
+    # ↓↓ 路径 B：改用自签证书（把上面两行换成下面两行）
+    # ssl_certificate     /etc/nginx/ssl/unidrop.crt;
+    # ssl_certificate_key /etc/nginx/ssl/unidrop.key;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
+
+    # 启用上面定义的脱敏日志格式
+    access_log /var/log/nginx/access.log unidrop;
 
     # 禁用上传限制（剪贴板传输走分块 WebSocket 流）
     client_max_body_size 0;
