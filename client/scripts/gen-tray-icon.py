@@ -161,19 +161,22 @@ def check(path):
         print(f"FAIL: {path} 不存在", file=sys.stderr)
         return 1
 
-    on_disk = path.read_bytes()
-    expected = render_png_bytes(build_mask())
-
     problems = []
-    if on_disk != expected:
-        problems.append("产物与脚本输出不一致（脚本改了没重跑，或产物被直接编辑）")
 
     try:
-        width, height, pixels = decode_rgba(on_disk)
+        width, height, pixels = decode_rgba(path.read_bytes())
+        # 比的是解码后的像素，不是 PNG 字节。字节全等看着更严，但 IDAT 的压缩
+        # 位流取决于运行环境链接的 zlib 实现——产物在开发机（macOS）生成、
+        # 校验在 CI（ubuntu）执行，两边一旦产出不同位流，CI 会永久红，
+        # 而失败信息会把人指向「脚本改了没重跑」这个错误方向，在开发机重跑也修不好。
+        # 逐像素比对对 zlib 实现差异免疫，且真正要守的不变量本就是像素。
+        _, _, expected_pixels = decode_rgba(render_png_bytes(build_mask()))
     except Exception as exc:  # noqa: BLE001 - 解码失败本身就是要报告的结论
         print(f"FAIL: 无法解码 {path}：{exc}", file=sys.stderr)
         return 1
 
+    if pixels != expected_pixels:
+        problems.append("产物与脚本输出不一致（脚本改了没重跑，或产物被直接编辑）")
     if (width, height) != (SIZE, SIZE):
         problems.append(f"尺寸应为 {SIZE}x{SIZE}，实际 {width}x{height}")
     if any(px[0] or px[1] or px[2] for px in pixels):

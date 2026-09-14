@@ -24,21 +24,17 @@ use protocol::{
 use storage::db::init_database;
 use storage::HistoryRepo;
 
-/// 唤起主窗口的唯一入口。
-///
-/// 「隐藏到托盘」与「最小化到任务栏」是两种不同的形态：后者窗口仍是 visible，
-/// 只调 show() + set_focus() 在 Windows 上无法还原，必须先 unminimize()。
 /// 构建菜单栏 / 任务栏托盘图标。
-///
-/// macOS 上放在 `RunEvent::Ready` 而不是 `setup()` 里：Ready 时 NSApplication
-/// 才算真正就绪，是创建 NSStatusItem 更稳妥的时机。
 ///
 /// **注意：macOS 26 起，菜单栏图标受系统权限控制。** 若用户未在
 /// 「系统设置 → 控制中心 → 菜单栏」允许本应用，状态项仍会被创建成功、
 /// 菜单与点击回调也都正常工作，但系统不给它菜单栏位置（实测坐标恒为
 /// 「屏幕最右减自身宽度」，会被时钟盖住），肉眼看就是「图标没出现」。
-/// 这种情况下代码侧无能为力，也检测不到——排查时不要再往创建时机上找原因。
-/// 参见 tauri-apps/tauri#13770。
+/// 这种情况下代码侧无能为力，也检测不到。
+///
+/// 排查时**不要再往创建时机上找原因**：setup 内创建、推迟到 `RunEvent::Ready`、
+/// 再叠加数百毫秒到数秒的延迟、乃至创建后强制重建，五种形态在生产构建下
+/// 实测坐标全都相同——时机不是变量。参见 tauri-apps/tauri#13770。
 fn build_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tauri::tray::TrayIcon<R>> {
     let quit_item = MenuItem::with_id(app, "quit", "退出 瞬贴 (UniDrop)", true, None::<&str>)?;
     let settings_item = MenuItem::with_id(app, "settings", "偏好设置...", true, None::<&str>)?;
@@ -111,6 +107,11 @@ fn build_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
     Ok(tray)
 }
 
+/// 唤起主窗口的唯一入口。
+///
+/// 「隐藏到托盘」与「最小化到任务栏」是两种不同的形态：后者窗口仍是 visible，
+/// 只调 show() + set_focus() 在 Windows 上无法还原，必须先 unminimize()。
+///
 /// 托盘菜单、托盘点击、第二实例、macOS Reopen、macOS 通知点击全部走这里，
 /// 避免各处行为不一致。pub(crate) 是为了让 platform::notification_macos
 /// 的 delegate 回调也能复用它，而不是另造一条唤起路径。
@@ -765,10 +766,7 @@ pub fn run() {
                 });
             }
 
-            // 6/7. 托盘图标。
-            // macOS 推迟到 RunEvent::Ready 才建，原因见 build_tray 的文档注释；
-            // 其余平台维持原样在 setup 内建，行为不变。
-            #[cfg(not(target_os = "macos"))]
+            // 6/7. 托盘图标（全平台一致，在此创建）。
             build_tray(app.handle())?;
 
             // 7.5 macOS 通知初始化：装 delegate 并请求授权。
@@ -816,35 +814,8 @@ pub fn run() {
         .expect("error while building UniDrop application")
         .run(|app_handle, event| {
             #[cfg(target_os = "macos")]
-            match event {
-                // 托盘在这里建，而不是 setup 里：NSApplication 此时才算真正就绪，
-                // 早于这个点创建的 NSStatusItem 拿不到菜单栏位置（详见 build_tray）。
-                // Ready 在一次进程生命周期内只触发一次，不会重复创建。
-                tauri::RunEvent::Ready => {
-                    // 光推到 Ready 还不够，得再等一小会儿。
-                    //
-                    // 菜单栏的状态项区域就绪得比 Ready 晚，早于它创建的 NSStatusItem
-                    // 建得出来、菜单和点击也都正常，但拿不到布局位置，只会得到一个
-                    // 「屏幕最右减自身宽度」的兜底坐标，于是被系统时钟盖住——
-                    // 肉眼看就是「图标压根没出现」。
-                    //
-                    // 这个时间差在 release 构建下才暴露：实测同一份源码，
-                    // cargo build 的产物坐标正常 (2726,3)，而带 custom-protocol 的
-                    // 生产构建是 (3405,-1)。dev 构建要等 dev server、
-                    // 生产构建走 custom protocol 直接加载，后者到达 Ready 更早，
-                    // 于是抢在了菜单栏前面。只在 dev 下验证会漏掉这个 bug。
-                    //
-                    // 800ms 是留了余量的经验值，不是精确阈值：这里没有可等的确定性
-                    // 信号（AppKit 不提供「状态栏已就绪」的通知），只能给够余量。
-                    // 代价仅仅是图标晚一点出现，而赌小了就会退回图标不可见。
-                    if let Err(e) = build_tray(app_handle) {
-                        // 托盘是本应用唯一的常驻入口，建不出来必须留痕，
-                        // 否则又变成「图标没出现」这种无从查起的哑故障。
-                        log::error!("Failed to build tray icon: {}", e);
-                    }
-                }
-                tauri::RunEvent::Reopen { .. } => reveal_main_window(app_handle),
-                _ => {}
+            if let tauri::RunEvent::Reopen { .. } = event {
+                reveal_main_window(app_handle);
             }
             #[cfg(not(target_os = "macos"))]
             let _ = (app_handle, event);
