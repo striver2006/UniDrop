@@ -303,6 +303,10 @@ sudo nginx -t && sudo systemctl reload nginx
 那么公共 CA 证书对它其实没有意义——你反正用 IP 连，走不了域名校验，
 只能靠指纹。**既然如此，不如换一张有效期十年的自签证书，指纹十年不变。**
 
+> 自签证书在这个用法下并不比公共 CA 证书弱。公共 CA 证明的是「对方拥有那个
+> 域名」，而你要确认的是「对方是我那台服务器」——指纹直接钉住了后者，比前者
+> 更贴题。前提是你**在服务器上**取指纹，而不是从客户端看到什么就信什么。
+
 动手前先确认那张公共 CA 证书有没有别的用途。逐个端口看它是否真在提供 HTTPS：
 
 ```bash
@@ -320,7 +324,12 @@ echo | openssl s_client -connect 你的服务器IP:443 2>/dev/null \
 > 设备常让放行端口的 TCP 握手看起来成功，而后面并没有进程在监听。
 > 要判断"有没有服务"，得让它真的说句话——上面那条 openssl 或一次 `curl -i`。
 
-在服务器上生成：
+#### 操作顺序（按这个顺序做，可以零中断）
+
+关键在于**先让客户端认识新证书，再切换服务端**。顺序反了的话，切换完成到各台
+设备填上新指纹之间，所有设备都连不上。
+
+**第 1 步：生成证书**（不影响正在运行的服务）
 
 ```bash
 sudo mkdir -p /etc/nginx/ssl
@@ -328,19 +337,42 @@ sudo openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
   -keyout /etc/nginx/ssl/unidrop.key \
   -out /etc/nginx/ssl/unidrop.crt \
   -subj "/CN=UniDrop" \
-  -addext "subjectAltName=IP:你的服务器IP"
+  -addext "subjectAltName=IP:你的服务器IP,DNS:你的域名"
+sudo chmod 600 /etc/nginx/ssl/unidrop.key
+sudo chmod 644 /etc/nginx/ssl/unidrop.crt
 ```
 
-**必须确认生成的是 X.509 v3**——客户端在解析阶段就会拒绝 v1 证书，
-那一步早于任何校验逻辑，选哪一档都绕不过：
+SAN 里同时写上 IP 与域名（有域名的话）：指纹档本来就不检查名称，多写无害，
+将来若改用域名访问也不必重签。
+
+**第 2 步：确认是 X.509 v3**
 
 ```bash
-openssl x509 -in /etc/nginx/ssl/unidrop.crt -noout -text | grep Version
-# 必须输出 Version: 3 (0x2)
+openssl x509 -in /etc/nginx/ssl/unidrop.crt -noout -text | grep -E "Version|Not After"
+# 必须是 Version: 3 (0x2)
 ```
 
-把 Nginx 中 UniDrop 那个 `server` 块的证书指向它。**只改这一个 server 块**——
-如果 443 上还有网站在用原来的公共 CA 证书，那部分配置保持不动：
+客户端在**解析**阶段就会拒绝 v1 证书，那一步早于任何校验逻辑，选哪一档都绕不过。
+OpenSSL 1.1.1 以上加了 `-addext` 就会生成 v3；老版本或没加这个参数会产出 v1。
+
+**第 3 步：取指纹**
+
+```bash
+sudo openssl x509 -fingerprint -sha256 -noout -in /etc/nginx/ssl/unidrop.crt
+```
+
+**第 4 步：先把新指纹填进每一台客户端**，在原有那行下面**另起一行**，
+旧的先留着。此时服务端还是旧证书，新指纹不匹配任何东西，不影响当前连接——
+这正是先填的意义。
+
+**第 5 步：切换 Nginx 并重载**（先建回滚点）
+
+```bash
+sudo cp -a /etc/nginx/conf.d/unidrop.conf /etc/nginx/conf.d/unidrop.conf.bak-$(date +%Y%m%d-%H%M%S)
+```
+
+把 UniDrop 那个 `server` 块的两行证书路径指过去。**只改这一个 server 块**——
+如果别的端口上还有网站在用原来的公共 CA 证书，那部分保持不动：
 
 ```nginx
 server {
@@ -353,21 +385,107 @@ server {
 }
 ```
 
-取出指纹并填入客户端：
-
-```bash
-openssl x509 -fingerprint -sha256 -noout -in /etc/nginx/ssl/unidrop.crt
-```
-
 ```bash
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-从此这一串十年不变，不需要再维护。到期前换一张新的，走一次上面的流程即可。
+`nginx -t` 不通过就不要 reload，直接从备份恢复。
 
-> 自签证书并不比公共 CA 证书弱。公共 CA 证明的是「对方拥有那个域名」，
-> 而你在这里要确认的是「对方是我那台服务器」——指纹直接钉住了这一点，
-> 比前者更贴题。前提是你**在服务器上**取指纹，而不是从客户端看到什么就信什么。
+**第 6 步：带外核对**
+
+在能访问服务器的机器上取一次实际握手到的证书，与服务器上的文件比对：
+
+```bash
+echo | openssl s_client -connect 你的服务器IP:58921 2>/dev/null \
+  | openssl x509 -fingerprint -sha256 -noout
+```
+
+两串一致，说明新证书已生效且链路上没有中间人。各设备此时应当自动重连成功
+（连接 actor 最长 30 秒退避一次），确认无误后再把旧指纹那一行删掉。
+
+#### 收尾：停用 certbot 并清理旧证书
+
+换完之后 certbot 就没有存在的必要了。**先备份再删**，万一将来要用还能还原：
+
+```bash
+# 1. 归档备份（含私钥，权限收紧）
+sudo tar czf /root/letsencrypt-backup-$(date +%Y%m%d-%H%M%S).tar.gz -C /etc letsencrypt
+sudo chmod 600 /root/letsencrypt-backup-*.tar.gz
+
+# 2. 停用自动续期
+sudo systemctl disable --now certbot-renew.timer
+# 如果是 cron 方式：sudo crontab -e 删掉 certbot 那一行
+
+# 3. 确认 Nginx 已不再引用它，再删证书
+sudo grep -rn "letsencrypt" /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf
+sudo certbot delete --cert-name 你的域名
+```
+
+用 `certbot delete` 而不是手工 `rm`：它会把 `live/`、`archive/`、`renewal/`
+三处一并清理干净，手工删容易留下半截配置，下次装 certbot 时报错。
+
+> 留意 `sudo ls /root/xxx-*.tar.gz` 这类写法**会失败**：通配符由当前 shell 展开，
+> 而普通用户读不了 `/root`，展开不出来就把字面量传给了 ls。
+> 要用 `sudo sh -c "ls /root/xxx-*.tar.gz"`。
+
+#### 顺带：关掉不再需要的端口
+
+certbot 用的是 HTTP-01 验证（`authenticator = standalone` 或 `webroot`）的话，
+它依赖 80 端口。停用 certbot 之后，如果 80 上没有别的业务，可以一并关掉，
+减少暴露面——公网上的扫描器会持续探测 80 上的 `.env`、`.bak`、`.conf` 这类文件。
+
+先确认 80 上确实没有业务：
+
+```bash
+sudo ss -tlnp | grep -E ':80\b'                    # 谁在监听
+sudo grep -rn "listen.*80" /etc/nginx/nginx.conf /etc/nginx/conf.d/
+sudo ls /etc/nginx/default.d/                      # 默认 server 常 include 这里
+```
+
+> ⚠️ **看访问日志判断「有没有人在用」时有个坑。**
+>
+> Nginx 默认只在 `http` 块里配一次 `access_log`，**所有 server 块共享同一个
+> 文件**，而 `combined` 格式**不记录端口号**。于是 58921 上的 UniDrop 流量
+> 也会写进同一份日志——你会在里面看到 `/ws/control` 返回 `101`
+> （WebSocket 升级成功）而误以为有客户端在走 80 明文连接，
+> 进而不敢关 80。
+>
+> 要分清来自哪个端口，临时加一条带 `$server_port` 的日志格式：
+>
+> ```nginx
+> log_format probe '$remote_addr :$server_port $request $status';
+> access_log /var/log/nginx/probe.log probe;
+> ```
+>
+> `reload` 后观察一会儿，就能看到每条请求各自落在哪个端口。查完把这两行撤掉。
+
+确认无误后，注释掉默认站点的整个 `server` 块（在 `/etc/nginx/nginx.conf` 里）：
+
+```nginx
+# --- 默认站点已停用：80 端口不再监听 ---
+#    server {
+#        listen       80;
+#        listen       [::]:80;
+#        server_name  _;
+#        root         /usr/share/nginx/html;
+#        ……
+#    }
+```
+
+**必须注释整个 server 块，不能只注释那两行 `listen`**——Nginx 对没有 `listen`
+指令的 `server` 块会默认监听 80，只注释 listen 等于什么都没做。
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+sudo ss -tlnp | grep nginx        # 确认只剩 UniDrop 那个端口
+```
+
+> `reload` 之后短时间内 `ss` 可能仍显示 80 在监听，那是旧 worker 进程在优雅
+> 退出（`nginx: worker process is shutting down`），它们还持有旧的监听描述符。
+> 等十几秒再看即可，不必重启 Nginx。
+
+走完这套流程后，指纹十年不变，certbot、80 端口、每两个月一次的指纹更新
+这三件事可以一起从维护清单里划掉。证书到期前换一张新的，重走一遍即可。
 
 ### 6.3 指纹核对：别在被攻击的链路上核对
 
