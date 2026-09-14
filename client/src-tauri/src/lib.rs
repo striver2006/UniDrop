@@ -24,6 +24,18 @@ use protocol::{
 use storage::db::init_database;
 use storage::HistoryRepo;
 
+/// 上一次**生效**的左键动作发生的时刻，用于双击去抖。
+///
+/// 与 `tray_placement_macos` 里的 `CURRENT_POLICY` 同样是模块内静态量而不是
+/// `AppState` 的字段：它只服务于托盘回调这一处，进不了前端也进不了持久化，
+/// 挂到共享状态上只会让那个结构体多背一个跟它无关的概念。
+///
+/// 用 `std::sync::Mutex` 而非本文件里 `use` 进来的 `tokio::sync::Mutex`：
+/// 托盘回调是同步的（`TrayIconEvent::send` 直接调 handler，
+/// tray-icon-0.24.2/src/lib.rs:693-699），里面 await 不了。
+static LAST_LEFT_CLICK: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
 /// 构建菜单栏 / 任务栏托盘图标。
 ///
 /// **注意：macOS 26 (Tahoe) 起，菜单栏项由控制中心进程托管并有准入控制。**
@@ -91,20 +103,65 @@ fn build_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
             _ => {}
         })
         .on_tray_icon_event(|tray, event| {
-            if let TrayIconEvent::Click {
-                button: MouseButton::Left,
-                button_state: MouseButtonState::Up,
+            let TrayIconEvent::Click {
+                button,
+                button_state,
                 ..
             } = event
-            {
-                let app = tray.app_handle();
-                if let Some(win) = app.get_webview_window("main") {
-                    // 最小化到任务栏时窗口仍是 visible，此时应还原而不是隐藏
-                    if win.is_visible().unwrap_or(false) && !win.is_minimized().unwrap_or(false) {
-                        let _ = win.hide();
-                    } else {
-                        reveal_main_window(app);
-                    }
+            else {
+                return;
+            };
+
+            // 这条链路此前一行日志都没有，「点了没反应」时无从分辨事件压根没来，
+            // 还是来了但判据走错——本次故障就卡在这个盲点上排查了很久。留着它。
+            // 回调是被 `TrayIconEvent::send` 同步调用的，直接跑在 AppKit 的鼠标
+            // 事件处理里（macOS 上就是 `mouseUp:`），所以这里只能做轻量的事。
+            log::info!(
+                "Tray icon clicked: button={:?} state={:?}",
+                button,
+                button_state
+            );
+
+            // 只认抬起。按下与抬起各会发一次 Click（macOS 见 tray-icon-0.24.2/
+            // src/platform_impl/macos/mod.rs:336-365，Windows 见 windows/mod.rs:409-449，
+            // Tauri 两种都原样转发、不过滤，tauri-2.11.5/src/tray/mod.rs:31-36），
+            // 两种都接就是一次点击触发两次动作，正好互相抵消。
+            if button != MouseButton::Left || button_state != MouseButtonState::Up {
+                return;
+            }
+
+            // 双击去抖：一次双击会发两次抬起，不拦的话变成「唤起 + 收起」，
+            // 窗口闪一下就没了——旧代码双击打不开窗口就是这么来的。
+            // 被吞掉的那次不刷新时间戳，理由见 is_duplicate_left_click。
+            let now = std::time::Instant::now();
+            let duplicate = {
+                let mut last = LAST_LEFT_CLICK
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if crate::core::tray_click::is_duplicate_left_click(
+                    last.map(|t| now.saturating_duration_since(t)),
+                ) {
+                    true
+                } else {
+                    *last = Some(now);
+                    false
+                }
+            };
+            if duplicate {
+                log::debug!("Ignoring the second click of a tray double-click");
+                return;
+            }
+
+            let app = tray.app_handle();
+            if let Some(win) = app.get_webview_window("main") {
+                if crate::core::tray_click::should_hide_on_tray_click(
+                    win.is_visible().unwrap_or(false),
+                    win.is_minimized().unwrap_or(false),
+                    win.is_focused().unwrap_or(false),
+                ) {
+                    let _ = win.hide();
+                } else {
+                    reveal_main_window(app);
                 }
             }
         })

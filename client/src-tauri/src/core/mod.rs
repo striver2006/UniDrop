@@ -7,6 +7,7 @@ pub mod retention;
 pub mod sliding_window;
 pub mod startup;
 pub mod tls_trust;
+pub mod tray_click;
 pub mod transfer_engine;
 
 pub use cache_manager::*;
@@ -18,4 +19,5 @@ pub use retention::*;
 pub use sliding_window::*;
 pub use startup::*;
 pub use tls_trust::*;
+pub use tray_click::*;
 pub use transfer_engine::*;
