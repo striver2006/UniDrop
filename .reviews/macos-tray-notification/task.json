@@ -3,7 +3,7 @@
   "topic": "macos-tray-notification",
   "goal": "修复 macOS 端两个已失效的功能。其一，菜单栏托盘图标创建成功但不可见，因为直接用了彩色应用图标 32x32.png 且未启用 template 模式，深色主体在深色菜单栏上与背景融为一体。其二，接收消息后的系统通知从不弹出，因为 tauri-plugin-notification 底层经 notify-rust 依赖 mac-notification-sys 的 NSUserNotifica…",
   "created_at": "2026-09-14T03:14:15.573Z",
-  "updated_at": "2026-09-14T03:48:18.115Z",
+  "updated_at": "2026-09-14T05:30:12.573Z",
   "runs": [
     {
       "run_id": "20260914T031414Z",
@@ -28,15 +28,40 @@
       "status": "success",
       "review_mode": "dual",
       "started_at": "2026-09-14T03:48:18.115Z"
+    },
+    {
+      "run_id": "20260914T051622Z",
+      "stage": "code",
+      "rerun_index": 2,
+      "status": "success",
+      "review_mode": "dual",
+      "started_at": "2026-09-14T05:16:23.465Z"
+    },
+    {
+      "run_id": "20260914T053009Z",
+      "stage": "verify",
+      "rerun_index": 2,
+      "status": "success",
+      "review_mode": "dual",
+      "started_at": "2026-09-14T05:30:12.573Z"
     }
   ],
   "gate": {
-    "stage": null,
-    "state": "idle",
-    "since": null,
-    "run_id": null
+    "stage": "code",
+    "state": "approved",
+    "since": "2026-09-14T05:29:12.852Z",
+    "run_id": "20260914T051622Z"
   },
-  "approvals": [],
+  "approvals": [
+    {
+      "at": "2026-09-14T05:29:12.852Z",
+      "stage": "code",
+      "run_id": "20260914T051622Z",
+      "decision": "approved",
+      "reason": null,
+      "session_id": null
+    }
+  ],
   "degradations": [],
   "disputed": false,
   "disputes": []

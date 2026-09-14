@@ -1,0 +1,74 @@
+{
+  "schema": "trivium.review.v1",
+  "verdict": "request-changes",
+  "summary": "最危险的是 GLM-01：RunEvent::Ready 分支的注释通篇论证「光推到 Ready 还不够，得再等约 800ms」，代码却是零等待直接 build_tray——无法确认提交的就是真机验收过的那份形态；同一症状（兜底坐标被时钟盖住）在 build_tray 文档里又被归因为 macOS 26 菜单栏权限并明言「不要再往创建时机上找原因」，两处注释互斥，必须裁决出唯一因果口径。GLM-02 是重构时把 reveal_main_window 的旧文档残留拼进了 build_tray 的 rustdoc。审查焦点之二（通知封装）核实通过：delegate 的 OnceLock 长期持有、completionHandler 当前帧同步调用、窗口操作经 run_on_main_thread 派发，三项在最终形态全部成立且相互一致；上一轮两条意见的修复（minimumSystemVersion=11.0、图标 --check 挂 CI）均已正确落地并本机实测通过。",
+  "findings": [
+    {
+      "id": "GLM-01",
+      "severity": "major",
+      "layer": "code",
+      "kind": "correctness",
+      "location": "client/src-tauri/src/lib.rs:824-844",
+      "problem": "Ready 分支注释声称必须额外等待：lib.rs:824「光推到 Ready 还不够，得再等一小会儿」，831-835 用实测坐标（cargo build 2726,3 vs 生产构建 3405,-1）论证 release 构建 Reach Ready 早于菜单栏就绪，837-839 给出结论「800ms 是留了余量的经验值……赌小了就会退回图标不可见」；但 lib.rs:840 的代码是 `if let Err(e) = build_tray(app_handle)` 直接调用，全文件没有任何 sleep/Duration/dispatch_after（已通读 lib.rs 全文核实）。两种解读都有实际后果：(a) 若时序竞态属实，则真机验收通过的形态（带等待）与提交形态（无等待）不一致，「生产构建图标不可见」的原 bug 仍在；(b) 若真因确系 macOS 26 菜单栏权限（如 build_tray 文档 lib.rs:36-41 所述），则这段竞态叙事是被推翻的旧假设残留，且与该文档「不要再往创建时机上找原因」的排查指引正面冲突——同一症状在相邻两处注释里被归因为两个互斥成因，后来者无从取舍。无论哪种，当前仓库状态都无法证明提交代码经过了它自己描述的那种验证。",
+      "evidence": "通读 client/src-tauri/src/lib.rs 全文：824-839 为等待论证、840 为无等待直接调用、全文件无任何延迟原语；36-41 为 build_tray 文档中「macOS 26 权限、代码侧无能为力、不要再往创建时机上找原因、参见 tauri#13770」的反向叙事；两处描述的症状字面相同（「屏幕最右减自身宽度」兜底坐标、被时钟盖住）。并与 .reviews/macos-tray-notification/code/_meta/changes-20260914T051622Z.diff 的同一 hunk 比对，工作树与 diff 一致（base af5eae4 → head 3249004 的净变更即此形态）。tauri#13770 本身无法外部核实（见 not_covered）。",
+      "suggestion": "Driver 裁决出唯一因果口径并让代码与两处注释对齐：若时序竞态真有其事，把等待实现出来（不要在 run 回调里阻塞主线程，用主队列 dispatch_after 或定时派发后再 build_tray），同时改写 build_tray 文档的权限段落使两处一致；若权限才是真因、竞态是排查过渡假设，则删除 Ready 注释里的竞态叙事与 800ms 段（含 (2726,3)/(3405,-1) 实测数据的因果解读），只保留「Ready 时 NSApplication 就绪、更稳妥」一句话理由。",
+      "confidence": "high"
+    },
+    {
+      "id": "GLM-02",
+      "severity": "minor",
+      "layer": "code",
+      "kind": "maintainability",
+      "location": "client/src-tauri/src/lib.rs:27-42",
+      "problem": "build_tray 的 rustdoc 开头两行半是 reveal_main_window 的旧文档残留：「唤起主窗口的唯一入口。……只调 show() + set_focus() 在 Windows 上无法还原，必须先 unminimize()。」（lib.rs:27-30）紧接「构建菜单栏 / 任务栏托盘图标。」（lib.rs:31），拼接成一段自相矛盾的文档——读文档的人会以为 build_tray 负责唤起主窗口。同时 reveal_main_window（lib.rs:114-117）的新文档只剩调用方清单，丢失了「隐藏到托盘 vs 最小化到任务栏」这段行为依据。成因从 diff 可见：重构把 build_tray 插到 reveal_main_window 原位置时，只替换了旧函数文档注释的最后一行，前两行半留在了原地。",
+      "evidence": "client/src-tauri/src/lib.rs:27-31（残留文本与 build_tray 文档首行直接相连，中间无空行无新条目）、42（fn build_tray）、114-117（reveal_main_window 现文档）；.reviews/macos-tray-notification/code/_meta/changes-20260914T051622Z.diff 的 lib.rs 首 hunk 显示旧 reveal 文档仅有末行「托盘菜单、托盘点击……全部走这里」被替换，首两行未动。",
+      "suggestion": "把 27-30 的旧文档文本移回 reveal_main_window 的文档注释（补回它丢失的行为依据），build_tray 文档从「构建菜单栏 / 任务栏托盘图标。」起头。",
+      "confidence": "high"
+    },
+    {
+      "id": "GLM-03",
+      "severity": "nit",
+      "layer": "code",
+      "kind": "test-gap",
+      "location": "client/scripts/gen-tray-icon.py:164-169",
+      "problem": "--check 用「内存重渲染的完整 PNG 字节」与磁盘产物做全等比较（on_disk != expected），而 IDAT 压缩字节取决于执行环境链接的 zlib 实现。产物在开发机（macOS）生成、校验在 ubuntu-latest 的 CI 执行，两边 zlib 一旦对同一像素数据产生不同位流，CI 会永久红，且失败文案（「脚本改了没重跑，或产物被直接编辑」）把人指向错误方向——在开发机重跑也修不好。不变量断言（36x36、RGB 恒 0）本身是稳的，脆的只是字节全等这一层。",
+      "evidence": "client/scripts/gen-tray-icon.py:164-169（字节全等判定）与 188（成功文案）；.github/workflows/client-ci.yml:41-43（该校验跑在 ubuntu-latest 的 build-frontend job）。我在本机（macOS）实际执行 `python3 client/scripts/gen-tray-icon.py --check` 通过：OK: tray-macos.png 与脚本一致（36x36 RGBA，RGB 恒 0，1296 像素）——即本机字节一致、脚本与产物当前无漂移；跨平台 zlib 位流稳定性未实测，故置信度低。",
+      "suggestion": "把「重渲染字节全等」降级为「decode_rgba 两侧解码后逐像素（含 alpha）比对 + 现有结构不变量」，解码比对对 zlib 实现差异免疫；或在失败信息中补一句「若确认脚本与产物均未动过，可能是 zlib 实现差异」。",
+      "confidence": "low"
+    }
+  ],
+  "agreed": [
+    "审查焦点之二核实通过：notification_macos.rs 最终形态三项性质全部成立且相互一致——DELEGATE 以 OnceLock<Retained> 进程级长期持有，匹配 setDelegate 的 weak property 语义；will_present 与 did_receive 的 completionHandler 均在当前帧同步调用、全路径恰好一次（did_receive 在派发主线程工作之后、闭包之外调用，与其注释论证一致）；did_receive 中 is_minimized/unminimize/show/set_focus 等 NSWindow 系操作全部经 app.run_on_main_thread 派发，闭包只捕获 'static 的 AppHandle clone（notification_macos.rs:33-38、68-69、84-100、153-158）。",
+    "running_as_app_bundle 的 identifier 比对判据在 init_notifications 与 show_notification 两处独立执行，同时防住 currentNotificationCenter 的 NSInternalInconsistencyException 崩溃路径与 dev 裸二进制回落到宿主 bundle 的授权冒名问题（notification_macos.rs:105-135、142-146、183-187）。",
+    "托盘移到 RunEvent::Ready 的机制本身正确：Ready 单次触发、在主线程回调、晚于 setup；非 macOS 平台维持 setup 内创建、行为不变（lib.rs:768-772）；build 失败改为 log::error 留痕而不是让启动失败，方向正确（lib.rs:840-844）。问题仅在注释与因果口径（GLM-01），不在这次移动本身。",
+    "transfer_engine.rs 四处 `let _ =` 改为 Err 留痕（703、992、1011、1023 行附近），与错误 surfaced 的分工自洽：macOS 侧 show_notification 恒返回 Ok、投递失败经 completion block 内的 log::warn 暴露，Windows/Linux 侧经新增的 warn 暴露。",
+    "上一轮 GLM-01 的修复正确落地：tauri.conf.json bundle.macOS.minimumSystemVersion=11.0（tauri.conf.json:34-36），且与 notification_macos.rs:63-67 will_present 处「Banner 是 11.0+ 选项」的注释互为印证。",
+    "上一轮 GLM-02 的修复正确落地：gen-tray-icon.py 新增 --check 模式并断言三项不变量，挂进 client-ci.yml 的 build-frontend job（ubuntu-latest、python3 仅标准库，前置条件成立），本机实测通过。",
+    "Cargo.toml 的 objc2 0.5/0.6 双代并存注释与依赖声明自洽（Cargo.toml:65-97），notification.rs 的 cfg 分发两侧均可编译（ubuntu CI cargo check 覆盖非 macOS 侧）。"
+  ],
+  "not_covered": [
+    "tauri-apps/tauri#13770 无法外部核实：派出的网页检索代理环境无网络能力。build_tray 文档对 macOS 26 菜单栏权限行为的描述（系统设置→控制中心→菜单栏逐应用允许、状态项创建成功但无布局位置）与我对 macOS Tahoe 该行为的既有了解一致，但引用编号本身未验证。",
+    "GLM-01 的两个成因（时序竞态 vs macOS 26 权限）哪个为真无法从仓库判定：无真机、无法复现 release 构建的坐标观测，本次只报告矛盾本身，裁决权在 Driver。",
+    "未编译、未运行 Rust 侧任何构建（只读约束）；编译正确性沿用上一轮对上游绑定的逐一签名比对与 ubuntu CI cargo check 的既有结论，本次未重复。",
+    "真机行为未验证：授权弹窗时机、通知点击唤窗、深浅色菜单栏模板反色、macOS 26 实际投递与菜单栏权限表现。",
+    "跨平台 zlib 压缩字节稳定性未实测，GLM-03 因此标为 low。",
+    "Cargo.lock 仅核对了 diff 涉及的 hunk（objc2-user-notifications 依赖展开、unidrop-client 新增依赖），未全图复查；tray-macos.png 未做人工目检（--check 的逐字节比对已覆盖）。"
+  ],
+  "consulted": [
+    ".reviews/macos-tray-notification/code/_meta/changes-20260914T051622Z.diff",
+    ".reviews/macos-tray-notification/code/2026-09-14-macos-tray-notification-glm.md",
+    ".reviews/macos-tray-notification/code/2026-09-14-macos-tray-notification-response-claude.md",
+    "CLAUDE.md",
+    "AGENTS.md",
+    "README.md",
+    ".github/workflows/client-ci.yml",
+    "client/scripts/gen-tray-icon.py",
+    "client/src-tauri/Cargo.toml",
+    "client/src-tauri/tauri.conf.json",
+    "client/src-tauri/src/lib.rs",
+    "client/src-tauri/src/platform/mod.rs",
+    "client/src-tauri/src/platform/notification.rs",
+    "client/src-tauri/src/platform/notification_macos.rs",
+    "client/src-tauri/src/core/transfer_engine.rs"
+  ]
+}

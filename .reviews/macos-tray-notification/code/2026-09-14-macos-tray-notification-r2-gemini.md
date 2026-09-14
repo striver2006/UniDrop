@@ -1,0 +1,122 @@
+---
+schema: trivium.review.v1
+topic: macos-tray-notification
+stage: code
+role: gemini
+vendor: antigravity
+agent_cli: agy/1.2.2
+model_requested: gemini-3.8-flash-high
+model_effective: gemini-3.8-flash-high
+model_effective_source: envelope
+effort: high
+run_id: 20260914T051622Z
+rerun_index: 2
+snapshot_hash: sha256:36b38fafc0e290f4311dbbbb223933144e76c9b1c460b2eda9063241e6d66923
+blind: true
+started_at: 2026-09-14T05:16:23.595Z
+finished_at: 2026-09-14T05:24:15.082Z
+duration_s: 139
+tool_calls:
+  read: 20
+  grep: 2
+  glob: 1
+  run_command: 0
+  project_reads: 10
+evidence_ok: true
+verdict: request-changes
+findings_count:
+  blocker: 0
+  major: 1
+  minor: 0
+  nit: 1
+degraded: false
+parse_fallback: false
+peer_deny: false
+drift: false
+heterogeneous: true
+session_id: c10e5469-04bb-4057-8601-2cd6753a165e
+---
+
+# 代码审查：macos-tray-notification
+
+> Critic-A · Google Antigravity ｜ 模型 `gemini-3.8-flash-high`
+> ｜ 运行 `20260914T051622Z` ｜ 第 2 轮
+
+> ⚠️ **路径级 deny 未生效**：本机该侧 CLI 不支持路径级读取拒绝，对方历史产出的屏蔽仅依赖任务书禁读清单与事后轨迹核验。
+
+## 总判断
+
+最主要问题在于托盘创建移至 Ready 的改动存在严重文实割裂与自相矛盾（AGY-01）：代码无延时直接调用，注释却详述「800ms 经验值延迟」，且与行 36-41 阐明菜单栏权限才是不可见真因的结论直接对立；
+在 macOS 26 权限控制才是不可见根因的前提下，该时序调整必要性不成立，且导致平台间生命周期不对称与最小化冷启动时序倒挂；
+此外 build_tray 注释开头残留了 reveal_main_window 的说明文本（AGY-02）；
+除托盘时序与注释外，UNUserNotificationCenter 的 OnceLock 长期持有、completionHandler 同步回调、主线程派发三者逻辑完备且高度自洽。
+
+**结论**：`request-changes`
+
+## 审查意见（共 2 条：重要 1 ｜ 吹毛求疵 1）
+
+### AGY-01 · 重要（major）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `client/src-tauri/src/lib.rs:824-845` |
+| 类别 | correctness ｜ 层次 code |
+| 置信度 | high |
+
+**问题**：托盘创建推迟至 Ready 的必要性不成立，且存在严重的文实割裂与自相矛盾：注释详述「800ms 经验值延迟」但代码同步直接执行；且将 (3405, -1) 归咎于时序落后，与行 36-41 阐述的系统菜单栏权限真实成因直接冲突。
+
+**依据**：查阅 client/src-tauri/src/lib.rs:824-845，代码在 RunEvent::Ready 分支直接调用 build_tray(app_handle)，并无任何延时逻辑；但上方注释却称『光推到 Ready 还不够，得再等一小会儿... 800ms 是留了余量的经验值... 赌小了就会退回图标不可见』。同时对比 client/src-tauri/src/lib.rs:36-41，已明确写明『macOS 26 起受系统权限控制... 实测坐标恒为屏幕最右减自身宽度... 排查时不要再往创建时机上找原因』。结合 .reviews/macos-tray-notification/verify/2026-09-14-macos-tray-notification-acceptance-claude.md，真机测试中立即调用即成功，反证了时序缺陷与 800ms 假设均不成立。将托盘创建拆出至 Ready 仅在 macOS 生效，导致跨平台生命周期不对称、错误无法在 setup 阶段向上传播，且在 cold launch 配置为最小化启动时导致窗口已隐藏而托盘尚不存在的时序倒挂。
+
+**建议**：清理 RunEvent::Ready 中虚构的 800ms 延迟及错误归因注释；在确认真实根因为 macOS 权限的前提下，评估将 build_tray 重新收拢回 setup() 中全平台统一创建；若因 AppKit 事件循环就绪考虑仍保留在 Ready，应彻底重写注释消除与行 36-41 的矛盾，并明确说明无延迟立即调用的真实理由。
+
+### AGY-02 · 吹毛求疵（nit）
+
+| 项 | 内容 |
+| :--- | :--- |
+| 位置 | `client/src-tauri/src/lib.rs:27-31` |
+| 类别 | maintainability ｜ 层次 code |
+| 置信度 | high |
+
+**问题**：build_tray 文档注释开头残留了 reveal_main_window 的历史说明，造成语义混乱。
+
+**依据**：查阅 client/src-tauri/src/lib.rs:27-31，build_tray 的 doc comment 开头包含了『唤起主窗口的唯一入口... 「隐藏到托盘」与「最小化到任务栏」是两种不同的形态...』等三行文字，而该描述实际属于 reveal_main_window（见 client/src-tauri/src/lib.rs:114-116），系重构提取 build_tray 函数时遗留的拼接残余。
+
+**建议**：删除 client/src-tauri/src/lib.rs 第 27-30 行中属于 reveal_main_window 的冗余文档注释，使 build_tray 文档注释从『构建菜单栏 / 任务栏托盘图标』开始。
+
+## 认为正确的部分
+
+- UNUserNotificationCenter 完整生命周期与线程模型自洽：DELEGATE 经 OnceLock 长期保留，有效防范了 ObjC setDelegate: 的 weak 属性导致对象被释放后通知回调静默失效的问题；completionHandler 在当前回调线程当前帧同步调用，严格遵守了 block2 借用引用生命周期契约并及时向系统汇报；reveal_main_window 经 app.run_on_main_thread 安全派发至主线程，确保 AppKit NSWindow UI 操作线程安全，三者设计完备且互不冲突。
+- 权限与 Bundle 边界判定防御：running_as_app_bundle 通过精确比对 NSBundle 的 bundleIdentifier 与应用配置，既消除了开发态裸二进制调用抛出 NSInternalInconsistencyException 导致的启动崩溃，又避免了回落至宿主终端身份发起索权的异常行为。
+- 托盘模板图标防漂移机制：gen-tray-icon.py 严格按照 36x36 RGBA、颜色通道恒为 0 且仅由 alpha 表达形状的规范生成模板图，并在 CI 中集成 --check 防漂移比对，从根源上杜绝了深色菜单栏图标融色不可见问题。
+- 错误可观测性提升：将 transfer_engine.rs 中原有的四处 let _ = show_transfer_notification(...) 统一改为 if let Err(e) = ... log::warn!，彻底清除了发通知失败时的静默吞错隐患。
+
+## 未覆盖范围（本侧盲区）
+
+- macOS 真实多屏环境下不同屏幕分辨率与菜单栏拥挤情况下的物理排布渲染表现。
+- 用户在系统偏好设置中动态关闭/开启通知权限时，运行中进程接收通知的即时动态行为。
+- Windows 与 Linux 系统环境下托盘与通知在非标准桌面环境下的显示表现。
+
+## 实际查阅的项目文件
+
+- `CLAUDE.md`
+- `AGENTS.md`
+- `README.md`
+- `client/src-tauri/src/lib.rs`
+- `client/src-tauri/src/platform/notification_macos.rs`
+- `client/src-tauri/src/platform/notification.rs`
+- `client/src-tauri/src/core/transfer_engine.rs`
+- `client/src-tauri/Cargo.toml`
+- `client/src-tauri/tauri.conf.json`
+- `client/scripts/gen-tray-icon.py`
+- `.reviews/macos-tray-notification/code/2026-09-14-macos-tray-notification-gemini.md`
+- `.reviews/macos-tray-notification/code/2026-09-14-macos-tray-notification-response-claude.md`
+- `.reviews/macos-tray-notification/verify/2026-09-14-macos-tray-notification-acceptance-claude.md`
+- `.reviews/macos-tray-notification/plan/2026-09-14-macos-tray-notification-revised-claude.md`
+- `.reviews/macos-tray-notification/verify/2026-09-14-macos-tray-notification-verify.md`
+
+> 编排器从工具轨迹中记录到的读取次数：{"read":20,"grep":2,"glob":1,"run_command":0,"project_reads":10}
+
+---
+
+*本文档由 TriviumCode 编排器从 `gemini` 侧的结构化输出渲染而成。
+审查员无写仓库权限，全部落盘由编排器完成。*

@@ -1,0 +1,20 @@
+{
+  "schema": "trivium.verify-run.v1",
+  "run_id": "20260914T053009Z",
+  "topic": "macos-tray-notification",
+  "stage": "verify",
+  "rerun_index": 2,
+  "status": "success",
+  "started_at": "2026-09-14T05:30:09.904Z",
+  "finished_at": "2026-09-14T05:30:12.568Z",
+  "artifacts": [
+    {
+      "path": "macos-tray-notification/verify/2026-09-14-macos-tray-notification-r2-verify.md",
+      "sha256": "0c415036d4b72d8a622b803be93cabd7bd6ad641f40be7d9b6d4443fea0ea01a"
+    },
+    {
+      "path": "macos-tray-notification/verify/_meta/verify-20260914T053009Z.json",
+      "sha256": "eead079c7a427df350ec4b95297af01f6f844437bb9b5e3fd94a6cc51cec83cb"
+    }
+  ]
+}
