@@ -156,3 +156,20 @@ export function certFailureStatusText(kind: CertFailureKind["kind"]): string {
       return "证书校验失败";
   }
 }
+
+/** 菜单栏图标是否真被系统放上了菜单栏（macOS 26 起有此机制）。 */
+export type TrayPlacement = "placed" | "rejected" | "unknown";
+
+/**
+ * 后端菜单栏放置探测的结果。
+ *
+ * `cmd_get_tray_placement` 返回 `null` 表示本平台没有这套机制
+ * （Windows / Linux 的托盘不受限），此时什么都不显示。
+ */
+export type TrayPlacementPayload = {
+  placement: TrayPlacement;
+  /** 用户开了「启动即最小化到托盘」。被拒时这会让他彻底没有入口。 */
+  start_minimized: boolean;
+  guidance_shown: boolean;
+  force_reveal_optout: boolean;
+};

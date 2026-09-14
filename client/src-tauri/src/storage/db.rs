@@ -163,3 +163,29 @@ pub fn save_persisted_settings(conn: &Connection, json_val: &str) -> Result<(), 
     )?;
     Ok(())
 }
+
+/// 读一个 `local_config` 标记，不存在（或读失败）返回 `None`。
+///
+/// 与上面几个函数不同，键名由调用方给：`device_id` / `app_settings` 是两个
+/// 各有语义的单例，写死键名是合适的；而这里服务的是一族「后端自己写、
+/// 前端不参与」的开关，每加一个就复制一对专用函数没有意义。
+///
+/// **这类标记刻意不放进 `AppSettings`。** `cmd_save_settings` 收的是前端提交的
+/// **整份** settings，后端若往里写字段，用户随便保存一次设置就会把它冲回默认值
+/// （前端手里那份是打开面板时拉的旧副本）——经典的 read-modify-write 覆盖。
+/// `AppSettings` 的不变量是「前端是唯一写入方」，后端状态不能混进去。
+pub fn get_local_flag(conn: &Connection, key: &str) -> Option<String> {
+    let mut stmt = conn
+        .prepare("SELECT value FROM local_config WHERE key = ?1")
+        .ok()?;
+    stmt.query_row([key], |row| row.get(0)).ok()
+}
+
+/// 写一个 `local_config` 标记。
+pub fn set_local_flag(conn: &Connection, key: &str, value: &str) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT OR REPLACE INTO local_config (key, value, updated_at) VALUES (?1, ?2, CURRENT_TIMESTAMP)",
+        [key, value],
+    )?;
+    Ok(())
+}

@@ -26,15 +26,20 @@ use storage::HistoryRepo;
 
 /// 构建菜单栏 / 任务栏托盘图标。
 ///
-/// **注意：macOS 26 起，菜单栏图标受系统权限控制。** 若用户未在
-/// 「系统设置 → 控制中心 → 菜单栏」允许本应用，状态项仍会被创建成功、
-/// 菜单与点击回调也都正常工作，但系统不给它菜单栏位置（实测坐标恒为
-/// 「屏幕最右减自身宽度」，会被时钟盖住），肉眼看就是「图标没出现」。
-/// 这种情况下代码侧无能为力，也检测不到。
+/// **注意：macOS 26 (Tahoe) 起，菜单栏项由控制中心进程托管并有准入控制。**
+/// 状态项被拒时不会报任何错误——创建成功、菜单弹得开、回调照常触发，只是
+/// 控制中心不给它菜单栏位置，肉眼看就是「图标没出现」。这套哑故障的检测在
+/// [`platform::tray_placement_macos`]，已知诱因（LaunchServices 死记录触发按
+/// bundle id 的粘性拉黑）的启动期治理在 [`platform::ls_hygiene_macos`]，
+/// 且治理必须在**本函数之前**完成（见其模块头的顺序约束）。
 ///
+/// 用户侧还有一道正常的准入开关：「系统设置 → 菜单栏 → 允许在菜单栏中」。
 /// 排查时**不要再往创建时机上找原因**：setup 内创建、推迟到 `RunEvent::Ready`、
 /// 再叠加数百毫秒到数秒的延迟、乃至创建后强制重建，五种形态在生产构建下
-/// 实测坐标全都相同——时机不是变量。参见 tauri-apps/tauri#13770。
+/// 实测坐标全都相同——时机不是变量（见 tauri-apps/tauri#13770 与
+/// `tray_placement_macos` 的模块头）。2026-09-14 的最小探针实验进一步证明
+/// 拒绝与托盘的建法（tray-icon 还是原生 AppKit）也无关：同 bundle id 的
+/// /tmp 裸探针照样秒拒，全新 bundle id 的同款探针正常上屏。
 fn build_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tauri::tray::TrayIcon<R>> {
     let quit_item = MenuItem::with_id(app, "quit", "退出 瞬贴 (UniDrop)", true, None::<&str>)?;
     let settings_item = MenuItem::with_id(app, "settings", "偏好设置...", true, None::<&str>)?;
@@ -68,7 +73,7 @@ fn build_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
         tray_builder = tray_builder.icon(icon.clone());
     }
 
-    let tray = tray_builder
+    let tray_built = tray_builder
         .on_menu_event(|app, event| match event.id.as_ref() {
             "quit" => {
                 app.exit(0);
@@ -104,7 +109,70 @@ fn build_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
         })
         .build(app)?;
 
-    Ok(tray)
+    // macOS 26 起，菜单栏项由「控制中心」进程托管，应用这边只留一个坐标不可信的
+    // 影子窗口。托管窗口以状态项的 `autosaveName` 为名——**没有 autosaveName 的
+    // 状态项会以匿名身份（Item-0）去登记，系统认不出它是谁，于是不给槽位**，
+    // 表现就是「图标完全不出现」，且没有任何错误。
+    //
+    // tray-icon 0.24.2 自己不设这个属性（全仓库无 setAutosaveName 调用），
+    // 所以必须在这里补。实测依据：
+    //   - 同机对照的原生应用设了 autosaveName，控制中心为它建了同名窗口，图标正常；
+    //   - 本应用未设时，控制中心**完全没有**为它建窗口，而进程内的影子窗口停在
+    //     「屏幕最右减自身宽度」处（压在时钟底下），这正是「从未获得槽位」的特征。
+    //
+    // 这个名字同时是运行期自检的依据（见 platform::tray_placement_macos），
+    // **改名字要两边一起改**，否则自检会把正常状态误判成被拒。
+    //
+    // 在 setup（主线程）里调 with_inner_tray_icon 不会自锁：它内部是
+    // run_on_main_thread + 阻塞收回执，而 tauri-runtime-wry 的 send_user_message
+    // 对「调用方已在主线程」做了特判，直接同步就地执行（lib.rs:239）。
+    // 此时事件循环还没 run 起来，靠的正是这条特判——别改成先 spawn 再等。
+    #[cfg(target_os = "macos")]
+    if let Err(e) = tray_built.with_inner_tray_icon(|inner| {
+        if let Some(item) = inner.ns_status_item() {
+            item.setAutosaveName(Some(&objc2_foundation_v06::NSString::from_str(
+                platform::tray_placement_macos::TRAY_AUTOSAVE_NAME,
+            )));
+
+            // 诊断：把状态项自身的状态打出来。
+            // macOS 26 下系统侧日志对「能显示」和「不能显示」的应用完全一致
+            // （实测对照过一个同机正常工作的原生应用，托管序列逐行相同），
+            // 所以差异只可能在我们送过去的内容上——图标是否真的设上、按钮多宽、
+            // 状态项是否 visible。这几个值只能在本进程内读到。
+            if let Some(mtm) = objc2_v06::MainThreadMarker::new() {
+                let button = item.button(mtm);
+                let (has_image, image_size, title, button_frame) = match &button {
+                    Some(b) => {
+                        let img = b.image();
+                        (
+                            img.is_some(),
+                            img.as_ref().map(|i| i.size()),
+                            b.title().to_string(),
+                            Some(b.frame()),
+                        )
+                    }
+                    None => (false, None, String::new(), None),
+                };
+                log::info!(
+                    "Status item diagnostics: visible={} length={} has_button={} has_image={} \
+                     image_size={:?} title={:?} button_frame={:?}",
+                    item.isVisible(),
+                    item.length(),
+                    button.is_some(),
+                    has_image,
+                    image_size,
+                    title,
+                    button_frame,
+                );
+            }
+        }
+    }) {
+        // 设不上不致命：图标可能仍然显示（系统会退回匿名身份），只是位置不再被
+        // 记住、自检也会失去依据。所以留痕但不阻断启动。
+        log::warn!("Failed to set the status item autosave name: {}", e);
+    }
+
+    Ok(tray_built)
 }
 
 /// 唤起主窗口的唯一入口。
@@ -146,6 +214,12 @@ fn derive_key_for(
 
 pub fn run() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // macOS：LaunchServices 死记录清理要抢在一切之前开跑（全量 dump 实测 ~3.5s），
+    // 与建库、建窗并行；到 setup 里建托盘之前再收结果。顺序约束见
+    // platform::ls_hygiene_macos 的模块头——晚于托盘创建的清理救不了本次会话。
+    #[cfg(target_os = "macos")]
+    let ls_cleanup = platform::ls_hygiene_macos::spawn();
 
     // 启动期日志缓冲。
     //
@@ -766,7 +840,17 @@ pub fn run() {
                 });
             }
 
+            // 6/7 前置（仅 macOS）：收 LaunchServices 死记录清理的结果，然后才建托盘。
+            // 顺序不能反：控制中心在状态项创建那一刻按 bundle id 查 LaunchServices，
+            // 死记录还挂着就把整个 bundle id 拉黑（粘性会话态，本次会话救不回来），
+            // 所以宁可让图标晚一两秒出现。线程在 run() 开头就已起跑，这里等的是残余。
+            #[cfg(target_os = "macos")]
+            ls_cleanup.finish_before_tray(std::time::Duration::from_secs(10));
+
             // 6/7. 托盘图标（全平台一致，在此创建）。
+            // 返回的 TrayIcon 可以就地丢弃：TrayIconBuilder::build 内部已经把它
+            // 注册进 app 的资源表与 manager.tray.icons，引用计数不会归零。
+            // 丢弃它与「图标不可见」无关，别再往这上面怀疑。
             build_tray(app.handle())?;
 
             // 7.5 macOS 通知初始化：装 delegate 并请求授权。
@@ -775,6 +859,16 @@ pub fn run() {
             // 非 bundle 环境（如 tauri dev 的裸二进制）由函数内部自行跳过。
             #[cfg(target_os = "macos")]
             crate::platform::notification_macos::init_notifications(app.handle());
+
+            // 7.6 菜单栏放置看门狗：托盘建好之后，确认系统是否真给了它位置。
+            // macOS 26 会静默拒绝（状态项创建成功但拿不到菜单栏位置），
+            // 不探测的话这就是个彻底的哑故障——应用在后台跑着，用户既看不到图标，
+            // 也收不到任何解释。探测本身是延迟异步的，不阻塞 setup。
+            #[cfg(target_os = "macos")]
+            crate::platform::tray_placement_macos::spawn_placement_watchdog(
+                app.handle(),
+                start_minimized_on_launch,
+            );
 
             // 8. 冷启动显隐：只取决于用户配置，手动启动与开机自启一视同仁。
             // 窗口在 tauri.conf.json 里初始 visible:false，避免 minimized 时的闪窗。
@@ -809,6 +903,9 @@ pub fn run() {
             commands::cmd_save_transfer_as,
             commands::cmd_reveal_session,
             commands::cmd_get_server_limits,
+            commands::cmd_get_tray_placement,
+            commands::cmd_dismiss_tray_guidance,
+            commands::cmd_open_menu_bar_settings,
         ])
         .build(tauri::generate_context!())
         .expect("error while building UniDrop application")

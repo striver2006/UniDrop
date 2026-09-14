@@ -18,8 +18,10 @@ import {
   ActiveTransfer,
   ServerLimits,
   TlsCertFailure,
+  TrayPlacementPayload,
   certFailureStatusText,
 } from "./types";
+import { MenuBarHiddenBanner } from "./components/MenuBarHiddenBanner";
 import { DeviceList } from "./components/DeviceList";
 import { TransferProgress } from "./components/TransferProgress";
 import { SettingsModal } from "./components/SettingsModal";
@@ -52,6 +54,10 @@ export const App: React.FC = () => {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [selectedDeviceForSend, setSelectedDeviceForSend] = useState<OnlineDevice | null>(null);
+  /// macOS 26 菜单栏放置状态。null = 本平台无此机制（Windows / Linux）。
+  /// 「推」（事件）与「拉」（命令）两条通道都要有：开了 start_minimized 时
+  /// 窗口是隐藏的，后端探测很可能早于这里注册 listener，只推不拉横幅永远不出现。
+  const [trayPlacement, setTrayPlacement] = useState<TrayPlacementPayload | null>(null);
   /// 连接层错误横幅。kind 决定文案与引导按钮：
   /// "auth" 是 PSK / 账号格式被服务端拒绝，"tls" 是服务器证书校验失败。
   /// 两者的修复动作不同——前者改密钥或账号，后者按证书失败的**具体档位**而定——
@@ -148,6 +154,15 @@ export const App: React.FC = () => {
       // 事件是推送来的，打开设置面板时可能早已错过，所以这里主动补拉一次。
       const limits = await invoke<ServerLimits | null>("cmd_get_server_limits");
       setServerLimits(limits);
+
+      // 托盘放置状态单独 try：它只是一条提示，失败绝不该把整个初始化
+      // 拖进上面那个 catch，让用户看到一句「拉取初始状态失败」的红字。
+      try {
+        const tp = await invoke<TrayPlacementPayload | null>("cmd_get_tray_placement");
+        setTrayPlacement(tp);
+      } catch (e) {
+        console.warn("tray placement probe unavailable:", e);
+      }
     } catch (err: any) {
       console.error("fetch initial data error:", err);
       showNotification(typeof err === "string" ? err : "拉取初始状态失败", "error");
@@ -267,6 +282,15 @@ export const App: React.FC = () => {
       setIsSettingsOpen(true);
     });
 
+    // macOS 菜单栏放置状态变化（被拒 / 已恢复）。看门狗在恢复时也会推一次，
+    // 横幅据此自行消失，用户不需要重启应用。
+    const unlistenTrayPlacementPromise = listen<TrayPlacementPayload>(
+      "macos-tray-placement",
+      (event) => {
+        setTrayPlacement(event.payload);
+      }
+    );
+
     const unlistenLimitsPromise = listen<ServerLimits | null>("server-limits-updated", (event) => {
       setServerLimits(event.payload ?? null);
     });
@@ -283,6 +307,7 @@ export const App: React.FC = () => {
       unlistenProgressPromise.then((unlisten) => unlisten());
       unlistenOfferPromise.then((unlisten) => unlisten());
       unlistenSettingsPromise.then((unlisten) => unlisten());
+      unlistenTrayPlacementPromise.then((unlisten) => unlisten());
       // 卸载后定时器若仍触发就会对已卸载的组件 setState。StrictMode 下开发期
       // 会 mount→unmount→mount，不清会稳定复现重复定时器。
       dismissTimersRef.current.forEach((timer) => clearTimeout(timer));
@@ -401,6 +426,31 @@ export const App: React.FC = () => {
           </button>
         </div>
       </header>
+
+      {/*
+        菜单栏放置横幅排在连接错误之上：它讲的是「你为什么找不到这个应用」，
+        比「连不上服务器」更靠前一层——后者至少还能看到窗口。
+      */}
+      <MenuBarHiddenBanner
+        payload={trayPlacement}
+        onOpenSettings={async () => {
+          try {
+            await invoke("cmd_open_menu_bar_settings");
+          } catch (e) {
+            // URL scheme 未文档化，打不开是可能的。横幅里的文字路径始终可见，
+            // 所以这里只提示一句，不必把失败演成故障。
+            showNotification("请手动打开：系统设置 → 菜单栏", "error");
+          }
+        }}
+        onDismiss={async () => {
+          try {
+            await invoke("cmd_dismiss_tray_guidance");
+            setTrayPlacement((prev) => (prev ? { ...prev, force_reveal_optout: true } : prev));
+          } catch (e) {
+            console.warn("failed to persist tray guidance opt-out:", e);
+          }
+        }}
+      />
 
       {/* Connection Error Banner */}
       {connError && (

@@ -79,6 +79,8 @@ objc2-foundation-v06 = { package = "objc2-foundation", version = "0.3", features
     "NSError",
     # NSBundle 是独立 feature：用于判断当前进程是否真以本应用身份运行。
     "NSBundle",
+    # NSData：把内嵌的 PNG 字节喂给 NSImage
+    "NSData",
 ] }
 objc2-user-notifications = { version = "0.3", features = [
     "UNUserNotificationCenter",
@@ -95,6 +97,48 @@ objc2-user-notifications = { version = "0.3", features = [
     "block2",
 ] }
 block2 = "0.6"
+
+# 以下三项供菜单栏放置探测（platform::tray_placement_macos）使用，同属 0.6 那一代。
+# 三个 crate 本身都**已经在 Cargo.lock 里**（0.3.2，由 tao/wry 带进 macOS 构建），
+# 这里只是把用得到的 feature 打开。代价是 objc2-app-kit 的 NSApplication /
+# NSWindow 会级联激活它自己的几个可选依赖，Cargo.lock 因此净增一个 crate
+# （objc2-core-video）——不是零成本，但相较「为一个可见性判据自己写 FFI」
+# 仍然划算得多。
+objc2-app-kit-v06 = { package = "objc2-app-kit", version = "0.3", features = [
+    # NSApp.windows()：状态项窗口的来源
+    "NSApplication",
+    # level() 判 25、frame() 取几何
+    "NSWindow",
+    "NSResponder",
+    # 菜单栏所在屏的几何，作为「够不够得到菜单栏带」的基准
+    "NSScreen",
+    # thickness()：菜单栏带宽不写死 24，Tahoe 改过一次
+    "NSStatusBar",
+    # setAutosaveName()：给状态项一个稳定身份，见 lib.rs::build_tray
+    "NSStatusItem",
+    # 读状态项自身状态用于诊断（图标是否真的设上、按钮尺寸），见 lib.rs::build_tray
+    "NSStatusBarButton",
+    "NSButton",
+    "NSControl",
+    "NSView",
+    "NSImage",
+    # mainMenu / menuBarHeight：状态项窗口高度取自本进程的菜单栏高度，诊断用
+    "NSMenu",
+] }
+# 只开 CGWindow 一个 feature：其余 CG 子模块一律不要，多开一个就多一批生成代码
+# 进编译单元，而这里只需要 CGWindowListCopyWindowInfo 与那几个键常量。
+objc2-core-graphics = { version = "0.3", default-features = false, features = [
+    "std",
+    "CGWindow",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "CFArray",
+    "CFDictionary",
+    "CFNumber",
+    "CFString",
+    "CFCGTypes",
+] }
 
 [dev-dependencies]
 # 只为 tls_trust 的端到端分类测试而在：起一个本地自签 TLS 监听器，真握一次手，
