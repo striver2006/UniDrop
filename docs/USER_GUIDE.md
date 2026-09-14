@@ -303,6 +303,23 @@ sudo nginx -t && sudo systemctl reload nginx
 那么公共 CA 证书对它其实没有意义——你反正用 IP 连，走不了域名校验，
 只能靠指纹。**既然如此，不如换一张有效期十年的自签证书，指纹十年不变。**
 
+动手前先确认那张公共 CA 证书有没有别的用途。逐个端口看它是否真在提供 HTTPS：
+
+```bash
+# 在任意一台能访问服务器的机器上执行
+echo | openssl s_client -connect 你的服务器IP:443 2>/dev/null \
+  | openssl x509 -noout -subject -dates
+```
+
+能打印出证书信息，说明 443 上确实有 HTTPS 在用它，那就保留续期、只给 UniDrop
+那个端口换自签证书。若报 `no peer certificate available` 或没有输出，说明那个
+端口上并没有在用它——这种情况下整张公共 CA 证书就只为 UniDrop 存在，
+换掉零损失，还能顺便省掉 certbot 的续期维护。
+
+> 只用 `nc -z` 或 `telnet` 测端口通不通是**不够的**：云服务商的安全组与网络
+> 设备常让放行端口的 TCP 握手看起来成功，而后面并没有进程在监听。
+> 要判断"有没有服务"，得让它真的说句话——上面那条 openssl 或一次 `curl -i`。
+
 在服务器上生成：
 
 ```bash
@@ -322,8 +339,8 @@ openssl x509 -in /etc/nginx/ssl/unidrop.crt -noout -text | grep Version
 # 必须输出 Version: 3 (0x2)
 ```
 
-把 Nginx 中 UniDrop 那个 `server` 块的证书指向它（**不要动 443 的配置**，
-那里的公共 CA 证书继续服务浏览器）：
+把 Nginx 中 UniDrop 那个 `server` 块的证书指向它。**只改这一个 server 块**——
+如果 443 上还有网站在用原来的公共 CA 证书，那部分配置保持不动：
 
 ```nginx
 server {
