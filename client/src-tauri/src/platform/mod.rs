@@ -10,6 +10,8 @@ pub mod listener_windows;
 pub mod clipboard_macos;
 #[cfg(target_os = "macos")]
 pub mod listener_macos;
+#[cfg(target_os = "macos")]
+pub mod notification_macos;
 
 #[cfg(target_os = "linux")]
 pub mod clipboard_linux;

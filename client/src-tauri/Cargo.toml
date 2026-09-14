@@ -14,7 +14,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.0.0", features = [] }
 
 [dependencies]
-tauri = { version = "2.0.0", features = ["tray-icon"] }
+# image-png 是托盘模板图所需：菜单栏图标经 Image::from_bytes 载入，而该方法被
+# #[cfg(any(feature = "image-ico", feature = "image-png"))] 门控，tauri 的默认
+# features 并不含它——不开这个 feature 会直接编译不过。
+tauri = { version = "2.0.0", features = ["tray-icon", "image-png"] }
 tauri-plugin-shell = "2.0.0"
 tauri-plugin-notification = "2.0.0"
 tauri-plugin-single-instance = "2.0.0"
@@ -63,6 +66,35 @@ windows = { version = "0.58", features = [
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", features = ["NSString", "NSArray", "NSURL", "NSData"] }
 objc2-app-kit = { version = "0.2", features = ["NSPasteboard", "NSPasteboardItem"] }
+
+# 以下四项供 UNUserNotificationCenter 使用，属 objc2 0.6 那一代。
+# 与上面的 0.5 并存是刻意的，不是疏漏：0.6.4 早已由 tao/dispatch2 带进 macOS
+# 构建（见 Cargo.lock），两代在本 crate 内不交换任何类型——剪贴板那几个文件只碰
+# 0.5，通知这个文件只碰 0.6。把剪贴板一并升到 0.6 需要改写全部 FFI
+# （Id → Retained、msg_send_id! → msg_send!、declare_class! → define_class!），
+# 那是给本次需求之外的稳定代码引入回归风险，收益与风险不成比例。
+objc2-v06 = { package = "objc2", version = "0.6" }
+objc2-foundation-v06 = { package = "objc2-foundation", version = "0.3", features = [
+    "NSString",
+    "NSError",
+    # NSBundle 是独立 feature：用于判断当前进程是否真以本应用身份运行。
+    "NSBundle",
+] }
+objc2-user-notifications = { version = "0.3", features = [
+    "UNUserNotificationCenter",
+    # UNNotificationContent 已覆盖 UNMutableNotificationContent，无需单列。
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationResponse",
+    "UNNotificationTrigger",
+    "UNNotificationSound",
+    # willPresent 回调被 cfg(all(feature = "UNNotification", feature = "block2"))
+    # 门控，缺它则「应用在前台时通知照常显示」根本无从实现。
+    "UNNotification",
+    "UNError",
+    "block2",
+] }
+block2 = "0.6"
 
 [dev-dependencies]
 # 只为 tls_trust 的端到端分类测试而在：起一个本地自签 TLS 监听器，真握一次手，

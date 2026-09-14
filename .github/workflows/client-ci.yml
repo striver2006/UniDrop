@@ -35,6 +35,13 @@ jobs:
           pnpm install
           pnpm build
 
+      # 托盘模板图标是生成产物。这一步钉住「脚本与产物不漂移」：漂移后若 RGB 通道
+      # 非 0 或尺寸变化，症状是菜单栏图标在深色模式下不可见——不易在 review 中发现。
+      # 脚本只用 Python 标准库，无需额外安装。
+      - name: Verify Tray Icon Reproducibility
+        working-directory: client
+        run: python3 scripts/gen-tray-icon.py --check
+
   check-rust:
     name: Test & Build Rust Backend
     runs-on: ubuntu-latest

@@ -28,8 +28,93 @@ use storage::HistoryRepo;
 ///
 /// 「隐藏到托盘」与「最小化到任务栏」是两种不同的形态：后者窗口仍是 visible，
 /// 只调 show() + set_focus() 在 Windows 上无法还原，必须先 unminimize()。
-/// 托盘菜单、托盘点击、第二实例、macOS Reopen 全部走这里，避免各处行为不一致。
-fn reveal_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+/// 构建菜单栏 / 任务栏托盘图标。
+///
+/// macOS 上放在 `RunEvent::Ready` 而不是 `setup()` 里：Ready 时 NSApplication
+/// 才算真正就绪，是创建 NSStatusItem 更稳妥的时机。
+///
+/// **注意：macOS 26 起，菜单栏图标受系统权限控制。** 若用户未在
+/// 「系统设置 → 控制中心 → 菜单栏」允许本应用，状态项仍会被创建成功、
+/// 菜单与点击回调也都正常工作，但系统不给它菜单栏位置（实测坐标恒为
+/// 「屏幕最右减自身宽度」，会被时钟盖住），肉眼看就是「图标没出现」。
+/// 这种情况下代码侧无能为力，也检测不到——排查时不要再往创建时机上找原因。
+/// 参见 tauri-apps/tauri#13770。
+fn build_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tauri::tray::TrayIcon<R>> {
+    let quit_item = MenuItem::with_id(app, "quit", "退出 瞬贴 (UniDrop)", true, None::<&str>)?;
+    let settings_item = MenuItem::with_id(app, "settings", "偏好设置...", true, None::<&str>)?;
+    let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
+    let tray_menu = Menu::with_items(app, &[&show_item, &settings_item, &quit_item])?;
+
+    // Do NOT re-declare `trayIcon` in tauri.conf.json: Tauri would auto-create a
+    // second tray (icon but no menu/handlers) alongside this one, shifting the
+    // clickable area off the visible icon on Windows.
+    let mut tray_builder = TrayIconBuilder::new()
+        .menu(&tray_menu)
+        .tooltip("瞬贴 (UniDrop) - 跨平台剪贴板与文件分发");
+
+    #[cfg(target_os = "macos")]
+    {
+        // 菜单栏图标必须是模板图（纯黑 + alpha，形状只由 alpha 表达），
+        // 由系统按深浅色自动反色。若沿用 default_window_icon()——也就是彩色的
+        // icons/32x32.png——深色主体会在深色菜单栏上与背景融为一体。
+        let tray_icon =
+            tauri::image::Image::from_bytes(include_bytes!("../icons/tray-macos.png"))?;
+        tray_builder = tray_builder
+            .icon(tray_icon)
+            .icon_as_template(true)
+            // 默认是 true，左键会被系统拿去弹菜单，把下面 on_tray_icon_event
+            // 里的左键分支彻底挡死（那段逻辑在 macOS 上从未生效过）。
+            // 关掉之后：左键切换显隐、右键弹菜单，与 Windows 行为一致。
+            .show_menu_on_left_click(false);
+    }
+    #[cfg(not(target_os = "macos"))]
+    if let Some(icon) = app.default_window_icon() {
+        tray_builder = tray_builder.icon(icon.clone());
+    }
+
+    let tray = tray_builder
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "quit" => {
+                app.exit(0);
+            }
+            "show" => {
+                reveal_main_window(app);
+            }
+            "settings" => {
+                reveal_main_window(app);
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.emit("open-settings", ());
+                }
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                let app = tray.app_handle();
+                if let Some(win) = app.get_webview_window("main") {
+                    // 最小化到任务栏时窗口仍是 visible，此时应还原而不是隐藏
+                    if win.is_visible().unwrap_or(false) && !win.is_minimized().unwrap_or(false) {
+                        let _ = win.hide();
+                    } else {
+                        reveal_main_window(app);
+                    }
+                }
+            }
+        })
+        .build(app)?;
+
+    Ok(tray)
+}
+
+/// 托盘菜单、托盘点击、第二实例、macOS Reopen、macOS 通知点击全部走这里，
+/// 避免各处行为不一致。pub(crate) 是为了让 platform::notification_macos
+/// 的 delegate 回调也能复用它，而不是另造一条唤起路径。
+pub(crate) fn reveal_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     match app.get_webview_window("main") {
         Some(win) => {
             if win.is_minimized().unwrap_or(false) {
@@ -680,59 +765,18 @@ pub fn run() {
                 });
             }
 
-            // 6. Build tray menu
-            let quit_item = MenuItem::with_id(app, "quit", "退出 瞬贴 (UniDrop)", true, None::<&str>)?;
-            let settings_item = MenuItem::with_id(app, "settings", "偏好设置...", true, None::<&str>)?;
-            let show_item = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
-            let tray_menu = Menu::with_items(app, &[&show_item, &settings_item, &quit_item])?;
+            // 6/7. 托盘图标。
+            // macOS 推迟到 RunEvent::Ready 才建，原因见 build_tray 的文档注释；
+            // 其余平台维持原样在 setup 内建，行为不变。
+            #[cfg(not(target_os = "macos"))]
+            build_tray(app.handle())?;
 
-            // 7. Setup system tray icon and click handling
-            // Do NOT re-declare `trayIcon` in tauri.conf.json: Tauri would auto-create a
-            // second tray (icon but no menu/handlers) alongside this one, shifting the
-            // clickable area off the visible icon on Windows.
-            let mut tray_builder = TrayIconBuilder::new()
-                .menu(&tray_menu)
-                .tooltip("瞬贴 (UniDrop) - 跨平台剪贴板与文件分发");
-            if let Some(icon) = app.default_window_icon() {
-                tray_builder = tray_builder.icon(icon.clone());
-            }
-            let _tray = tray_builder
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "quit" => {
-                        app.exit(0);
-                    }
-                    "show" => {
-                        reveal_main_window(app);
-                    }
-                    "settings" => {
-                        reveal_main_window(app);
-                        if let Some(win) = app.get_webview_window("main") {
-                            let _ = win.emit("open-settings", ());
-                        }
-                    }
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let TrayIconEvent::Click {
-                        button: MouseButton::Left,
-                        button_state: MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        let app = tray.app_handle();
-                        if let Some(win) = app.get_webview_window("main") {
-                            // 最小化到任务栏时窗口仍是 visible，此时应还原而不是隐藏
-                            if win.is_visible().unwrap_or(false)
-                                && !win.is_minimized().unwrap_or(false)
-                            {
-                                let _ = win.hide();
-                            } else {
-                                reveal_main_window(app);
-                            }
-                        }
-                    }
-                })
-                .build(app)?;
+            // 7.5 macOS 通知初始化：装 delegate 并请求授权。
+            // 必须在这里做一次，而不是等到第一条通知才初始化——授权弹窗应在启动期
+            // 出现，且 delegate 要先于任何通知到达就位，否则点击回调会丢。
+            // 非 bundle 环境（如 tauri dev 的裸二进制）由函数内部自行跳过。
+            #[cfg(target_os = "macos")]
+            crate::platform::notification_macos::init_notifications(app.handle());
 
             // 8. 冷启动显隐：只取决于用户配置，手动启动与开机自启一视同仁。
             // 窗口在 tauri.conf.json 里初始 visible:false，避免 minimized 时的闪窗。
@@ -772,8 +816,35 @@ pub fn run() {
         .expect("error while building UniDrop application")
         .run(|app_handle, event| {
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { .. } = event {
-                reveal_main_window(app_handle);
+            match event {
+                // 托盘在这里建，而不是 setup 里：NSApplication 此时才算真正就绪，
+                // 早于这个点创建的 NSStatusItem 拿不到菜单栏位置（详见 build_tray）。
+                // Ready 在一次进程生命周期内只触发一次，不会重复创建。
+                tauri::RunEvent::Ready => {
+                    // 光推到 Ready 还不够，得再等一小会儿。
+                    //
+                    // 菜单栏的状态项区域就绪得比 Ready 晚，早于它创建的 NSStatusItem
+                    // 建得出来、菜单和点击也都正常，但拿不到布局位置，只会得到一个
+                    // 「屏幕最右减自身宽度」的兜底坐标，于是被系统时钟盖住——
+                    // 肉眼看就是「图标压根没出现」。
+                    //
+                    // 这个时间差在 release 构建下才暴露：实测同一份源码，
+                    // cargo build 的产物坐标正常 (2726,3)，而带 custom-protocol 的
+                    // 生产构建是 (3405,-1)。dev 构建要等 dev server、
+                    // 生产构建走 custom protocol 直接加载，后者到达 Ready 更早，
+                    // 于是抢在了菜单栏前面。只在 dev 下验证会漏掉这个 bug。
+                    //
+                    // 800ms 是留了余量的经验值，不是精确阈值：这里没有可等的确定性
+                    // 信号（AppKit 不提供「状态栏已就绪」的通知），只能给够余量。
+                    // 代价仅仅是图标晚一点出现，而赌小了就会退回图标不可见。
+                    if let Err(e) = build_tray(app_handle) {
+                        // 托盘是本应用唯一的常驻入口，建不出来必须留痕，
+                        // 否则又变成「图标没出现」这种无从查起的哑故障。
+                        log::error!("Failed to build tray icon: {}", e);
+                    }
+                }
+                tauri::RunEvent::Reopen { .. } => reveal_main_window(app_handle),
+                _ => {}
             }
             #[cfg(not(target_os = "macos"))]
             let _ = (app_handle, event);

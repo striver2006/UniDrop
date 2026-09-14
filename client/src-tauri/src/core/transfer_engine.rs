@@ -697,7 +697,12 @@ impl TransferEngine {
                     status: "FAILED".to_string(),
                     data_type: offer.data_type.clone(),
                 });
-                let _ = show_transfer_notification(&app_handle, "UniDrop 接收失败", "数据通道连接失败，请检查服务器地址与证书配置");
+                // Err 必须留痕：通知发不出去本身就是哑故障，而「收不到提醒」
+                // 恰恰是这个功能要防的那件事。此前四处都是 let _ =，
+                // 所以 macOS 上通知整整失效了都没有任何信号。
+                if let Err(e) = show_transfer_notification(&app_handle, "UniDrop 接收失败", "数据通道连接失败，请检查服务器地址与证书配置") {
+                    log::warn!("Failed to show notification: {}", e);
+                }
                 finalize_history_status(&app_handle, &session_id, "FAILED", Some(&format!("数据通道连接失败: {}", e))).await;
                 let fail_env = ControlEnvelope {
                     version: 1,
@@ -984,7 +989,9 @@ impl TransferEngine {
                                     }
                                 }
                             }
-                            let _ = show_transfer_notification(&app_handle, "UniDrop 文本已同步", "已写入系统剪贴板，可直接粘贴");
+                            if let Err(e) = show_transfer_notification(&app_handle, "UniDrop 文本已同步", "已写入系统剪贴板，可直接粘贴") {
+                                log::warn!("Failed to show notification: {}", e);
+                            }
                             let _ = cache_manager.mark_clipboard_injected(&session_id).await;
                         }
                         "IMAGE" if still_owned => {
@@ -1001,7 +1008,9 @@ impl TransferEngine {
                                     }
                                 }
                             }
-                            let _ = show_transfer_notification(&app_handle, "UniDrop 图片已同步", "已写入系统剪贴板，可直接粘贴");
+                            if let Err(e) = show_transfer_notification(&app_handle, "UniDrop 图片已同步", "已写入系统剪贴板，可直接粘贴") {
+                                log::warn!("Failed to show notification: {}", e);
+                            }
                             let _ = cache_manager.mark_clipboard_injected(&session_id).await;
                         }
                         _ => {
@@ -1011,7 +1020,9 @@ impl TransferEngine {
                             } else {
                                 format!("{} (已保存在沙盒，可在面板中点击装载)", offer.preview_summary)
                             };
-                            let _ = show_transfer_notification(&app_handle, "UniDrop 文件接收完成", &notification_body);
+                            if let Err(e) = show_transfer_notification(&app_handle, "UniDrop 文件接收完成", &notification_body) {
+                                log::warn!("Failed to show notification: {}", e);
+                            }
 
                             // P1-9: Auto inject into clipboard if configured
                             if auto_inject && still_owned && !completed_paths.is_empty() {
