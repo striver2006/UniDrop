@@ -42,15 +42,18 @@ export const MenuBarHiddenBanner: React.FC<Props> = ({ payload, onDismiss, onOpe
             </p>
             <ol className="list-decimal pl-4 space-y-0.5 text-amber-200/80 break-words">
               <li>
-                打开 <span className="text-amber-100">系统设置 → 菜单栏 →「允许在菜单栏中」</span>
+                打开 <span className="text-amber-100">系统设置 → 菜单栏 → 应用程序</span>
                 ，找到 <span className="text-amber-100">瞬贴 (UniDrop)</span> 并确认开关打开。
                 列表要等应用运行 1–2 分钟才会写入条目，稍候再看。
               </li>
               <li>
-                开关<span className="text-amber-100">已经是打开</span>仍然不显示：这是 macOS
-                把本应用拉进了会话级黑名单（应用已自动清理其已知诱因，但解除要靠系统重置）。
-                <span className="text-amber-100">注销并重新登录（或重启电脑）</span>
-                后图标即恢复，且通常不会再复发。
+                瞬贴自己的开关<span className="text-amber-100">已经是打开</span>仍然不显示：
+                问题多半出在<span className="text-amber-100">同一列表里的其他应用</span>上。
+                macOS 26 会把菜单栏图标算在「启动它的那个应用」名下，那个应用的开关关着时，
+                它名下的图标会被一起挡住。请在列表里把
+                <span className="text-amber-100">你用来启动过瞬贴的那个应用</span>
+                （例如终端或代码编辑器）的开关也打开——图标会立刻回来，
+                不需要重启瞬贴，也不需要重启电脑。
               </li>
             </ol>
             <p className="break-words text-amber-200/60">

@@ -31,11 +31,32 @@
 //!    （见 `lib.rs::build_tray` 与 tauri-apps/tauri#13770）。
 //! 3. 不要切 activation policy。同上，已被穷举证伪。
 //!
-//! 应用侧能做的两件正事都在别处：给状态项设 `autosaveName`（`lib.rs::build_tray`），
-//! 以及启动期清掉 LaunchServices 死记录（`ls_hygiene_macos`，本模块之前跑完）。
-//! 清理之后仍被拒的，就是控制中心的粘性会话拉黑——按 bundle id 命中、跨 PID 跨
-//! autosaveName 复现（2026-09-14 最小探针实验证实），应用侧无解除手段，
-//! 用户侧的出路是注销重登 / 重启，引导文案要说这个，别再折腾状态项本身。
+//! # 被拒的真实机制（2026-09-14 晚定案，勿再改写成别的说法）
+//!
+//! 控制中心把准入落在 `group.com.apple.controlcenter.plist` 的 `trackedApplications`
+//! 里，每条记录是 `{ location, menuItemLocations, isAllowed }`。判定是**连坐**的：
+//! 一个 bundle id 只要出现在**任一** `isAllowed=false` 记录的 `menuItemLocations`
+//! 里就被挡，**它自己那条记录是 `true` 也没用**。
+//!
+//! 挂到别人名下的途径是**责任进程（responsible process）**：从 IDE 集成终端直接
+//! 执行可执行文件时，责任进程是那个 IDE，控制中心就按 IDE 归属这个菜单栏项。
+//! 实测 `com.unidrop.client` 被记在 `com.microsoft.VSCode` 与 `com.google.antigravity`
+//! 名下，而这两条都是 `isAllowed=false`，于是本应用无论怎么改都上不了屏。
+//! 用 `open` 启动的 .app 由 launchd 负责，不会挂到 IDE 下——**开发期构建完一律
+//! `open` 启动，不要在集成终端里直接跑二进制**，已经挂错的归属不会自动清理。
+//!
+//! 解除只需在「系统设置 › 菜单栏 › 应用程序」里打开**那条挡着它的记录**的开关
+//! （即那个 IDE 的开关，不是本应用自己的）。实测开关一开，控制中心立刻输出
+//! `Unblocking host`，运行中的进程无需重启即恢复。
+//!
+//! 已实测**无效**、不要再试的手段：清 LaunchServices 死记录、重启控制中心、
+//! `tccutil reset`、整机重启、把本应用自己那行开关关掉再打开。
+//! 曾经按「LS 死记录触发粘性拉黑」写过一个启动期清理模块，该归因已被证伪，
+//! 模块随之删除；别照着旧 commit（`ba6cc06`）的说法再恢复它。
+//!
+//! 应用侧能做的正事只有一件：给状态项设 `autosaveName`（`lib.rs::build_tray`），
+//! 那是本模块主判据的前提，不是修复手段。剩下的是把哑故障翻译给用户，
+//! 引导文案要指向「打开挡着它的那个应用的开关」，别再折腾状态项本身。
 //!
 //! 本模块用 objc2 0.6 那一代，与 `notification_macos` 对齐。
 //! **只许 import `objc2_*_v06` / `objc2_core_*`**：误用剪贴板那边的 0.5 代，
@@ -336,6 +357,9 @@ fn conclude(obs: &Observation) -> TrayPlacement {
              named {:?} at layer {}. hosted={:?} {}. \
              The status item itself was created fine (menu and click handlers work), \
              so this is a system-side placement failure, not a tray construction error. \
+             Most likely some OTHER app's menu bar switch is off and this app is listed \
+             under it (Control Center attributes menu bar items to the responsible \
+             process; launching the binary from an IDE terminal attributes it to that IDE). \
              See docs/USER_GUIDE.md for the user-facing recovery steps.",
             TRAY_AUTOSAVE_NAME,
             MENU_BAR_WINDOW_LAYER,
