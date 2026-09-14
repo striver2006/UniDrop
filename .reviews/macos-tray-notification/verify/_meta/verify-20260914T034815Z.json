@@ -1,0 +1,42 @@
+{
+  "schema": "trivium.verify.v1",
+  "run_id": "20260914T034815Z",
+  "topic": "macos-tray-notification",
+  "started_at": "2026-09-14T03:48:15.754Z",
+  "finished_at": "2026-09-14T03:48:18.111Z",
+  "project_root": "/Users/chenzhenbo/Work/UniClip",
+  "commands": [
+    {
+      "cmd": "cd client && pnpm build",
+      "cmd_sha256": "ed1e6660f6467fb11133533ac31050a627b3a319df400c2a3d76be88f3f984a0",
+      "group": "build",
+      "exit_code": 0,
+      "duration_s": 1.7,
+      "timed_out": false,
+      "stdout_tail": "\n> unidrop-client-ui@0.4.0 build /Users/chenzhenbo/Work/UniClip/client\n> tsc && vite build\n\nvite v5.4.21 building for production...\ntransforming...\n✓ 1578 modules transformed.\nrendering chunks...\ncomputing gzip size...\ndist/index.html                   0.47 kB │ gzip:  0.31 kB\ndist/assets/index-C61rGEIL.css   19.95 kB │ gzip:  4.34 kB\ndist/assets/index-Clmv6-fD.js   218.67 kB │ gzip: 64.99 kB\n✓ built in 733ms",
+      "stderr_tail": ""
+    },
+    {
+      "cmd": "cd server && go build ./...",
+      "cmd_sha256": "54ca0b984c1fa352ea98e9d96944a34bfdf05a1e70c091d69b9997f101714876",
+      "group": "build",
+      "exit_code": 0,
+      "duration_s": 0.5,
+      "timed_out": false,
+      "stdout_tail": "",
+      "stderr_tail": ""
+    },
+    {
+      "cmd": "cd server && go test ./...",
+      "cmd_sha256": "a40f6eeafb2bf4c048cc6cd9b7c94a81c677cb40cc42eb4b61b762fbc4b0a1ef",
+      "group": "test",
+      "exit_code": 0,
+      "duration_s": 0.2,
+      "timed_out": false,
+      "stdout_tail": "?   \tgithub.com/unidrop/unidrop-server/cmd/diag-receiver\t[no test files]\n?   \tgithub.com/unidrop/unidrop-server/cmd/diag-sender\t[no test files]\n?   \tgithub.com/unidrop/unidrop-server/cmd/unidrop-server\t[no test files]\nok  \tgithub.com/unidrop/unidrop-server/internal\t(cached)\nok  \tgithub.com/unidrop/unidrop-server/internal/auth\t(cached)\n?   \tgithub.com/unidrop/unidrop-server/internal/config\t[no test files]\nok  \tgithub.com/unidrop/unidrop-server/internal/controller\t(cached)\nok  \tgithub.com/unidrop/unidrop-server/internal/limits\t(cached)\nok  \tgithub.com/unidrop/unidrop-server/internal/protocol\t(cached)\nok  \tgithub.com/unidrop/unidrop-server/internal/registry\t(cached)\nok  \tgithub.com/unidrop/unidrop-server/internal/relay\t(cached)\n?   \tgithub.com/unidrop/unidrop-server/internal/stun\t[no test files]",
+      "stderr_tail": ""
+    }
+  ],
+  "status": "success",
+  "unconfigured": false
+}

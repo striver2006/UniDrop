@@ -1,0 +1,624 @@
+# trivium changes.diff
+# run_id: 20260914T032856Z
+# base: HEAD
+# head: af5eae4d070b254468156a731e12f6542cab8b28
+# files: 9
+#   client/scripts/gen-tray-icon.py
+#   client/src-tauri/Cargo.lock
+#   client/src-tauri/Cargo.toml
+#   client/src-tauri/icons/tray-macos.png
+#   client/src-tauri/src/core/transfer_engine.rs
+#   client/src-tauri/src/lib.rs
+#   client/src-tauri/src/platform/mod.rs
+#   client/src-tauri/src/platform/notification.rs
+#   client/src-tauri/src/platform/notification_macos.rs
+diff --git a/client/scripts/gen-tray-icon.py b/client/scripts/gen-tray-icon.py
+new file mode 100644
+index 0000000..6e89aca
+--- /dev/null
++++ b/client/scripts/gen-tray-icon.py
+@@ -0,0 +1,133 @@
++#!/usr/bin/env python3
++"""生成 macOS 菜单栏托盘模板图标 icons/tray-macos.png。
++
++产物规格：36x36 RGBA，颜色通道恒为 0（纯黑），形状**仅由 alpha 通道表达**。
++这是 macOS 模板图标（template image）的硬性规范——系统据此在深色/浅色菜单栏
++自动反色。直接用彩色应用图标会在深色菜单栏上与背景融为一体，那正是本次修复的原症状。
++
++尺寸依据：tray-icon 把菜单栏图标高度硬编码缩放到 18pt
++（tray-icon/src/platform_impl/macos/mod.rs 的 `let icon_height: f64 = 18.0`，
++宽度按原始宽高比换算）。故源图取 18pt @2x = 36px，且**必须是正方形**，
++否则宽度会按宽高比失真。
++
++图形沿用应用图标的剪贴板意象，保持品牌识别的连续性。
++
++只用标准库（zlib / struct），不引入 Pillow 等第三方依赖——
++本脚本与产物一并提交，任何人 clone 后都能无环境准备地复现。
++"""
++
++import struct
++import zlib
++from pathlib import Path
++
++SIZE = 36          # 最终边长（px）
++SS = 8             # 超采样倍率，用于抗锯齿
++N = SIZE * SS      # 超采样画布边长
++
++
++def in_round_rect(px, py, x0, y0, x1, y1, r):
++    """点是否落在圆角矩形内。坐标为超采样后的浮点像素中心。"""
++    if r <= 0:
++        return x0 <= px <= x1 and y0 <= py <= y1
++    # 把点向「圆心矩形」夹紧，再比较到夹紧点的距离
++    cx = min(max(px, x0 + r), x1 - r)
++    cy = min(max(py, y0 + r), y1 - r)
++    dx, dy = px - cx, py - cy
++    return dx * dx + dy * dy <= r * r
++
++
++def build_mask():
++    """在超采样画布上绘制剪贴板图形，返回 [0,1] 的覆盖率矩阵（SIZE x SIZE）。"""
++    # 以 36px 逻辑坐标定义图形，再统一乘以 SS
++    def S(v):
++        return v * SS
++
++    # 板子外框：描边圆角矩形（外轮廓减内轮廓）
++    board_out = (S(7.0), S(7.5), S(29.0), S(33.0), S(3.0))
++    stroke = S(2.2)
++    board_in = (
++        board_out[0] + stroke, board_out[1] + stroke,
++        board_out[2] - stroke, board_out[3] - stroke,
++        max(board_out[4] - stroke, 0.5),
++    )
++
++    # 顶部夹子：实心圆角矩形，压在板子上边缘
++    clip = (S(13.0), S(3.2), S(23.0), S(10.5), S(2.0))
++    # 夹子周围的透明隔离带，让它在视觉上"浮"在板子之上
++    gap = S(1.3)
++    clip_gap = (
++        clip[0] - gap, clip[1] - gap,
++        clip[2] + gap, clip[3] + gap,
++        clip[4] + gap,
++    )
++
++    # 板内横线：两条，示意文本
++    line_x0, line_x1 = S(12.0), S(24.0)
++    line_h = S(1.8)
++    lines = [
++        (line_x0, S(19.0), line_x1, S(19.0) + line_h, line_h / 2),
++        (line_x0, S(25.0), S(21.0), S(25.0) + line_h, line_h / 2),
++    ]
++
++    cov = [[0.0] * SIZE for _ in range(SIZE)]
++    for gy in range(N):
++        py = gy + 0.5
++        for gx in range(N):
++            px = gx + 0.5
++
++            on = False
++            # 板子描边
++            if in_round_rect(px, py, *board_out) and not in_round_rect(px, py, *board_in):
++                on = True
++            # 横线
++            if not on:
++                for ln in lines:
++                    if in_round_rect(px, py, *ln):
++                        on = True
++                        break
++            # 夹子隔离带：先挖空
++            if on and in_round_rect(px, py, *clip_gap):
++                on = False
++            # 再画夹子本体
++            if not on and in_round_rect(px, py, *clip):
++                on = True
++
++            if on:
++                cov[gy // SS][gx // SS] += 1.0
++
++    inv = 1.0 / (SS * SS)
++    return [[c * inv for c in row] for row in cov]
++
++
++def write_png(path, mask):
++    """把覆盖率矩阵写成 RGBA PNG：颜色通道全 0，alpha 取覆盖率。"""
++    raw = bytearray()
++    for row in mask:
++        raw.append(0)  # 每条扫描线的 filter type：None
++        for c in row:
++            a = int(round(max(0.0, min(1.0, c)) * 255))
++            raw += b"\x00\x00\x00" + bytes((a,))
++
++    def chunk(tag, data):
++        out = struct.pack(">I", len(data)) + tag + data
++        return out + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
++
++    # bit_depth=8, color_type=6 (RGBA)
++    ihdr = struct.pack(">IIBBBBB", SIZE, SIZE, 8, 6, 0, 0, 0)
++    png = (
++        b"\x89PNG\r\n\x1a\n"
++        + chunk(b"IHDR", ihdr)
++        + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
++        + chunk(b"IEND", b"")
++    )
++    path.write_bytes(png)
++
++
++def main():
++    out = Path(__file__).resolve().parent.parent / "src-tauri" / "icons" / "tray-macos.png"
++    write_png(out, build_mask())
++    print(f"wrote {out} ({SIZE}x{SIZE} RGBA, template icon)")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/client/src-tauri/Cargo.lock b/client/src-tauri/Cargo.lock
+index 709d6c2..73c5572 100644
+--- a/client/src-tauri/Cargo.lock
++++ b/client/src-tauri/Cargo.lock
+@@ -2896,7 +2896,10 @@ version = "0.3.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "9df9128cbbfef73cda168416ccf7f837b62737d748333bfe9ab71c245d76613e"
+ dependencies = [
++ "bitflags 2.13.2",
++ "block2 0.6.2",
+  "objc2 0.6.4",
++ "objc2-core-location",
+  "objc2-foundation 0.3.2",
+ ]
+ 
+@@ -4275,6 +4278,7 @@ dependencies = [
+  "gtk",
+  "heck 0.5.0",
+  "http",
++ "image",
+  "jni",
+  "libc",
+  "log",
+@@ -5156,6 +5160,7 @@ name = "unidrop-client"
+ version = "0.4.0"
+ dependencies = [
+  "base64 0.22.1",
++ "block2 0.6.2",
+  "crc32fast",
+  "futures-util",
+  "hex",
+@@ -5163,8 +5168,11 @@ dependencies = [
+  "image",
+  "log",
+  "objc2 0.5.2",
++ "objc2 0.6.4",
+  "objc2-app-kit 0.2.2",
+  "objc2-foundation 0.2.2",
++ "objc2-foundation 0.3.2",
++ "objc2-user-notifications",
+  "rcgen",
+  "ring",
+  "rusqlite",
+diff --git a/client/src-tauri/Cargo.toml b/client/src-tauri/Cargo.toml
+index 663d3a0..5a6c889 100644
+--- a/client/src-tauri/Cargo.toml
++++ b/client/src-tauri/Cargo.toml
+@@ -14,7 +14,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
+ tauri-build = { version = "2.0.0", features = [] }
+ 
+ [dependencies]
+-tauri = { version = "2.0.0", features = ["tray-icon"] }
++# image-png 是托盘模板图所需：菜单栏图标经 Image::from_bytes 载入，而该方法被
++# #[cfg(any(feature = "image-ico", feature = "image-png"))] 门控，tauri 的默认
++# features 并不含它——不开这个 feature 会直接编译不过。
++tauri = { version = "2.0.0", features = ["tray-icon", "image-png"] }
+ tauri-plugin-shell = "2.0.0"
+ tauri-plugin-notification = "2.0.0"
+ tauri-plugin-single-instance = "2.0.0"
+@@ -64,6 +67,35 @@ objc2 = "0.5"
+ objc2-foundation = { version = "0.2", features = ["NSString", "NSArray", "NSURL", "NSData"] }
+ objc2-app-kit = { version = "0.2", features = ["NSPasteboard", "NSPasteboardItem"] }
+ 
++# 以下四项供 UNUserNotificationCenter 使用，属 objc2 0.6 那一代。
++# 与上面的 0.5 并存是刻意的，不是疏漏：0.6.4 早已由 tao/dispatch2 带进 macOS
++# 构建（见 Cargo.lock），两代在本 crate 内不交换任何类型——剪贴板那几个文件只碰
++# 0.5，通知这个文件只碰 0.6。把剪贴板一并升到 0.6 需要改写全部 FFI
++# （Id → Retained、msg_send_id! → msg_send!、declare_class! → define_class!），
++# 那是给本次需求之外的稳定代码引入回归风险，收益与风险不成比例。
++objc2-v06 = { package = "objc2", version = "0.6" }
++objc2-foundation-v06 = { package = "objc2-foundation", version = "0.3", features = [
++    "NSString",
++    "NSError",
++    # NSBundle 是独立 feature：用于判断当前进程是否真以本应用身份运行。
++    "NSBundle",
++] }
++objc2-user-notifications = { version = "0.3", features = [
++    "UNUserNotificationCenter",
++    # UNNotificationContent 已覆盖 UNMutableNotificationContent，无需单列。
++    "UNNotificationContent",
++    "UNNotificationRequest",
++    "UNNotificationResponse",
++    "UNNotificationTrigger",
++    "UNNotificationSound",
++    # willPresent 回调被 cfg(all(feature = "UNNotification", feature = "block2"))
++    # 门控，缺它则「应用在前台时通知照常显示」根本无从实现。
++    "UNNotification",
++    "UNError",
++    "block2",
++] }
++block2 = "0.6"
++
+ [dev-dependencies]
+ # 只为 tls_trust 的端到端分类测试而在：起一个本地自签 TLS 监听器，真握一次手，
+ # 验证 tokio-rustls 产出的 io::Error 确实能被本包这份 rustls downcast 回来。
+diff --git a/client/src-tauri/icons/tray-macos.png b/client/src-tauri/icons/tray-macos.png
+new file mode 100644
+index 0000000..6b47d82
+Binary files /dev/null and b/client/src-tauri/icons/tray-macos.png differ
+diff --git a/client/src-tauri/src/core/transfer_engine.rs b/client/src-tauri/src/core/transfer_engine.rs
+index fd9eaa0..f12a647 100644
+--- a/client/src-tauri/src/core/transfer_engine.rs
++++ b/client/src-tauri/src/core/transfer_engine.rs
+@@ -697,7 +697,12 @@ impl TransferEngine {
+                     status: "FAILED".to_string(),
+                     data_type: offer.data_type.clone(),
+                 });
+-                let _ = show_transfer_notification(&app_handle, "UniDrop 接收失败", "数据通道连接失败，请检查服务器地址与证书配置");
++                // Err 必须留痕：通知发不出去本身就是哑故障，而「收不到提醒」
++                // 恰恰是这个功能要防的那件事。此前四处都是 let _ =，
++                // 所以 macOS 上通知整整失效了都没有任何信号。
++                if let Err(e) = show_transfer_notification(&app_handle, "UniDrop 接收失败", "数据通道连接失败，请检查服务器地址与证书配置") {
++                    log::warn!("Failed to show notification: {}", e);
++                }
+                 finalize_history_status(&app_handle, &session_id, "FAILED", Some(&format!("数据通道连接失败: {}", e))).await;
+                 let fail_env = ControlEnvelope {
+                     version: 1,
+@@ -984,7 +989,9 @@ impl TransferEngine {
+                                     }
+                                 }
+                             }
+-                            let _ = show_transfer_notification(&app_handle, "UniDrop 文本已同步", "已写入系统剪贴板，可直接粘贴");
++                            if let Err(e) = show_transfer_notification(&app_handle, "UniDrop 文本已同步", "已写入系统剪贴板，可直接粘贴") {
++                                log::warn!("Failed to show notification: {}", e);
++                            }
+                             let _ = cache_manager.mark_clipboard_injected(&session_id).await;
+                         }
+                         "IMAGE" if still_owned => {
+@@ -1001,7 +1008,9 @@ impl TransferEngine {
+                                     }
+                                 }
+                             }
+-                            let _ = show_transfer_notification(&app_handle, "UniDrop 图片已同步", "已写入系统剪贴板，可直接粘贴");
++                            if let Err(e) = show_transfer_notification(&app_handle, "UniDrop 图片已同步", "已写入系统剪贴板，可直接粘贴") {
++                                log::warn!("Failed to show notification: {}", e);
++                            }
+                             let _ = cache_manager.mark_clipboard_injected(&session_id).await;
+                         }
+                         _ => {
+@@ -1011,7 +1020,9 @@ impl TransferEngine {
+                             } else {
+                                 format!("{} (已保存在沙盒，可在面板中点击装载)", offer.preview_summary)
+                             };
+-                            let _ = show_transfer_notification(&app_handle, "UniDrop 文件接收完成", &notification_body);
++                            if let Err(e) = show_transfer_notification(&app_handle, "UniDrop 文件接收完成", &notification_body) {
++                                log::warn!("Failed to show notification: {}", e);
++                            }
+ 
+                             // P1-9: Auto inject into clipboard if configured
+                             if auto_inject && still_owned && !completed_paths.is_empty() {
+diff --git a/client/src-tauri/src/lib.rs b/client/src-tauri/src/lib.rs
+index 59c9a9c..cfdea22 100644
+--- a/client/src-tauri/src/lib.rs
++++ b/client/src-tauri/src/lib.rs
+@@ -28,8 +28,10 @@ use storage::HistoryRepo;
+ ///
+ /// 「隐藏到托盘」与「最小化到任务栏」是两种不同的形态：后者窗口仍是 visible，
+ /// 只调 show() + set_focus() 在 Windows 上无法还原，必须先 unminimize()。
+-/// 托盘菜单、托盘点击、第二实例、macOS Reopen 全部走这里，避免各处行为不一致。
+-fn reveal_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
++/// 托盘菜单、托盘点击、第二实例、macOS Reopen、macOS 通知点击全部走这里，
++/// 避免各处行为不一致。pub(crate) 是为了让 platform::notification_macos
++/// 的 delegate 回调也能复用它，而不是另造一条唤起路径。
++pub(crate) fn reveal_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+     match app.get_webview_window("main") {
+         Some(win) => {
+             if win.is_minimized().unwrap_or(false) {
+@@ -693,6 +695,25 @@ pub fn run() {
+             let mut tray_builder = TrayIconBuilder::new()
+                 .menu(&tray_menu)
+                 .tooltip("瞬贴 (UniDrop) - 跨平台剪贴板与文件分发");
++
++            #[cfg(target_os = "macos")]
++            {
++                // 菜单栏图标必须是模板图（纯黑 + alpha，形状只由 alpha 表达），
++                // 由系统按深浅色自动反色。此前直接用 default_window_icon()——
++                // 也就是彩色的 icons/32x32.png——深色主体在深色菜单栏上与背景
++                // 融为一体，看起来就像「图标没出现」。
++                let tray_icon = tauri::image::Image::from_bytes(include_bytes!(
++                    "../icons/tray-macos.png"
++                ))?;
++                tray_builder = tray_builder
++                    .icon(tray_icon)
++                    .icon_as_template(true)
++                    // 默认是 true，左键会被系统拿去弹菜单，把下面 on_tray_icon_event
++                    // 里的左键分支彻底挡死（那段逻辑在 macOS 上从未生效过）。
++                    // 关掉之后：左键切换显隐、右键弹菜单，与 Windows 行为一致。
++                    .show_menu_on_left_click(false);
++            }
++            #[cfg(not(target_os = "macos"))]
+             if let Some(icon) = app.default_window_icon() {
+                 tray_builder = tray_builder.icon(icon.clone());
+             }
+@@ -734,6 +755,13 @@ pub fn run() {
+                 })
+                 .build(app)?;
+ 
++            // 7.5 macOS 通知初始化：装 delegate 并请求授权。
++            // 必须在这里做一次，而不是等到第一条通知才初始化——授权弹窗应在启动期
++            // 出现，且 delegate 要先于任何通知到达就位，否则点击回调会丢。
++            // 非 bundle 环境（如 tauri dev 的裸二进制）由函数内部自行跳过。
++            #[cfg(target_os = "macos")]
++            crate::platform::notification_macos::init_notifications(app.handle());
++
+             // 8. 冷启动显隐：只取决于用户配置，手动启动与开机自启一视同仁。
+             // 窗口在 tauri.conf.json 里初始 visible:false，避免 minimized 时的闪窗。
+             if core::startup::should_show_on_launch(start_minimized_on_launch) {
+diff --git a/client/src-tauri/src/platform/mod.rs b/client/src-tauri/src/platform/mod.rs
+index 93194d7..ebb1ece 100644
+--- a/client/src-tauri/src/platform/mod.rs
++++ b/client/src-tauri/src/platform/mod.rs
+@@ -10,6 +10,8 @@ pub mod listener_windows;
+ pub mod clipboard_macos;
+ #[cfg(target_os = "macos")]
+ pub mod listener_macos;
++#[cfg(target_os = "macos")]
++pub mod notification_macos;
+ 
+ #[cfg(target_os = "linux")]
+ pub mod clipboard_linux;
+diff --git a/client/src-tauri/src/platform/notification.rs b/client/src-tauri/src/platform/notification.rs
+index 87d6160..293c45b 100644
+--- a/client/src-tauri/src/platform/notification.rs
++++ b/client/src-tauri/src/platform/notification.rs
+@@ -1,13 +1,28 @@
+ use tauri::AppHandle;
++
++#[cfg(not(target_os = "macos"))]
+ use tauri_plugin_notification::NotificationExt;
+ 
++/// 投递一条传输相关的系统通知。
++///
++/// macOS 走 UNUserNotificationCenter（见 notification_macos.rs），不走
++/// tauri-plugin-notification——后者底层的 NSUserNotificationCenter 已被系统废弃，
++/// 在 macOS 26 上不再投递任何通知。Windows / Linux 维持插件实现不变。
+ pub fn show_transfer_notification(app: &AppHandle, title: &str, body: &str) -> Result<(), String> {
+-    app.notification()
+-        .builder()
+-        .title(title)
+-        .body(body)
+-        .show()
+-        .map_err(|e| e.to_string())?;
+-
+-    Ok(())
++    #[cfg(target_os = "macos")]
++    {
++        super::notification_macos::show_notification(app, title, body)
++    }
++
++    #[cfg(not(target_os = "macos"))]
++    {
++        app.notification()
++            .builder()
++            .title(title)
++            .body(body)
++            .show()
++            .map_err(|e| e.to_string())?;
++
++        Ok(())
++    }
+ }
+diff --git a/client/src-tauri/src/platform/notification_macos.rs b/client/src-tauri/src/platform/notification_macos.rs
+new file mode 100644
+index 0000000..18bf131
+--- /dev/null
++++ b/client/src-tauri/src/platform/notification_macos.rs
+@@ -0,0 +1,204 @@
++//! macOS 系统通知：UNUserNotificationCenter 实现。
++//!
++//! 为什么不走 tauri-plugin-notification：它经 notify-rust 落到
++//! mac-notification-sys 的 `NSUserNotificationCenter`（objc/notify.m），
++//! 而该 API 自 macOS 11 起被 Apple 废弃，在 macOS 26 上已不再投递任何通知。
++//! 失败还是静默的——ObjC 层不报错，插件内部又把 `show()` 的错误吞进
++//! `spawn(async { let _ = ... })`，所以此前零信号。Windows/Linux 仍走插件，
++//! 只有 macOS 换成这里的实现。
++//!
++//! 本模块用的是 objc2 0.6 那一代（`objc2_v06` / `objc2_foundation_v06`），
++//! 与剪贴板模块的 0.5 并存。两者不交换任何类型，理由见 Cargo.toml 的注释。
++
++use std::sync::OnceLock;
++
++use block2::{DynBlock, RcBlock};
++use objc2_foundation_v06::{NSBundle, NSError, NSObject, NSObjectProtocol, NSString};
++use objc2_user_notifications::{
++    UNAuthorizationOptions, UNMutableNotificationContent, UNNotification,
++    UNNotificationDefaultActionIdentifier, UNNotificationPresentationOptions,
++    UNNotificationRequest, UNNotificationResponse, UNNotificationSound, UNUserNotificationCenter,
++    UNUserNotificationCenterDelegate,
++};
++use objc2_v06::rc::Retained;
++use objc2_v06::runtime::{Bool, ProtocolObject};
++use objc2_v06::{define_class, msg_send, AnyThread};
++use tauri::AppHandle;
++
++/// 供 delegate 回调唤起主窗口用。delegate 由 ObjC 运行时在任意线程调起，
++/// 拿不到调用方传来的上下文，只能从这里取。
++static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
++
++/// delegate 必须由我们自己长期持有：`setDelegate:` 是 **weak property**
++/// （见绑定中 `UNUserNotificationCenter::setDelegate` 的文档注释），
++/// 通知中心不会持有它，一旦 Retained 被 drop，点击回调就静默失效。
++static DELEGATE: OnceLock<Retained<NotificationDelegate>> = OnceLock::new();
++
++define_class!(
++    // SAFETY:
++    // - 父类 NSObject 无子类化要求。
++    // - NotificationDelegate 不实现 Drop。
++    // 刻意不标 `#[thread_kind = MainThreadOnly]`：UNUserNotificationCenterDelegate
++    // 的回调线程不受保证（协议定义里没有任何 MainThreadOnly/MainThreadMarker 约束），
++    // 标了反而会在非主线程被调起时触发断言。
++    #[unsafe(super(NSObject))]
++    #[name = "UniDropNotificationDelegate"]
++    struct NotificationDelegate;
++
++    unsafe impl NSObjectProtocol for NotificationDelegate {}
++
++    unsafe impl UNUserNotificationCenterDelegate for NotificationDelegate {
++        /// 应用在前台时，macOS 默认**不**展示通知。不实现这个回调，
++        /// 用户在窗口开着时收不到任何提示，会被当成「又不工作了」。
++        #[unsafe(method(userNotificationCenter:willPresentNotification:withCompletionHandler:))]
++        fn will_present(
++            &self,
++            _center: &UNUserNotificationCenter,
++            _notification: &UNNotification,
++            completion_handler: &DynBlock<dyn Fn(UNNotificationPresentationOptions)>,
++        ) {
++            completion_handler.call((UNNotificationPresentationOptions::Banner
++                | UNNotificationPresentationOptions::Sound,));
++        }
++
++        /// 用户对通知作出动作。只有「点击通知本体」才唤起窗口——
++        /// 划走/关闭通知是用户明确表示不想处理，此时弹窗口是打扰。
++        #[unsafe(method(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:))]
++        fn did_receive(
++            &self,
++            _center: &UNUserNotificationCenter,
++            response: &UNNotificationResponse,
++            completion_handler: &DynBlock<dyn Fn()>,
++        ) {
++            let action = response.actionIdentifier().to_string();
++            let default_action = unsafe { UNNotificationDefaultActionIdentifier.to_string() };
++
++            if action == default_action {
++                if let Some(app) = APP_HANDLE.get() {
++                    let app_for_main = app.clone();
++                    // 本回调的线程不受保证，而 reveal_main_window 内部的
++                    // is_minimized / unminimize / show / set_focus 都是 NSWindow 系
++                    // API，必须在主线程执行。闭包只捕获 AppHandle（'static），
++                    // 可以安全移入；completionHandler 则不行——它是借用引用，
++                    // 所以下面在当前帧同步调用，不进这个闭包。
++                    if let Err(e) = app.run_on_main_thread(move || {
++                        crate::reveal_main_window(&app_for_main);
++                    }) {
++                        log::warn!("Failed to dispatch window reveal to main thread: {}", e);
++                    }
++                }
++            }
++
++            completion_handler.call(());
++        }
++    }
++);
++
++/// 当前进程是否真以本应用的身份在运行。
++///
++/// 判据刻意**不是**「bundleIdentifier 为 nil」：从终端跑 `tauri dev` 时，
++/// 裸二进制的 mainBundle 会回落到宿主应用（如 Terminal），identifier 非空，
++/// nil 判据根本不触发，于是会以 Terminal 的身份去请求通知授权，
++/// 在开发机上弹出「Terminal 想要发送通知」。tauri-plugin-notification 自己在
++/// dev 模式特意 `set_application("com.apple.Terminal")`，正是对这一回落的让步。
++/// 比对 identifier 才能同时覆盖 nil 与回落两种情形。
++fn running_as_app_bundle(app: &AppHandle) -> bool {
++    let expected = &app.config().identifier;
++    let bundle = NSBundle::mainBundle();
++    match bundle.bundleIdentifier() {
++        Some(id) => {
++            let actual = id.to_string();
++            if &actual != expected {
++                log::warn!(
++                    "Not running as the app bundle (bundle id: {}, expected: {}); \
++                     skipping macOS notifications",
++                    actual,
++                    expected
++                );
++                return false;
++            }
++            true
++        }
++        None => {
++            log::warn!("Process has no bundle identifier; skipping macOS notifications");
++            false
++        }
++    }
++}
++
++/// 装 delegate 并请求通知授权。由 setup 调用一次。
++///
++/// 这里同样要过 `running_as_app_bundle`：`currentNotificationCenter()` 在没有
++/// 合法 bundle 的进程里会抛 NSInternalInconsistencyException，
++/// 而 setDelegate 与 requestAuthorization 都要先取它——不拦就是启动即崩。
++pub fn init_notifications(app: &AppHandle) {
++    if !running_as_app_bundle(app) {
++        return;
++    }
++
++    let _ = APP_HANDLE.set(app.clone());
++
++    let center = UNUserNotificationCenter::currentNotificationCenter();
++
++    // 先装 delegate 再请求授权：授权弹窗期间就可能有通知回调进来，
++    // 顺序反了会丢掉这段窗口内的事件。
++    let delegate = DELEGATE.get_or_init(|| {
++        let this = NotificationDelegate::alloc();
++        unsafe { msg_send![this, init] }
++    });
++    let proto = ProtocolObject::from_ref(&**delegate);
++    center.setDelegate(Some(proto));
++
++    // 不要 Badge：本应用没有角标需求，多要一项权限只会让授权弹窗更可疑。
++    let options = UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound;
++    let handler = RcBlock::new(|granted: Bool, error: *mut NSError| {
++        if !error.is_null() {
++            let msg = unsafe { (*error).localizedDescription() }.to_string();
++            log::warn!("Notification authorization request failed: {}", msg);
++            return;
++        }
++        if granted.as_bool() {
++            log::info!("Notification authorization granted");
++        } else {
++            // 不是错误，但必须留痕：否则「通知不弹」又会变成无从排查的哑故障，
++            // 而这正是本次修复要根除的那种形态。
++            log::warn!(
++                "Notification authorization denied by user; \
++                 transfer notifications will not be shown until it is enabled in System Settings"
++            );
++        }
++    });
++    center.requestAuthorizationWithOptions_completionHandler(options, &handler);
++}
++
++/// 投递一条通知。
++pub fn show_notification(app: &AppHandle, title: &str, body: &str) -> Result<(), String> {
++    // 与 init 各自独立判定，不依赖调用顺序：即便 init 因故没跑，这里也不会崩。
++    if !running_as_app_bundle(app) {
++        return Ok(());
++    }
++
++    let center = UNUserNotificationCenter::currentNotificationCenter();
++
++    let content = UNMutableNotificationContent::new();
++    content.setTitle(&NSString::from_str(title));
++    content.setBody(&NSString::from_str(body));
++    content.setSound(Some(&UNNotificationSound::defaultSound()));
++
++    // identifier 用随机 UUID：同 id 的后一条会覆盖前一条，
++    // 连续收到多次传输时只会剩最后一条。
++    let identifier = NSString::from_str(&uuid::Uuid::new_v4().to_string());
++    // trigger 传 None 即立即投递。
++    let request =
++        UNNotificationRequest::requestWithIdentifier_content_trigger(&identifier, &content, None);
++
++    let handler = RcBlock::new(|error: *mut NSError| {
++        if !error.is_null() {
++            let msg = unsafe { (*error).localizedDescription() }.to_string();
++            log::warn!("Failed to deliver notification: {}", msg);
++        }
++    });
++    center.addNotificationRequest_withCompletionHandler(&request, Some(&handler));
++
++    Ok(())
++}
