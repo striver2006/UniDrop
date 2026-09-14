@@ -1,8 +1,9 @@
 # TriviumCode 项目配置（进 Git，团队共享）
 # 本机绝对路径与探针结论在 config.local.yaml（不进 Git）
 # verify.build / verify.test 只执行此处显式声明的命令——编排器不猜测执行（§14.1）
+# 本文件由 trivium init 从 trivium.config.v1 改写而来，原文见 config.yaml.trivium-backup（YAML 往返会丢失注释，原注释在备份里）
 
-schema: trivium.config.v1
+schema: trivium.config.v2
 archive_root: .reviews
 topic:
   max_len: 64
@@ -23,21 +24,10 @@ isolation:
 review:
   parallel: true
   failure_policy: strict
-  allow_single_flag: true
   timeout_s:
-    # plan 从 900 提到 1500，对齐 TriviumCode。那边实测 GLM-5.3-Flash 跑一次计划审
-    # 要 682~900+ 秒（74 次工具调用、含子 Agent），900s 卡在边缘；本项目 default 档
-    # 的 plan 侧现在也是更慢的非 Flash GLM-5.3。
     plan: 1500
-    # code 从 1200 提到 2700，对齐 TriviumCode。那边实测 GLM-5.3-Flash 审 258KB
-    # 补丁用了 1063s、277KB 的那次直接撞满 1200s；本项目 default 档的 code 侧现在
-    # 换成了更慢的非 Flash GLM-5.3，1200s 余量不足。
-    # 注意：2700 是借来的经验值，不是本仓库的实测结果，撞到再按实测调。
     code: 2700
     bug: 1200
-  # 每次 --wait 的窗口，也是用户能收到进度的最小间隔（Bash 工具在命令退出前
-  # 不回传 stdout，窗口内 Driver 说不了话）。540→180 对齐 TriviumCode：
-  # 9 分钟一声等于没有反馈。
   wait_timeout_s: 180
   heartbeat_stale_s: 120
   retry:
@@ -76,41 +66,8 @@ review:
     - Dockerfile
     - .claude/**
     - .trivium/**
-critics:
-  gemini:
-    vendor: antigravity
-    bin: null
-    agent: trivium-critic
-    # slug 后缀才是权威：模型名带 -high/-medium/-low 时编排器不传 --effort
-    # （agy 1.2.0 会报冲突，坑 P-16）。当前两档 slug 全是 -high，此处三项均随之写 high，
-    # 否则归档 front-matter 会记下一个从未生效的 effort 值。
-    effort:
-      plan: high
-      code: high
-      bug: high
-    readonly_commands:
-      - git log
-      - git blame
-      - git diff
-      - git show
-      - git status
-      - ls
-      - cat
-      - head
-      - tail
-      - grep
-      - rg
-      - find
-      - wc
-  glm:
-    vendor: zcode
-    entry: null
-    max_turns: 40
-    unsupported_override: reject
-# 两档的差异只在 GLM 侧用不用 Flash——gemini 侧两档相同。
-# 不写 profile 级 effort：该字段无任何读取点，且 slug 自带后缀时 effort 本就不生效。
-# 注意配置是递归合并的：这里写了哪些档，就在内置默认的两档之上叠加哪些档，
-# 所以旧档位必须从这里删掉，光改内置默认不够。
+  allow_partial_flag: true
+  max_critics: 3
 profiles:
   default:
     gemini:
@@ -145,14 +102,39 @@ gate:
 preflight:
   auth_cache_ttl_h: 1
 verify:
-  # monorepo：cwd 固定为项目根，且每条命令是独立的 /bin/sh -c 进程，
-  # 因此每条都必须自带 cd（前一条的 cd 不会累积到下一条）。
   build:
     - cd client && pnpm build
     - cd server && go build ./...
   test:
-    # client 侧目前没有任何测试脚本，test 组只覆盖 server。
     - cd server && go test ./...
 retention:
   run_dir_days: 30
 probe_ttl_days: 7
+agents:
+  gemini:
+    vendor: antigravity
+    bin: null
+    agent: trivium-critic
+    effort:
+      plan: high
+      code: high
+      bug: high
+    readonly_commands:
+      - git log
+      - git blame
+      - git diff
+      - git show
+      - git status
+      - ls
+      - cat
+      - head
+      - tail
+      - grep
+      - rg
+      - find
+      - wc
+  glm:
+    vendor: zcode
+    entry: null
+    max_turns: 40
+    unsupported_override: reject
