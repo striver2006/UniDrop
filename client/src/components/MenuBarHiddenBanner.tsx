@@ -57,8 +57,10 @@ export const MenuBarHiddenBanner: React.FC<Props> = ({ payload, onDismiss, onOpe
               </li>
             </ol>
             <p className="break-words text-amber-200/60">
-              期间点击 Dock 栏的瞬贴图标随时可以唤回本窗口，功能不受影响。图标恢复后本提示会自行消失。
-              {payload.start_minimized && " 你开了「启动即最小化」，图标恢复前窗口会在启动几秒后自动打开，以免你完全没有入口。"}
+              瞬贴平时不在 Dock 里显示图标；检测到这个状况后，已临时把 Dock 图标放出来当作入口——
+              期间点击 Dock 栏的瞬贴图标随时可以唤回本窗口，功能不受影响。
+              菜单栏图标恢复后，本提示和那个 Dock 图标都会自行消失。
+              {payload.start_minimized && " 你开了「启动即最小化」，图标恢复前窗口会在启动后约半分钟内（最长约 28 秒）自动打开，以免你完全没有入口。"}
             </p>
           </div>
         </div>

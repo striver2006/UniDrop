@@ -179,6 +179,14 @@ fn build_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
 /// 「隐藏到托盘」与「最小化到任务栏」是两种不同的形态：后者窗口仍是 visible，
 /// 只调 show() + set_focus() 在 Windows 上无法还原，必须先 unminimize()。
 ///
+/// 三步顺序在 macOS 上同样是必须品，而且自从 Dock 图标被藏起来（Accessory，
+/// 见 `run()` 里的 set_activation_policy）之后更要命：tao 的 `Window::set_focus`
+/// 有一道前置守卫 `if !is_minimized && is_visible`
+/// （tao-0.35.3/src/platform_impl/macos/window.rs:677），不满足就整个空操作，
+/// 连里面那句 `activateIgnoringOtherApps: YES`（util/async.rs:234）都不会执行——
+/// 而没有 Dock 图标时，那一句是应用唯一还能把自己拉到前台的手段。
+/// 不要把 show() 挪到 set_focus() 后面，也不要以「反正已经 visible 了」删掉它。
+///
 /// 托盘菜单、托盘点击、第二实例、macOS Reopen、macOS 通知点击全部走这里，
 /// 避免各处行为不一致。pub(crate) 是为了让 platform::notification_macos
 /// 的 delegate 回调也能复用它，而不是另造一条唤起路径。
@@ -326,7 +334,10 @@ pub fn run() {
     let pending_inbound_ref = pending_inbound.clone();
     let start_minimized_on_launch = initial_settings.start_minimized;
 
-    tauri::Builder::default()
+    // 拆成 `let app = ...build()` 再单独 `app.run()`，而不是一路链下去：
+    // 中间要插一次 `set_activation_policy`，且**必须插在 run() 之前**，理由见那里。
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut app = tauri::Builder::default()
         // 日志插件放在最前：它之后注册的插件若有启动期日志，才有人接得住。
         //
         // 级别压到 Info；tungstenite 两个 crate 单独压到 Warn——它们在 Debug/Info
@@ -851,10 +862,7 @@ pub fn run() {
             // 不探测的话这就是个彻底的哑故障——应用在后台跑着，用户既看不到图标，
             // 也收不到任何解释。探测本身是延迟异步的，不阻塞 setup。
             #[cfg(target_os = "macos")]
-            crate::platform::tray_placement_macos::spawn_placement_watchdog(
-                app.handle(),
-                start_minimized_on_launch,
-            );
+            crate::platform::tray_placement_macos::spawn_placement_watchdog(app.handle());
 
             // 8. 冷启动显隐：只取决于用户配置，手动启动与开机自启一视同仁。
             // 窗口在 tauri.conf.json 里初始 visible:false，避免 minimized 时的闪窗。
@@ -894,13 +902,49 @@ pub fn run() {
             commands::cmd_open_menu_bar_settings,
         ])
         .build(tauri::generate_context!())
-        .expect("error while building UniDrop application")
-        .run(|app_handle, event| {
-            #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { .. } = event {
-                reveal_main_window(app_handle);
-            }
-            #[cfg(not(target_os = "macos"))]
-            let _ = (app_handle, event);
-        });
+        .expect("error while building UniDrop application");
+
+    // macOS：启动即 Accessory —— 只在菜单栏出现，Dock 里不要图标。
+    //
+    // **必须在 run() 之前，不能挪进 setup()。** 两条硬约束：
+    //
+    // 1. setup 闭包不是在 build() 里跑的，而是在 `RuntimeRunEvent::Ready` 里跑的
+    //    （tauri-2.11.5/src/app.rs:1423）。那时 tao 的 applicationDidFinishLaunching
+    //    早已执行完 `apply_activation_policy`（tao-0.35.3 app_state.rs:285），
+    //    按 aux state 的默认值 Regular 落过一次——每个用户都会看见 Dock 图标
+    //    闪一下再消失。
+    // 2. 只有 run() 之前 `App::runtime` 还是 Some，此时
+    //    `App::set_activation_policy`（app.rs:1286）走的是 tao 的
+    //    `EventLoopExtMacOS::set_activation_policy`，只写 aux state、由 tao 在
+    //    didFinishLaunching 统一 apply，零闪烁。run() 之后就只剩运行时那条路了。
+    //
+    // 与 `src-tauri/Info.plist` 里的 LSUIElement 是**互补而非冗余**，两边都要留：
+    // LSUIElement 只管 exec → didFinishLaunching 那几百毫秒（且只在 .app bundle 里
+    // 有效），这一行管其余全部时间，并且是 `tauri dev`（裸二进制、没有 Info.plist）
+    // 下唯一生效的手段。反过来单靠 LSUIElement 也不行——上面第 1 条那次 apply
+    // 是无条件的，会拿默认的 Regular 把它直接覆盖掉。
+    //
+    // dev 与 release 行为刻意保持一致，不加 cfg(debug_assertions) 分支。
+    // 被系统拒绝时切回 Regular 放出 Dock 图标当兜底，那是看门狗的职责，
+    // 见 platform::tray_placement_macos::desired_activation_policy。
+    #[cfg(target_os = "macos")]
+    app.set_activation_policy(platform::tray_placement_macos::launch_activation_policy());
+
+    app.run(|app_handle, event| {
+        // macOS「再次打开一个已在运行的应用」→ 唤回窗口。
+        //
+        // 触发面比字面上的「点 Dock 图标」宽得多：tao 注册的是
+        // applicationShouldHandleReopen:hasVisibleWindows:
+        // （tao-0.35.3/src/platform_impl/macos/app_delegate.rs:79），
+        // `open -a`、访达双击 .app、Spotlight 打开已运行的实例都会走这里。
+        // 本应用常态是 Accessory（Dock 里没有图标，见上面那次 set_activation_policy），
+        // 「点 Dock 图标」这一条确实不会再发生了，但**其余几条恰恰是此时最自然的
+        // 唤回手势**——不要因为「反正没有 Dock 图标了」就把这个分支删掉。
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = event {
+            reveal_main_window(app_handle);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (app_handle, event);
+    });
 }

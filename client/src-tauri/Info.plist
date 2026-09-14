@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- 只在菜单栏出现，Dock 里不要图标。
+
+       tauri.conf.json 不需要任何改动：bundler 会自动找 Tauri 配置文件同目录下的
+       Info.plist 并与生成的那份合并（tauri-utils-2.9.3/src/config.rs:664）。
+
+       **这一条只管从 exec 到 applicationDidFinishLaunching 那几百毫秒。**
+       没有它，LaunchServices 会先弹一个跳动的 Dock 图标出来再被我们收回去。
+
+       真正长期生效的是 lib.rs::run() 里 run() 之前那次 set_activation_policy ——
+       tao 会在 applicationDidFinishLaunching 里**无条件**按自己 aux state 的默认值
+       Regular 重设一次策略（tao-0.35.3 app_state.rs:285 -> :455），把这里的设定
+       直接覆盖掉。而且 `tauri dev` 跑的是裸二进制、根本没有 .app bundle，
+       这个文件在那种场景下完全不参与。
+
+       两者互补，缺一不可，不要以为重复就删掉任何一边。 -->
+  <key>LSUIElement</key>
+  <true/>
+</dict>
+</plist>

@@ -29,7 +29,13 @@
 //! 2. 不要再动托盘的创建时机，也不要「没放上就重建」。setup / `RunEvent::Ready` /
 //!    +800ms / +3000ms / 强制重建 五种形态实测坐标全都相同，时机不是变量
 //!    （见 `lib.rs::build_tray` 与 tauri-apps/tauri#13770）。
-//! 3. 不要切 activation policy。同上，已被穷举证伪。
+//! 3. 不要指望切 activation policy 能把菜单栏图标变出来。Regular / Accessory /
+//!    Prohibited 三种形态下影子窗口坐标完全相同，被拒就是被拒，同上，已穷举证伪。
+//!    **但这不是「禁止切 activation policy」**——本应用的常态恰恰就是 Accessory
+//!    （Dock 里不显示图标，见 `lib.rs::run()`），而且**正是本模块**在定论为
+//!    `Rejected` / `Unknown` 时切回 Regular，把 Dock 图标当救生艇放出来
+//!    （见 `desired_activation_policy` / `apply_activation_policy`）。
+//!    「被拒之后怎么给用户留个入口」与「怎么让图标出现」是两码事，别混为一谈。
 //!
 //! # 被拒的真实机制（2026-09-14 晚定案，勿再改写成别的说法）
 //!
@@ -429,6 +435,166 @@ pub(crate) fn should_force_reveal(
     matches!(placement, TrayPlacement::Rejected) && start_minimized && !opted_out
 }
 
+/// Dock 图标的去留，也就是本应用的激活策略。
+///
+/// **刻意不直接用 `tauri::ActivationPolicy`**：那个枚举在
+/// tauri-runtime-2.11.3/src/lib.rs:259 上一个 derive 都没有（无 `Debug`、
+/// 无 `Copy`、无 `PartialEq`），还带 `#[non_exhaustive]`——既 `assert_eq!` 不了，
+/// 也存不进原子量。转换只发生在 `apply_activation_policy` 与
+/// `launch_activation_policy` 两处出口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DockPolicy {
+    /// `NSApplicationActivationPolicyAccessory`——Dock 里没有图标。本应用的常态。
+    Hidden,
+    /// `NSApplicationActivationPolicyRegular`——Dock 里有图标。被拒时的救生艇。
+    Visible,
+}
+
+const POLICY_UNSET: u8 = 0;
+const POLICY_HIDDEN: u8 = 1;
+const POLICY_VISIBLE: u8 = 2;
+
+impl DockPolicy {
+    fn to_tauri(self) -> tauri::ActivationPolicy {
+        match self {
+            DockPolicy::Hidden => tauri::ActivationPolicy::Accessory,
+            DockPolicy::Visible => tauri::ActivationPolicy::Regular,
+        }
+    }
+
+    fn to_cache(self) -> u8 {
+        match self {
+            DockPolicy::Hidden => POLICY_HIDDEN,
+            DockPolicy::Visible => POLICY_VISIBLE,
+        }
+    }
+
+    fn from_cache(v: u8) -> Option<Self> {
+        match v {
+            POLICY_HIDDEN => Some(DockPolicy::Hidden),
+            POLICY_VISIBLE => Some(DockPolicy::Visible),
+            // POLICY_UNSET：本进程还没落过运行时策略。
+            _ => None,
+        }
+    }
+}
+
+/// 启动期（尚无探测结论时）采用的策略。
+///
+/// 恒为 `Hidden`，**刻意不查 `last_placement()`**：那一刻它必然是 `Unknown`
+/// （一次都还没探过），而 `desired_activation_policy(Unknown)` 是 `Visible`——
+/// 照它办的话每个用户启动时都会先看到一个 Dock 图标、几十秒后又凭空消失，
+/// 在正常用户眼里这就是个 bug。
+///
+/// 所以这里乐观押 Accessory：代价只由「真被拒」的少数派承担，且**有确定上界**
+/// `FIRST_PROBE_DELAY + (MAX_RETRIES - 1) * RETRY_INTERVAL`（28s）。
+///
+/// 把这个代价说准确，别再写成「不存在无入口的窗口期」——那是句错话：
+/// 开了「启动即最小化」又恰好被拒的人，在定论之前的那 28 秒里，菜单栏没有图标、
+/// Dock 没有图标、窗口也不显示，**确实是没有入口的**。这里保证的只是
+/// 「这段窗口期有上界，且定论那一刻一定会补上入口」，不是「它不存在」。
+///
+/// 定论时补什么也分两种，别只记住第一种：
+/// - 一般情况下 `handle_not_placed` 会把窗口唤起来，Dock 图标和窗口一起出现；
+/// - 但**已经点过「下次不要自动打开」的人不会被唤窗**（`should_force_reveal`
+///   在 `opted_out` 时为 false，而能点到那个按钮的人 `guidance_shown` 必然已置位，
+///   首次分支也不会再走）。他们在定论时刻拿到的入口只有 Dock 图标本身，
+///   外加「在访达/启动台里再打开一次」那条路（见 `RunEvent::Reopen`）。
+///   这是他们自己关掉打扰换来的，可以接受——但不要因为记着上一条，
+///   就以为「窗口必弹」，进而在别处省掉留给他们的入口。
+///
+/// 方向也不对称：Accessory→Regular 只是多一个图标；Regular→Accessory 会让应用
+/// 在降级瞬间失去前台状态，正在用窗口的人会看到一次焦点抖动。
+pub(crate) const LAUNCH_DOCK_POLICY: DockPolicy = DockPolicy::Hidden;
+
+/// 供 `lib.rs::run()` 在 `App::run()` **之前**取初始策略。
+pub fn launch_activation_policy() -> tauri::ActivationPolicy {
+    LAUNCH_DOCK_POLICY.to_tauri()
+}
+
+/// 看门狗定论之后期望的激活策略。
+///
+/// 三个态映射成两条策略，但理由各不相同，**不要合并 match 臂**：
+///
+/// - `Placed`：菜单栏确实有入口 → `Hidden`。这是产品想要的常态。
+/// - `Rejected`：菜单栏没有入口 → `Visible`。Dock 图标是唯一还能给用户的抓手。
+/// - `Unknown`：判据失效，**我们并不知道有没有入口** → 同样给 Dock 图标。
+///
+/// 最后这条**不是**把 `Unknown` 当 `Rejected` 处理，别照着这里去合并别处。
+/// 模块里那条「Unknown 一律不提示」的规矩管的是**要不要打扰用户**：
+/// `should_warn_user` 与 `should_force_reveal` 在 `Unknown` 下仍然一律返回
+/// `false`，前端横幅（`MenuBarHiddenBanner.tsx` 判 `placement !== "rejected"`）
+/// 也照旧不显示。Dock 图标不是告警，它是零噪音的静默兜底。
+///
+/// 往安全侧倒是因为代价不对称：赌 `Hidden` 赌错，用户是彻底没有入口、
+/// 只能去活动监视器强杀；赌 `Visible` 赌错，不过是多一个图标。
+pub(crate) fn desired_activation_policy(concluded: TrayPlacement) -> DockPolicy {
+    match concluded {
+        TrayPlacement::Placed => DockPolicy::Hidden,
+        TrayPlacement::Rejected => DockPolicy::Visible,
+        TrayPlacement::Unknown => DockPolicy::Visible,
+    }
+}
+
+/// 要不要真去调一次 `setActivationPolicy`。`None` = 现状已经对，别调。
+///
+/// 去重不是洁癖：稳态 loop 每轮都会走 `apply_activation_policy`，不去重就是
+/// 每隔 `STEADY_INTERVAL` 往主线程投递一条无用消息；而重复落
+/// `setActivationPolicy(Regular)` 实测会让 Dock 图标再弹一次。
+///
+/// `current` 为 `None`（本进程还没落过运行时策略）时必落一次：启动期那次走的是
+/// `App::set_activation_policy` → tao aux state 那条路径，与这里的运行时路径
+/// 不是同一份状态，不能假定它们一致。
+pub(crate) fn policy_transition(
+    current: Option<DockPolicy>,
+    concluded: TrayPlacement,
+) -> Option<DockPolicy> {
+    let wanted = desired_activation_policy(concluded);
+    if current == Some(wanted) {
+        None
+    } else {
+        Some(wanted)
+    }
+}
+
+/// 已经落到进程上的运行时策略。`POLICY_UNSET` = 还没落过。
+///
+/// 与 `LAST_PLACEMENT` 同样用模块内原子量而不是往 `AppState` 加字段，理由见那里。
+static CURRENT_POLICY: AtomicU8 = AtomicU8::new(POLICY_UNSET);
+
+/// 把探测结论落成激活策略。幂等，任意线程可调。
+///
+/// 用 `AppHandle::set_activation_policy`（tauri-2.11.5/src/app.rs:640）而**不是**
+/// 自己写 objc2 调 `NSApplication::setActivationPolicy`：前者内部是
+/// `send_user_message`（tauri-runtime-wry-2.11.4/src/lib.rs:235），本线程就是主线程
+/// 则内联执行、否则投递事件循环，**因此这里不需要再套一层 `run_on_main_thread`**。
+/// 最终它落到 tao 的 `set_activation_policy_at_runtime`，那一句调的就是
+/// `NSApplication::setActivationPolicy`——自己再写一遍只是把主线程约束和一个
+/// objc2 0.6 代的 `NSApplicationActivationPolicy` 引进来，白白多背两份负担。
+///
+/// 也**不要**换成看起来更对口的 `AppHandle::set_dock_visibility`（app.rs:660）：
+/// 它走 tao 的 `TransformProcessType`（tao-0.35.3/src/platform_impl/macos/dock.rs），
+/// 里面有一段硬编码的 1 秒去抖（`dock.rs:13,55`），会把紧跟在一次 show 之后的
+/// hide **静默丢弃**——而 hide↔show 往返恰恰就是本兜底逻辑的形态。
+fn apply_activation_policy(app: &AppHandle, concluded: TrayPlacement) {
+    let current = DockPolicy::from_cache(CURRENT_POLICY.load(Ordering::Relaxed));
+    let Some(wanted) = policy_transition(current, concluded) else {
+        return;
+    };
+
+    log::info!(
+        "Tray placement is {:?}; switching activation policy to {:?} \
+         (Hidden = Accessory / no Dock icon, Visible = Regular / Dock icon as the fallback entry point)",
+        concluded,
+        wanted,
+    );
+    match app.set_activation_policy(wanted.to_tauri()) {
+        Ok(()) => CURRENT_POLICY.store(wanted.to_cache(), Ordering::Relaxed),
+        // 退出过程中事件循环已经走了，投递必然失败。不更新缓存，下一轮自然重试。
+        Err(e) => log::warn!("Failed to set activation policy to {:?}: {}", wanted, e),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 持久化标记
 // ---------------------------------------------------------------------------
@@ -466,12 +632,21 @@ async fn build_payload(
 /// 用的是缓存值而不是现场再探一次：探测要派发主线程，而这个命令会在每次
 /// `fetchInitialData` 里被调用；看门狗已经在按固定节奏刷新缓存了。
 pub async fn current_payload(app: &AppHandle) -> TrayPlacementPayload {
-    let start_minimized = {
-        let state = app.state::<AppState>();
-        let settings = state.settings.lock().await;
-        settings.start_minimized
-    };
-    build_payload(app, last_placement(), start_minimized).await
+    build_payload(app, last_placement(), read_start_minimized(app).await).await
+}
+
+/// 现读一次「启动即最小化」。
+///
+/// **一定要现读，不要在 setup 时拍快照往下传。** 这个设定运行期是可改的
+/// （`cmd_save_settings` 会更新 `AppState::settings`），而看门狗自从改成常驻
+/// 之后，它的 loop 活得和进程一样久——快照会在那里一直冻着启动时的值：
+/// 用户后来关掉了该设定，翻转时仍会被强制弹窗；后来打开了它的人反而拿不到
+/// 那次安全唤起。而且「拉」通道（`current_payload`）本来就是现读的，
+/// 留着快照会让推、拉两条通道对同一个字段给出不同的答案。
+async fn read_start_minimized(app: &AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    let settings = state.settings.lock().await;
+    settings.start_minimized
 }
 
 /// 记下「已经引导过一次」。值里带版本与时间戳纯为排障留痕。
@@ -510,13 +685,24 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_RETRIES: u32 = 6;
 /// 定论为被拒之后的复探间隔。用户会中途去系统设置改开关，横幅必须能自己消失。
 const RECHECK_INTERVAL: Duration = Duration::from_secs(30);
+/// 定论为已放置之后的稳态复探间隔。
+///
+/// 比 `RECHECK_INTERVAL` 慢一个量级：这条路径是绝大多数用户的常态，一次
+/// `CGWindowListCopyWindowInfo(OptionAll)` 不算贵但也不白送，一个常驻进程按 30s
+/// 敲一辈子没有必要。但**不能不探**——理由见 `spawn_placement_watchdog` 阶段二。
+const STEADY_INTERVAL: Duration = Duration::from_secs(300);
 
 /// 挂上菜单栏放置看门狗。在 setup 里调用一次。
-pub fn spawn_placement_watchdog(app: &AppHandle, start_minimized: bool) {
+///
+/// 除了把哑故障翻译给用户，它还是**唯一**决定 Dock 图标去留的地方：
+/// 本应用常态是 Accessory（Dock 里没有图标），被拒时由这里切回 Regular
+/// 把 Dock 图标放出来当救生艇。见 `desired_activation_policy`。
+pub fn spawn_placement_watchdog(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(FIRST_PROBE_DELAY).await;
 
+        // ── 阶段一：定论 ──────────────────────────────────────────────
         let mut placement = probe(&app).await;
         let mut tries = 1;
         while placement != TrayPlacement::Placed && tries < MAX_RETRIES {
@@ -525,32 +711,70 @@ pub fn spawn_placement_watchdog(app: &AppHandle, start_minimized: bool) {
             tries += 1;
         }
 
+        // 落第一次策略。**必须先于 `handle_not_placed`**：后者会
+        // `reveal_main_window`，而那内部要 `activateIgnoringOtherApps`；
+        // 同一 tick 里先激活再切策略，macOS 会把这次激活丢掉。
+        apply_activation_policy(&app, placement);
+
         if placement == TrayPlacement::Placed {
-            // 已放置的图标不会被系统单方面收回；用户自己拖走或关开关是有可见
-            // 反馈的主动操作，不需要我们再告警。看门狗到此退出。
+            let start_minimized = read_start_minimized(&app).await;
             let payload = build_payload(&app, placement, start_minimized).await;
             let _ = app.emit(PLACEMENT_EVENT, payload);
-            return;
+        } else {
+            handle_not_placed(&app, placement).await;
         }
 
-        handle_not_placed(&app, placement, start_minimized).await;
-
-        // 复探直到恢复。恢复即推一次「已就位」让横幅自行消失，然后退出。
+        // ── 阶段二：常驻复探 ──────────────────────────────────────────
+        //
+        // **这里曾经在定论为 Placed 时直接 return 退出**，理由是「已放置的图标
+        // 不会被系统单方面收回，用户自己拖走或关开关是有可见反馈的主动操作」。
+        // 那条推理的前提是「图标没了至少还有 Dock 兜底」——自从 Dock 图标改由
+        // 本函数按需放出之后，前提不成立了：用户在「系统设置 › 菜单栏 › 应用程序」
+        // 里把开关一关（模块头记着这个开关是**运行时热生效**的，反方向同理），
+        // 菜单栏图标消失，而退出了的 loop 再也没人去把 Dock 图标放出来，
+        // 应用当场变成一个没有任何入口的幽灵进程。
+        //
+        // 所以两处 return 都删掉了，改成双速常驻轮询。别再把它改回去。
+        let mut last = placement;
         loop {
-            tokio::time::sleep(RECHECK_INTERVAL).await;
-            if probe(&app).await == TrayPlacement::Placed {
+            let interval = if last == TrayPlacement::Placed {
+                STEADY_INTERVAL
+            } else {
+                RECHECK_INTERVAL
+            };
+            tokio::time::sleep(interval).await;
+
+            let now = probe(&app).await;
+
+            // 每轮都落一次策略；`apply_activation_policy` 内部按「上次落过什么」
+            // 去重，稳态下并不会真的调下去。
+            apply_activation_policy(&app, now);
+
+            if now == last {
+                continue;
+            }
+            log::info!("Tray placement changed: {:?} -> {:?}", last, now);
+            last = now;
+
+            if now == TrayPlacement::Placed {
                 log::info!("Menu bar icon has been placed; clearing the guidance banner");
-                let payload = build_payload(&app, TrayPlacement::Placed, start_minimized).await;
+                let start_minimized = read_start_minimized(&app).await;
+                let payload = build_payload(&app, now, start_minimized).await;
                 let _ = app.emit(PLACEMENT_EVENT, payload);
-                return;
+            } else {
+                // 复用既有处置：首次会发通知 + 唤窗并置 guidance_shown，
+                // 之后只 emit + 按 should_force_reveal 决定是否唤窗。
+                handle_not_placed(&app, now).await;
             }
         }
     });
 }
 
 /// 定论为「没被放置」之后的处置，按打扰程度递增。
-async fn handle_not_placed(app: &AppHandle, placement: TrayPlacement, start_minimized: bool) {
+async fn handle_not_placed(app: &AppHandle, placement: TrayPlacement) {
     // 日志在 conclude() 里已经打过，这里只做用户可见的部分。
+    // start_minimized 现读而不是从 setup 一路传进来，理由见 `read_start_minimized`。
+    let start_minimized = read_start_minimized(app).await;
     let payload = build_payload(app, placement, start_minimized).await;
     let guidance_shown = payload.guidance_shown;
     let force_reveal_optout = payload.force_reveal_optout;
@@ -650,6 +874,123 @@ mod tests {
         assert!(!should_force_reveal(TrayPlacement::Placed, true, false));
         // 判据失效 → 一律不动用户的窗口
         assert!(!should_force_reveal(TrayPlacement::Unknown, true, false));
+    }
+
+    /// 期望策略的真值表。
+    #[test]
+    fn desired_policy_truth_table() {
+        assert_eq!(
+            desired_activation_policy(TrayPlacement::Placed),
+            DockPolicy::Hidden
+        );
+        assert_eq!(
+            desired_activation_policy(TrayPlacement::Rejected),
+            DockPolicy::Visible
+        );
+        assert_eq!(
+            desired_activation_policy(TrayPlacement::Unknown),
+            DockPolicy::Visible
+        );
+    }
+
+    /// **本次改造最需要钉住的一条不变量。**
+    ///
+    /// `Unknown` 与 `Rejected` 拿到同一条策略（都放出 Dock 图标），但处置必须
+    /// 截然不同：Dock 图标是零噪音兜底，告警和强制唤窗是打扰用户。
+    /// 有人若图省事把 `Unknown` 并进 `Rejected` 去简化 match，这条会先炸。
+    #[test]
+    fn unknown_takes_the_dock_but_never_warns() {
+        assert_eq!(
+            desired_activation_policy(TrayPlacement::Unknown),
+            desired_activation_policy(TrayPlacement::Rejected)
+        );
+        // 策略相同，处置必须不同：
+        assert!(!should_warn_user(TrayPlacement::Unknown));
+        assert!(should_warn_user(TrayPlacement::Rejected));
+        assert!(!should_force_reveal(TrayPlacement::Unknown, true, false));
+        assert!(should_force_reveal(TrayPlacement::Rejected, true, false));
+    }
+
+    /// 启动期乐观押 Accessory，且**不是**由 `desired_activation_policy` 推出来的。
+    ///
+    /// 若有人把它改写成 `desired_activation_policy(last_placement())`，这条会炸——
+    /// 那一刻 `last_placement()` 必为 `Unknown`，会让每个用户启动时先闪一下
+    /// Dock 图标再看着它消失。
+    #[test]
+    fn launch_is_optimistically_hidden() {
+        assert_eq!(LAUNCH_DOCK_POLICY, DockPolicy::Hidden);
+        assert_ne!(
+            LAUNCH_DOCK_POLICY,
+            desired_activation_policy(TrayPlacement::Unknown)
+        );
+    }
+
+    /// 去重：结论没变就别再往主线程投消息，也别让 Dock 图标重复弹一次。
+    #[test]
+    fn policy_transition_dedupes() {
+        // 稳态：已经 Hidden 且仍然 Placed → 不调
+        assert_eq!(
+            policy_transition(Some(DockPolicy::Hidden), TrayPlacement::Placed),
+            None
+        );
+        // 稳态：已经 Visible 且仍然 Rejected → 不调
+        assert_eq!(
+            policy_transition(Some(DockPolicy::Visible), TrayPlacement::Rejected),
+            None
+        );
+        // 掉线：Placed → Rejected，放出 Dock 图标
+        assert_eq!(
+            policy_transition(Some(DockPolicy::Hidden), TrayPlacement::Rejected),
+            Some(DockPolicy::Visible)
+        );
+        // 恢复：Rejected → Placed，收回 Dock 图标
+        assert_eq!(
+            policy_transition(Some(DockPolicy::Visible), TrayPlacement::Placed),
+            Some(DockPolicy::Hidden)
+        );
+        // 首次：本进程还没落过运行时策略，无论结论如何都要落一次——
+        // 启动期走的是 tao aux state，与运行时路径不是同一份状态。
+        assert_eq!(
+            policy_transition(None, TrayPlacement::Placed),
+            Some(DockPolicy::Hidden)
+        );
+        assert_eq!(
+            policy_transition(None, TrayPlacement::Rejected),
+            Some(DockPolicy::Visible)
+        );
+
+        // Unknown 参与的迁移。判据失效是这套启发式最可能的失败形态，
+        // 它在去重逻辑里的表现必须和 Rejected 一样被钉住，不能只测好路径。
+        assert_eq!(
+            policy_transition(Some(DockPolicy::Hidden), TrayPlacement::Unknown),
+            Some(DockPolicy::Visible)
+        );
+        assert_eq!(
+            policy_transition(Some(DockPolicy::Visible), TrayPlacement::Unknown),
+            None
+        );
+        assert_eq!(
+            policy_transition(None, TrayPlacement::Unknown),
+            Some(DockPolicy::Visible)
+        );
+        // Unknown ↔ Rejected 互相切换时不该产生多余的调用：
+        // 两者期望策略相同，Dock 图标不能因为判据在这两态之间抖动而重复弹。
+        assert_eq!(
+            policy_transition(
+                Some(desired_activation_policy(TrayPlacement::Rejected)),
+                TrayPlacement::Unknown
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn dock_policy_cache_roundtrips() {
+        for p in [DockPolicy::Hidden, DockPolicy::Visible] {
+            assert_eq!(DockPolicy::from_cache(p.to_cache()), Some(p));
+        }
+        // 从未落过策略时是 None，而不是乐观地报某一侧。
+        assert_eq!(DockPolicy::from_cache(POLICY_UNSET), None);
     }
 
     #[test]
