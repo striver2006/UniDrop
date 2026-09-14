@@ -21,6 +21,8 @@ const baseSettings: AppSettings = {
   cache_max_size_mb: 10240,
   cache_sweep_interval_minutes: 60,
   allow_insecure_tls: false,
+  tls_trust_mode: "public_ca",
+  pinned_cert_sha256: [],
   e2ee_enabled: true,
 };
 
@@ -339,5 +341,83 @@ describe("账号标识校验", () => {
 
     await user.click(toggle);
     expect(screen.getByText(/将以明文经过中继服务器/)).toBeInTheDocument();
+  });
+
+  describe("连接安全三档", () => {
+    const modeRadio = (name: RegExp) => screen.getByRole("radio", { name });
+
+    it("默认选中「校验公共 CA 证书」，且不显示任何警告", () => {
+      setup();
+      expect(modeRadio(/校验公共 CA 证书/)).toBeChecked();
+      expect(screen.queryByText(/已关闭证书校验/)).not.toBeInTheDocument();
+      // 指纹输入框只在中间档出现
+      expect(screen.queryByLabelText("证书 SHA-256 指纹")).not.toBeInTheDocument();
+    });
+
+    it("选到「允许不安全连接」才出现中间人警告", async () => {
+      const { user } = setup();
+      await user.click(modeRadio(/允许不安全连接/));
+      expect(screen.getByText(/任何中间人都可冒充服务器/)).toBeInTheDocument();
+    });
+
+    it("选到「信任指定证书」时出现指纹输入框与域名提醒", async () => {
+      const { user } = setup();
+      await user.click(modeRadio(/信任指定证书/));
+
+      expect(screen.getByLabelText("证书 SHA-256 指纹")).toBeInTheDocument();
+      // 这一条是该档放弃掉的保证，不写出来用户无从判断风险
+      expect(screen.getByText(/不再检查域名与有效期/)).toBeInTheDocument();
+    });
+
+    it("中间档不填指纹时拒绝保存", async () => {
+      const { onSave, user } = setup();
+      await user.click(modeRadio(/信任指定证书/));
+      await user.click(submit());
+
+      expect(await screen.findByText(/至少要填一条证书指纹/)).toBeInTheDocument();
+      expect(onSave).not.toHaveBeenCalled();
+    });
+
+    it("指纹格式错误时拒绝保存并指出是哪一条", async () => {
+      const { onSave, user } = setup();
+      await user.click(modeRadio(/信任指定证书/));
+      await user.type(screen.getByLabelText("证书 SHA-256 指纹"), "not-a-fingerprint");
+      await user.click(submit());
+
+      expect(await screen.findByText(/指纹格式不对/)).toBeInTheDocument();
+      expect(onSave).not.toHaveBeenCalled();
+    });
+
+    it("接受 openssl 原样输出，并把档位与老字段一起提交", async () => {
+      const { onSave, user } = setup();
+      const hexed = "ab".repeat(32);
+      const colonized = hexed.toUpperCase().match(/.{2}/g)!.join(":");
+
+      await user.click(modeRadio(/信任指定证书/));
+      await user.type(
+        screen.getByLabelText("证书 SHA-256 指纹"),
+        `SHA256 Fingerprint=${colonized}`
+      );
+      await user.click(submit());
+
+      await waitFor(() => expect(onSave).toHaveBeenCalled());
+      const saved = onSave.mock.calls[0][0];
+      expect(saved.tls_trust_mode).toBe("pinned");
+      // 老字段必须跟着走，否则降级回旧版本会读出错误的信任状态
+      expect(saved.allow_insecure_tls).toBe(false);
+      expect(saved.pinned_cert_sha256).toHaveLength(1);
+    });
+
+    it("切到不校验档时老字段同步为 true", async () => {
+      const { onSave, user } = setup();
+      await user.click(modeRadio(/允许不安全连接/));
+      await user.click(submit());
+
+      await waitFor(() => expect(onSave).toHaveBeenCalled());
+      expect(onSave.mock.calls[0][0]).toMatchObject({
+        tls_trust_mode: "insecure",
+        allow_insecure_tls: true,
+      });
+    });
   });
 });

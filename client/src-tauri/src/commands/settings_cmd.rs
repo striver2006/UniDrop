@@ -47,18 +47,37 @@ pub struct AppSettings {
     #[serde(default = "default_cache_max_size_mb")]
     pub cache_max_size_mb: u32,
 
-    /// 允许不安全的 TLS 连接：跳过服务器证书校验。
+    /// 【迁移专用，TLS 代码一律不要读它】跳过服务器证书校验的老开关。
     ///
-    /// 需要它的部署有三类：自签证书、直连 IP（证书上没有对应名字）、
-    /// 以及证书由**非公共 CA**（企业内部 CA）签发——webpki 根存储不含后者，
-    /// 所以合法的内部证书同样过不了默认校验。
+    /// 保留它只为两件事：读得懂老库；以及用户降级回旧版本时，旧版仍能读到
+    /// 正确的值。真正的读取入口是 `effective_trust_mode()`。
+    ///
+    /// Rust 侧加 `legacy_` 前缀而 serde 保留原 key，是为了让"直接读这个字段"
+    /// 在代码里长得就可疑——它现在只是三档枚举的一个投影，单独看会得出错误结论
+    /// （Pinned 档下它是 false，但那并不意味着走的是纯公共 CA 校验）。
     ///
     /// 这里用裸 `#[serde(default)]` 是对的，与上面几个字段相反：
-    /// `bool` 的 `Default` 是 `false`，而 `false` 恰好是安全值，
-    /// 老库升级后默认变成「校验证书」。上面那些字段之所以要自定义 default，
-    /// 是因为它们的零值 `0` 被定义成「关闭限制」——不安全的那一侧。
+    /// `bool` 的 `Default` 是 `false`，而 `false` 恰好是安全值。
+    /// 上面那些字段之所以要自定义 default，是因为它们的零值 `0` 被定义成
+    /// 「关闭限制」——不安全的那一侧。
+    #[serde(rename = "allow_insecure_tls", default)]
+    pub legacy_allow_insecure_tls: bool,
+
+    /// TLS 信任档位。`None` = 老库里根本没有这个键，交给
+    /// `effective_trust_mode()` 做迁移。
+    ///
+    /// 刻意用 `Option` 而不是 `#[serde(default = "...")]`：「这是一个老库」
+    /// 必须是个能表达、也能被测试直接断言的状态，否则迁移逻辑就没有可钉的对象。
     #[serde(default)]
-    pub allow_insecure_tls: bool,
+    pub tls_trust_mode: Option<crate::core::tls_trust::TlsTrustMode>,
+
+    /// 「信任指定证书」档下用户填的证书 SHA-256 指纹，每条一项。
+    ///
+    /// 存原样字符串而不是解析后的字节：设置面板要把用户填的内容原样显示回去，
+    /// 而规范化（去冒号、转小写）会让他看到一串跟自己粘进去的不一样的东西。
+    /// 解析在保存时做一次，失败当场报错。
+    #[serde(default)]
+    pub pinned_cert_sha256: Vec<String>,
 
     /// 是否对传输内容做端到端加密。
     ///
@@ -117,6 +136,43 @@ fn default_cache_sweep_interval_minutes() -> u32 {
 }
 
 impl AppSettings {
+    /// 三档信任的**唯一**读取入口。
+    ///
+    /// 老库里 `tls_trust_mode` 这个键根本不存在，所以必须能从老的
+    /// `allow_insecure_tls` 推出来——而且推的方向要对：
+    /// 显式关过校验的用户必须原样保持 Insecure，否则升级之后他会突然连不上，
+    /// 而界面上看不出任何东西变了。
+    pub fn effective_trust_mode(&self) -> crate::core::tls_trust::TlsTrustMode {
+        use crate::core::tls_trust::TlsTrustMode;
+        match self.tls_trust_mode {
+            Some(m) => m,
+            None if self.legacy_allow_insecure_tls => TlsTrustMode::Insecure,
+            // 键不存在、或存着 false：落到安全的那一侧。
+            // 这一支就是 legacy_db_without_tls_fields_defaults_to_public_ca 钉的东西。
+            None => TlsTrustMode::PublicCa,
+        }
+    }
+
+    /// 解析出连接层真正要用的信任配置。指纹格式错误在这里暴露。
+    pub fn tls_trust_config(&self) -> Result<crate::core::tls_trust::TlsTrustConfig, String> {
+        crate::core::tls_trust::TlsTrustConfig::new(
+            self.effective_trust_mode(),
+            &self.pinned_cert_sha256,
+        )
+    }
+
+    /// 把枚举回写成老 bool，保持两者一致。
+    ///
+    /// 为什么要回写：用户降级到旧版本时，旧版只认得 `allow_insecure_tls`。
+    /// Pinned 档在旧版本上会落成 `false`（= 严格校验）而连不上——
+    /// 那是**安全方向**的失败，正是降级时想要的形态。
+    pub fn normalize_tls_trust(&mut self) {
+        let mode = self.effective_trust_mode();
+        self.tls_trust_mode = Some(mode);
+        self.legacy_allow_insecure_tls =
+            matches!(mode, crate::core::tls_trust::TlsTrustMode::Insecure);
+    }
+
     /// 首次启动与反序列化失败时的兜底配置（唯一定义点，避免多处字面量漏改）
     pub fn default_config() -> Self {
         Self {
@@ -130,7 +186,9 @@ impl AppSettings {
             cache_ttl_hours: crate::core::retention::DEFAULT_CACHE_TTL_HOURS,
             cache_max_size_mb: crate::core::retention::DEFAULT_CACHE_MAX_SIZE_MB,
             cache_sweep_interval_minutes: crate::core::retention::DEFAULT_SWEEP_INTERVAL_MINUTES,
-            allow_insecure_tls: false,
+            legacy_allow_insecure_tls: false,
+            tls_trust_mode: Some(crate::core::tls_trust::TlsTrustMode::PublicCa),
+            pinned_cert_sha256: Vec::new(),
             e2ee_enabled: true,
         }
     }
@@ -197,6 +255,21 @@ pub async fn cmd_save_settings(
     clean_settings.cache_sweep_interval_minutes =
         crate::core::retention::effective_sweep_interval_minutes(&clean_settings);
 
+    // 指纹在**保存时**解析，不在重连循环里。
+    //
+    // 格式写错要在这里当场以精确原因回给用户（他刚粘完，还知道自己粘了什么）；
+    // 留到连接时才发现，就只剩一次次查不出原因的握手失败。
+    clean_settings.pinned_cert_sha256 = clean_settings
+        .pinned_cert_sha256
+        .iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let trust_config = clean_settings.tls_trust_config()?;
+
+    // 枚举与老 bool 保持一致，理由见 normalize_tls_trust。
+    clean_settings.normalize_tls_trust();
+
     let json_str = serde_json::to_string(&clean_settings).map_err(|e| e.to_string())?;
     {
         let conn = state.db_conn.lock().await;
@@ -217,7 +290,7 @@ pub async fn cmd_save_settings(
         cfg.server_url = clean_settings.server_url.clone();
         cfg.account_id = clean_settings.account_id.clone();
         cfg.psk_secret = clean_settings.psk_secret.clone();
-        cfg.allow_insecure_tls = clean_settings.allow_insecure_tls;
+        cfg.tls_trust = trust_config;
     }
 
     // 3. Clear online devices from previous server/account and notify frontend
@@ -338,6 +411,7 @@ pub async fn cmd_set_autostart(app: AppHandle, enabled: bool) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::tls_trust::TlsTrustMode;
 
     /// 老库里的 JSON 没有 start_minimized 字段，却**有**已被删除的
     /// rate_limit_mb 字段。本测试同时守护两个方向：
@@ -538,9 +612,10 @@ mod tests {
     }
 
     #[test]
-    fn allow_insecure_tls_defaults_to_secure_on_legacy_db() {
-        // 老库的 JSON 没有这个字段，缺省必须是 false（= 校验证书）。
-        // bool 的 Default 恰好是安全值，这也是它可以用裸 serde(default) 的原因。
+    fn legacy_db_without_tls_fields_defaults_to_public_ca() {
+        // 老库的 JSON 两个 TLS 字段都没有，缺省必须落在安全的一侧。
+        // bool 的 Default 恰好是安全值，这也是它可以用裸 serde(default) 的原因；
+        // 加了枚举之后这条结论仍然要成立，所以这条测试跟着改名留下来。
         let legacy = r#"{
             "server_url": "wss://example.com",
             "account_id": "acct",
@@ -548,7 +623,88 @@ mod tests {
             "auto_inject": false
         }"#;
         let parsed: AppSettings = serde_json::from_str(legacy).expect("反序列化失败");
-        assert!(!parsed.allow_insecure_tls, "老库升级后必须默认校验证书");
-        assert!(!AppSettings::default_config().allow_insecure_tls);
+        assert!(!parsed.legacy_allow_insecure_tls, "老库升级后必须默认校验证书");
+        assert_eq!(parsed.effective_trust_mode(), TlsTrustMode::PublicCa);
+        assert_eq!(
+            AppSettings::default_config().effective_trust_mode(),
+            TlsTrustMode::PublicCa
+        );
+    }
+
+    #[test]
+    fn legacy_db_with_allow_insecure_true_migrates_to_insecure() {
+        // 显式关过校验的用户必须原样保持，否则升级后突然连不上，
+        // 而界面上看不出任何东西变了。
+        let legacy = r#"{
+            "server_url": "wss://example.com",
+            "account_id": "acct",
+            "psk_secret": "secret",
+            "auto_inject": false,
+            "allow_insecure_tls": true
+        }"#;
+        let parsed: AppSettings = serde_json::from_str(legacy).expect("反序列化失败");
+        assert_eq!(parsed.effective_trust_mode(), TlsTrustMode::Insecure);
+    }
+
+    #[test]
+    fn explicit_mode_wins_over_legacy_flag() {
+        // 新键在就以新键为准——老 bool 只是它的投影，不该反过来干扰。
+        let json = r#"{
+            "server_url": "wss://example.com",
+            "account_id": "acct",
+            "psk_secret": "secret",
+            "auto_inject": false,
+            "allow_insecure_tls": true,
+            "tls_trust_mode": "public_ca"
+        }"#;
+        let parsed: AppSettings = serde_json::from_str(json).expect("反序列化失败");
+        assert_eq!(parsed.effective_trust_mode(), TlsTrustMode::PublicCa);
+    }
+
+    #[test]
+    fn normalize_keeps_legacy_flag_in_sync() {
+        let mut s = AppSettings::default_config();
+
+        // Pinned 在旧版本上落成 false（= 严格校验）而连不上：
+        // 安全方向的失败，正是降级时想要的形态。
+        s.tls_trust_mode = Some(TlsTrustMode::Pinned);
+        s.normalize_tls_trust();
+        assert!(!s.legacy_allow_insecure_tls);
+
+        s.tls_trust_mode = Some(TlsTrustMode::Insecure);
+        s.normalize_tls_trust();
+        assert!(s.legacy_allow_insecure_tls, "降级回旧版本时必须仍是关校验");
+
+        s.tls_trust_mode = Some(TlsTrustMode::PublicCa);
+        s.normalize_tls_trust();
+        assert!(!s.legacy_allow_insecure_tls);
+    }
+
+    #[test]
+    fn pinned_mode_requires_at_least_one_fingerprint() {
+        let mut s = AppSettings::default_config();
+        s.tls_trust_mode = Some(TlsTrustMode::Pinned);
+        assert!(s.tls_trust_config().is_err(), "空指纹的 Pinned 档等于没有任何信任来源");
+    }
+
+    #[test]
+    fn malformed_pin_is_rejected() {
+        let mut s = AppSettings::default_config();
+        s.tls_trust_mode = Some(TlsTrustMode::Pinned);
+        s.pinned_cert_sha256 = vec!["not-a-fingerprint".to_string()];
+        assert!(s.tls_trust_config().is_err());
+    }
+
+    #[test]
+    fn openssl_style_fingerprint_is_accepted() {
+        // 用户最可能直接粘 openssl 的整行输出，连前缀带冒号。
+        let mut s = AppSettings::default_config();
+        s.tls_trust_mode = Some(TlsTrustMode::Pinned);
+        s.pinned_cert_sha256 = vec![
+            "SHA256 Fingerprint=AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89:\
+             AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67:89"
+                .to_string(),
+        ];
+        assert!(s.tls_trust_config().is_ok(), "openssl 原样输出必须能直接粘进来");
     }
 }

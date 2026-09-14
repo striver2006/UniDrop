@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::app_state::AppState;
 use crate::core::cache_manager::CacheManager;
-use crate::core::connection_actor::create_tls_connector;
+use crate::core::tls_trust::create_tls_connector;
 use crate::core::path_guard::PathGuard;
 use crate::core::sliding_window::SlidingWindow;
 use crate::platform::show_transfer_notification;
@@ -45,6 +45,29 @@ pub struct ActiveTransfer {
 pub enum TransferSource {
     Files(Vec<PathBuf>),
     Memory(Vec<u8>),
+}
+
+/// 把 URL 查询串里的 `token=` 值抹掉，供日志输出使用。
+///
+/// 数据面 URL 把一次性会话令牌拼在查询串里，而这两条连接日志是 `info` 级别。
+/// 在日志只走 stderr、且默认级别是 `Error` 的年代这不构成问题——什么都没输出。
+/// 接入落盘日志后它就变成了「每传一次文件，令牌写一次磁盘」，
+/// 所以脱敏必须与日志改造同批次落地，不能分开做。
+///
+/// 只处理 `token`：同在查询串里的 session_id / device_id 都不是凭据，
+/// 而它们恰恰是排查时最需要看到的东西。
+fn redact_query_token(url: &str) -> String {
+    let Some(start) = url.find("token=") else {
+        return url.to_string();
+    };
+    let value_start = start + "token=".len();
+    // 令牌是查询串末位参数，但不能假定它一直是——否则哪天换了顺序，
+    // 脱敏会静默地把后面所有参数一起吃掉。
+    let value_end = url[value_start..]
+        .find('&')
+        .map(|i| value_start + i)
+        .unwrap_or(url.len());
+    format!("{}<redacted>{}", &url[..value_start], &url[value_end..])
 }
 
 /// Best-effort history status update; failures are logged only.
@@ -259,7 +282,7 @@ impl TransferEngine {
         server_url: String,
         // 与 server_url 同路取自设置：数据面必须与控制面用同一套 TLS 策略，
         // 否则用户在界面上关掉的校验会在这条连接上悄悄恢复（反之亦然）。
-        allow_insecure_tls: bool,
+        tls_trust: crate::core::tls_trust::TlsTrustConfig,
         session_id: String,
         token: String,
         from_device: String,
@@ -288,7 +311,7 @@ impl TransferEngine {
             )
         };
 
-        log::info!("Sender connecting to data plane: {}", ws_data_url);
+        log::info!("Sender connecting to data plane: {}", redact_query_token(&ws_data_url));
 
         // 与控制面同一套 TLS 策略：默认校验证书，勾选后才跳过。
         //
@@ -299,7 +322,7 @@ impl TransferEngine {
             &ws_data_url,
             None,
             false,
-            create_tls_connector(allow_insecure_tls),
+            create_tls_connector(&tls_trust, None),
         )
         .await
         {
@@ -602,7 +625,7 @@ impl TransferEngine {
     /// Connects to /ws/data as Receiver, writes chunks into sandbox, verifies SHA256 and sends ACKs (P0-3, P1-6).
     pub async fn start_receiver_task(
         server_url: String,
-        allow_insecure_tls: bool,
+        tls_trust: crate::core::tls_trust::TlsTrustConfig,
         session_id: String,
         token: String,
         from_device: String,
@@ -646,7 +669,7 @@ impl TransferEngine {
             )
         };
 
-        log::info!("Receiver connecting to data plane: {}", ws_data_url);
+        log::info!("Receiver connecting to data plane: {}", redact_query_token(&ws_data_url));
 
         // 与控制面同一套 TLS 策略：默认校验证书，勾选后才跳过。
         //
@@ -657,7 +680,7 @@ impl TransferEngine {
             &ws_data_url,
             None,
             false,
-            create_tls_connector(allow_insecure_tls),
+            create_tls_connector(&tls_trust, None),
         )
         .await
         {
@@ -1192,6 +1215,31 @@ mod tests {
     // 生产代码已全部改走 plaintext_chunk_len，只有测试还需要这个原始上限。
     use crate::protocol::MAX_PAYLOAD_LENGTH;
     use std::io::Write;
+
+    #[test]
+    fn redacts_token_at_end_of_query_string() {
+        let url = "wss://h/ws/data?session_id=abc&role=sender&device_id=d1&token=secret-tok";
+        let out = redact_query_token(url);
+        assert!(!out.contains("secret-tok"), "令牌泄漏进日志: {out}");
+        assert!(out.ends_with("token=<redacted>"));
+        // 排查需要的字段必须原样保留
+        assert!(out.contains("session_id=abc"));
+        assert!(out.contains("device_id=d1"));
+    }
+
+    #[test]
+    fn redacts_token_in_middle_and_keeps_trailing_params() {
+        // 今天 token 恰好在末位，这条钉的是「换了顺序也不会把后面的参数一起吃掉」。
+        let url = "wss://h/ws/data?token=secret-tok&session_id=abc";
+        let out = redact_query_token(url);
+        assert_eq!(out, "wss://h/ws/data?token=<redacted>&session_id=abc");
+    }
+
+    #[test]
+    fn url_without_token_is_unchanged() {
+        let url = "wss://h/ws/control?device_id=d1";
+        assert_eq!(redact_query_token(url), url);
+    }
 
     #[test]
     fn test_prepare_offer_aligns_valid_paths_and_skips_dirs() {

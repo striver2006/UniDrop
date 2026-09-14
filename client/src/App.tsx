@@ -12,7 +12,14 @@ import {
   AlertCircle,
   X,
 } from "lucide-react";
-import { OnlineDevice, AppSettings, ActiveTransfer , ServerLimits } from "./types";
+import {
+  OnlineDevice,
+  AppSettings,
+  ActiveTransfer,
+  ServerLimits,
+  TlsCertFailure,
+  certFailureStatusText,
+} from "./types";
 import { DeviceList } from "./components/DeviceList";
 import { TransferProgress } from "./components/TransferProgress";
 import { SettingsModal } from "./components/SettingsModal";
@@ -32,6 +39,8 @@ const defaultSettings: AppSettings = {
   cache_max_size_mb: 10240,
   cache_sweep_interval_minutes: 60,
   allow_insecure_tls: false,
+  tls_trust_mode: "public_ca",
+  pinned_cert_sha256: [],
   e2ee_enabled: true,
 };
 
@@ -45,9 +54,21 @@ export const App: React.FC = () => {
   const [selectedDeviceForSend, setSelectedDeviceForSend] = useState<OnlineDevice | null>(null);
   /// 连接层错误横幅。kind 决定文案与引导按钮：
   /// "auth" 是 PSK / 账号格式被服务端拒绝，"tls" 是服务器证书校验失败。
-  /// 两者的修复动作不同——前者改密钥或账号，后者要么换受信任的证书、
-  /// 要么显式勾选「允许不安全连接」——所以不能共用一句「检查密钥」。
-  const [connError, setConnError] = useState<{ kind: "auth" | "tls"; message: string } | null>(null);
+  /// 两者的修复动作不同——前者改密钥或账号，后者按证书失败的**具体档位**而定——
+  /// 所以不能共用一句「检查密钥」。
+  ///
+  /// tls 一支带的是整个结构化的分类结果而不是一句拼好的话：证书失败有好几种，
+  /// 处置互不相同（改地址 / 续期 / 重签 / 换 CA），拼字符串会逼着它们共用一句建议。
+  const [connError, setConnError] = useState<
+    { kind: "auth"; message: string } | { kind: "tls"; failure: TlsCertFailure } | null
+  >(null);
+  /// 证书错误详情是否展开。
+  ///
+  /// **必须独立于 connError，且只在 connError 清空时复位。** 连接 actor 每次
+  /// 退避重试（≤30s）都会重发 tls-cert-failed，若跟着事件一起复位，
+  /// 用户刚展开的详情会每隔几秒自己合上——而那个现象看起来像渲染 bug，
+  /// 没人会想到是重连在后面推事件。
+  const [certDetailExpanded, setCertDetailExpanded] = useState(false);
   // 服务端下发的限额。null = 尚未拿到（未连接，或老服务端不发这个字段）。
   // 不要用默认值顶上——那会让用户以为看到的就是实际生效的值。
   const [serverLimits, setServerLimits] = useState<ServerLimits | null>(null);
@@ -55,6 +76,16 @@ export const App: React.FC = () => {
     type: "info" | "success" | "error";
     text: string;
   } | null>(null);
+
+  // 横幅消失时才收起详情。
+  //
+  // 放在 effect 里而不是跟着三处 setConnError(null) 各写一遍，是为了让
+  // 「展开状态只由横幅的生死决定」这件事只有一个落点——将来再多一处清空点，
+  // 也不会漏掉复位。反过来也重要：**不能**在收到 tls-cert-failed 时复位，
+  // 那个事件每次重连都会重发，会把用户刚展开的详情反复合上。
+  useEffect(() => {
+    if (!connError) setCertDetailExpanded(false);
+  }, [connError]);
 
   const showNotification = (text: string, type: "info" | "success" | "error" = "info") => {
     setNotification({ text, type });
@@ -174,8 +205,8 @@ export const App: React.FC = () => {
     //
     // 刻意**不弹 toast**：连接 actor 每次退避重试（≤30s）都会重新 emit，
     // 弹 toast 会堆成一串。常驻横幅天然幂等——重复 set 同一内容不产生新 UI。
-    const unlistenTlsPromise = listen<string>("tls-cert-failed", (event) => {
-      setConnError({ kind: "tls", message: event.payload });
+    const unlistenTlsPromise = listen<TlsCertFailure>("tls-cert-failed", (event) => {
+      setConnError({ kind: "tls", failure: event.payload });
     });
 
     // E2EE 回落：本次传输没能加密。
@@ -373,19 +404,97 @@ export const App: React.FC = () => {
 
       {/* Connection Error Banner */}
       {connError && (
-        <div className="bg-rose-950/80 border-b border-rose-800/80 px-4 py-2 flex items-center justify-between text-xs text-rose-300">
-          <div className="flex items-center space-x-2 truncate">
-            <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0" />
-            <span className="truncate">
-              {connError.kind === "tls" ? connError.message : `鉴权失败: ${connError.message}`}
-            </span>
+        <div className="bg-rose-950/80 border-b border-rose-800/80 px-4 py-2 text-xs text-rose-300">
+          <div className="flex items-start justify-between gap-2">
+            {/*
+              min-w-0 是这里的关键，不是随手加的：flex 子项的 min-width 默认是 auto，
+              不加它，无论去掉 truncate 还是换成 break-words 都不会换行，
+              只会变成横向溢出。改造前这里是 `flex items-center` + `truncate`，
+              两个问题叠在一起，结果把后端拼好的多行处置建议整段吃掉——
+              用户只看到「无法验证服务器证书：IO error: invalid peer ...」，
+              而省略号后面那个词恰恰是唯一能决定怎么修的信息。
+            */}
+            <div className="flex items-start gap-2 min-w-0">
+              <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+              <div className="min-w-0">
+                <p className="font-medium break-words">
+                  {connError.kind === "tls"
+                    ? connError.failure.title
+                    : `鉴权失败: ${connError.message}`}
+                </p>
+                {connError.kind === "tls" && certDetailExpanded && (
+                  <div className="mt-1.5 space-y-1.5 text-rose-300/90">
+                    {/*
+                      窗口只有约 760px 宽、高度也有限，而通配符证书的 SAN 可能几十条。
+                      不封顶会把下面的设备列表整个挤出视口。
+                    */}
+                    <ul className="space-y-0.5 max-h-32 overflow-y-auto">
+                      {connError.failure.detail.map((line, i) => (
+                        <li key={i} className="break-words">
+                          {line}
+                        </li>
+                      ))}
+                    </ul>
+                    {connError.failure.observed_cert_sha256 && (
+                      /*
+                        实际看到的证书指纹。
+                        刻意**不给**「信任这张证书」的一键按钮：错误横幅下方的
+                        一键信任，恰恰是训练用户对中间人警告无脑点确认的经典形态，
+                        而这一整轮改造的目的就是拆掉这类捷径。这里只给出指纹和
+                        核对方法，多出来的那点摩擦正是它的价值——它逼用户至少
+                        看一眼那串 hex，也留出了带外核对的时机。
+                      */
+                      <div className="pt-1 border-t border-rose-800/50">
+                        <p className="text-[10px] text-rose-300/80">客户端实际看到的证书指纹：</p>
+                        <div className="flex items-start gap-2 mt-0.5">
+                          <code className="text-[10px] font-mono break-all text-rose-200/90 flex-1 min-w-0">
+                            {connError.failure.observed_cert_sha256}
+                          </code>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              navigator.clipboard
+                                ?.writeText(connError.failure.observed_cert_sha256 ?? "")
+                                .catch(() => {})
+                            }
+                            className="text-[10px] underline hover:text-rose-200 shrink-0"
+                          >
+                            复制
+                          </button>
+                        </div>
+                        <p className="text-[10px] text-rose-300/70 mt-0.5">
+                          请先在服务器上执行 openssl x509 -fingerprint -sha256 -noout -in
+                          &lt;证书文件&gt; 核对一致，再填入设置
+                        </p>
+                      </div>
+                    )}
+                    {/* 分类错了的时候，原始错误是唯一的现场，必须能看到。
+                        但它同样嵌着对端可控的 SAN 文本，所以和上面的 detail 一样
+                        要封高度——后端已做字符清洗与长度截断，这里是第二道。 */}
+                    <p className="text-[10px] text-rose-400/70 break-all font-mono max-h-20 overflow-y-auto">
+                      {connError.failure.raw}
+                    </p>
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="shrink-0 flex items-center gap-3">
+              {connError.kind === "tls" && (
+                <button
+                  onClick={() => setCertDetailExpanded((v) => !v)}
+                  className="text-[11px] underline hover:text-rose-200 font-medium"
+                >
+                  {certDetailExpanded ? "收起" : "详情"}
+                </button>
+              )}
+              <button
+                onClick={() => setIsSettingsOpen(true)}
+                className="text-[11px] underline hover:text-rose-200 font-medium"
+              >
+                {connError.kind === "tls" ? "检查连接设置" : "检查密钥"}
+              </button>
+            </div>
           </div>
-          <button
-            onClick={() => setIsSettingsOpen(true)}
-            className="text-[11px] underline hover:text-rose-200 font-medium shrink-0 ml-2"
-          >
-            {connError.kind === "tls" ? "检查连接设置" : "检查密钥"}
-          </button>
         </div>
       )}
 
@@ -444,7 +553,13 @@ export const App: React.FC = () => {
         <div className={`flex items-center space-x-1 ${connError ? "text-rose-400" : "text-teal-500/90"}`}>
           {connError ? <ShieldAlert className="w-3.5 h-3.5" /> : <ShieldCheck className="w-3.5 h-3.5" />}
           <span>
-            {connError ? (connError.kind === "tls" ? "证书不受信任" : "连接未授权") : "PSK 接入安全就绪"}
+            {connError
+              ? connError.kind === "tls"
+                // 不再一律说「证书不受信任」：名字不匹配那一档里证书**是**受信任的，
+                // 说成不受信任会把用户推去关校验，而正确动作是改地址。
+                ? certFailureStatusText(connError.failure.kind)
+                : "连接未授权"
+              : "PSK 接入安全就绪"}
           </span>
         </div>
         <span>支持跨设备秒级同步</span>

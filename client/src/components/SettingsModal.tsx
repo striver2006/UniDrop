@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { X, Save, Shield, AlertCircle, Server as ServerIcon } from "lucide-react";
-import { AppSettings, ServerLimits } from "../types";
+import { AppSettings, ServerLimits, TlsTrustMode } from "../types";
 
 /**
  * 把一项限额格式化成可读文案。
@@ -117,6 +117,19 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   serverLimits = null,
 }) => {
   const [form, setForm] = useState<AppSettings>(settings);
+
+  // 档位从 form 派生，而不是另开一个会和 form 走散的 state。
+  // 老库里 tls_trust_mode 可能是 null，此时按老的 allow_insecure_tls 推——
+  // 与后端 effective_trust_mode() 同一套规则，两边必须一致。
+  const trustMode: TlsTrustMode =
+    form.tls_trust_mode ?? (form.allow_insecure_tls ? "insecure" : "public_ca");
+  const setTrustMode = (mode: TlsTrustMode) =>
+    setForm((f) => ({
+      ...f,
+      tls_trust_mode: mode,
+      // 老字段跟着走，保持与后端 normalize_tls_trust 一致的投影关系
+      allow_insecure_tls: mode === "insecure",
+    }));
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -237,6 +250,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     }
     setFieldErrors({});
 
+    // 指纹在前端先校一遍。后端也会校（那一层才是约束），但错误从 invoke
+    // 抛回来只剩一句笼统的保存失败，用户看不出是哪一行写错了。
+    // 「前后端各校验一次」是本文件既有的惯例，见 cache_sweep_interval_minutes。
+    const pins = form.pinned_cert_sha256.map((p) => p.trim()).filter(Boolean);
+    if (trustMode === "pinned") {
+      if (pins.length === 0) {
+        setError("选择「信任指定证书」时至少要填一条证书指纹");
+        return;
+      }
+      const bad = pins.find((p) => !/^[0-9a-f]{64}$/i.test(p.replace(/^.*=/, "").replace(/[\s:]/g, "")));
+      if (bad) {
+        setError(`指纹格式不对（应为 64 位十六进制的 SHA-256）：${bad}`);
+        return;
+      }
+    }
+
     let cleanUrl = form.server_url.replace(/\s+/g, "");
     if (cleanUrl && !cleanUrl.startsWith("ws://") && !cleanUrl.startsWith("wss://")) {
       cleanUrl = `wss://${cleanUrl}`;
@@ -255,6 +284,9 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         cache_ttl_hours: (ttl as { value: number }).value,
         cache_max_size_mb: (size as { value: number }).value,
         cache_sweep_interval_minutes: (interval as { value: number }).value,
+        tls_trust_mode: trustMode,
+        allow_insecure_tls: trustMode === "insecure",
+        pinned_cert_sha256: pins,
       });
       onClose(); // 只有保存成功才关窗，失败时保留用户已填内容
     } catch (err: any) {
@@ -329,29 +361,100 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             />
           </div>
 
-          {/* 文案要说清后果，而不是只说「允许自签证书」：用户据此做的是
-              一个安全取舍，不告诉他代价就等于替他做了决定。
-              三类场景都要列全——少写「非公共 CA」那一类，用内部 CA 的用户会
-              以为这个开关与自己无关，最后仍然被引导来勾选它。 */}
-          <div className="flex items-center justify-between pt-2">
-            <div className="pr-3">
-              <span className="font-medium text-slate-200">允许不安全连接</span>
-              <p className="text-[11px] text-slate-500">
-                跳过服务器证书校验，用于自签证书、IP 直连或非公共 CA 签发的部署
-              </p>
-              {form.allow_insecure_tls && (
-                <p className="mt-1 text-[11px] text-amber-400">
-                  已关闭证书校验：任何中间人都可冒充服务器读取你传输的内容
+          {/* 三档而不是一个开关。
+              改造前只有「允许不安全连接」一个勾选框，于是「证书合法但名字对不上」
+              和「企业内部 CA 签发」这两类部署，唯一出路就是把校验整个关掉——
+              一个本该收窄到单台服务器的例外，被迫放大成对所有中间人敞开。
+              中间那一档就是为它们补的。
+
+              文案要说清每一档的后果：用户在这里做的是安全取舍，
+              不告诉他代价就等于替他做了决定。 */}
+          <fieldset className="pt-2 space-y-2">
+            <legend className="font-medium text-slate-200">连接安全</legend>
+
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="radio"
+                name="tls_trust_mode"
+                value="public_ca"
+                checked={trustMode === "public_ca"}
+                onChange={() => setTrustMode("public_ca")}
+                className="mt-0.5 w-4 h-4 text-teal-500 focus:ring-teal-400 bg-slate-800 border-slate-700"
+              />
+              <span>
+                <span className="text-slate-200">校验公共 CA 证书（推荐）</span>
+                <p className="text-[11px] text-slate-500">
+                  确认连上的确实是目标服务器。证书需由公共 CA 签发，且地址要与证书上的域名一致
                 </p>
-              )}
-            </div>
-            <input
-              type="checkbox"
-              checked={form.allow_insecure_tls}
-              onChange={(e) => setForm({ ...form, allow_insecure_tls: e.target.checked })}
-              className="w-4 h-4 rounded text-teal-500 focus:ring-teal-400 bg-slate-800 border-slate-700"
-            />
-          </div>
+              </span>
+            </label>
+
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="radio"
+                name="tls_trust_mode"
+                value="pinned"
+                checked={trustMode === "pinned"}
+                onChange={() => setTrustMode("pinned")}
+                className="mt-0.5 w-4 h-4 text-teal-500 focus:ring-teal-400 bg-slate-800 border-slate-700"
+              />
+              <span>
+                <span className="text-slate-200">信任指定证书</span>
+                <p className="text-[11px] text-slate-500">
+                  先按公共 CA 校验；不通过时再比对下面的指纹。用于自签证书或 IP 直连
+                </p>
+              </span>
+            </label>
+
+            {trustMode === "pinned" && (
+              <div className="ml-6 space-y-1">
+                <textarea
+                  aria-label="证书 SHA-256 指纹"
+                  value={form.pinned_cert_sha256.join("\n")}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      // 保留用户粘进来的原样（含冒号大写），规范化交给后端保存时做：
+                      // 这里当场改写会让他看到一串跟自己粘的不一样的东西。
+                      pinned_cert_sha256: e.target.value.split("\n"),
+                    })
+                  }
+                  rows={3}
+                  placeholder="证书 SHA-256 指纹，每行一条"
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-[11px] font-mono text-slate-200 focus:outline-none focus:border-teal-500"
+                />
+                <p className="text-[11px] text-slate-500">
+                  在服务器上执行 openssl x509 -fingerprint -sha256 -noout -in
+                  &lt;证书文件&gt; 获取，可直接粘贴整行输出
+                </p>
+                {/* 这一条必须写出来：它既是这一档能用于 IP 直连的原因，
+                    也是它与「校验公共 CA」相比放弃掉的那部分保证。 */}
+                <p className="text-[11px] text-amber-400">
+                  指纹匹配的证书将被信任，不再检查域名与有效期——请务必先在服务器上核对指纹
+                </p>
+              </div>
+            )}
+
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="radio"
+                name="tls_trust_mode"
+                value="insecure"
+                checked={trustMode === "insecure"}
+                onChange={() => setTrustMode("insecure")}
+                className="mt-0.5 w-4 h-4 text-teal-500 focus:ring-teal-400 bg-slate-800 border-slate-700"
+              />
+              <span>
+                <span className="text-slate-200">允许不安全连接（不校验）</span>
+                <p className="text-[11px] text-slate-500">完全跳过服务器证书校验</p>
+                {trustMode === "insecure" && (
+                  <p className="mt-1 text-[11px] text-amber-400">
+                    已关闭证书校验：任何中间人都可冒充服务器读取你传输的内容
+                  </p>
+                )}
+              </span>
+            </label>
+          </fieldset>
 
           {/* 与上面的 TLS 开关相对：那个默认关闭（安全值是 false），
               这个默认开启（安全值是 true）。文案同样要说清它保证什么、

@@ -8,6 +8,7 @@ use tauri::Emitter;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
+use crate::core::tls_trust::{self, create_tls_connector};
 use crate::protocol::{ActionType, AuthChallengePayload, AuthRequestPayload, AuthResponsePayload, ControlEnvelope};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -22,118 +23,12 @@ pub struct ConnectionConfig {
     pub os_type: String,
     pub app_version: String,
 
-    /// 跳过 TLS 服务器证书校验。默认 false。
+    /// TLS 信任策略。默认只信任公共根证书库。
     ///
-    /// 见 `create_tls_connector`：打开它就等于接受任何出示证书的中间人。
-    pub allow_insecure_tls: bool,
+    /// 见 `tls_trust::create_tls_connector`：Insecure 档等于接受任何出示证书的中间人。
+    pub tls_trust: tls_trust::TlsTrustConfig,
 }
 
-/// 一个**不校验服务器身份**的证书校验器。
-///
-/// `verify_server_cert` 无条件返回成功：它不看证书链、不看域名、不看有效期。
-/// 后果要说清楚——启用之后，任何位于中间的人只要出示一张自签证书就能接管
-/// 这条连接，读走经由它传输的剪贴板明文与文件字节。TLS 仍在加密，但加密的
-/// 对端是谁不再有任何保证。
-///
-/// 它只在用户显式勾选「允许不安全连接」时才被装上，用于自签证书、IP 直连、
-/// 或证书由非公共 CA 签发的内网部署。下面两个签名校验函数是真的——
-/// 握手本身仍需自洽，只是「对方是不是你要找的那台服务器」不再被验证。
-///
-/// 改名自 `CustomServerCertVerifier`：原名听起来像是某种定制策略，
-/// 而它实际做的事只有「跳过」。
-#[derive(Debug)]
-pub struct InsecureServerCertVerifier(pub Arc<rustls::crypto::CryptoProvider>);
-
-impl rustls::client::danger::ServerCertVerifier for InsecureServerCertVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.0.signature_verification_algorithms.supported_schemes()
-    }
-}
-
-/// 构造 WebSocket 的 TLS 连接器。
-///
-/// `allow_insecure = false`（默认）时返回 `None`，由 tokio-tungstenite 走它
-/// 自带的 webpki 根证书校验。刻意**不**在这里手搓 `ClientConfig`：
-/// `rustls-tls-webpki-roots` 是 tokio-tungstenite 的 feature，它不会把
-/// `webpki_roots` 这个 crate 注入本包，自己构造就得额外声明一条依赖，
-/// 而交给它自己加载既省依赖、也少一处可能配错的地方。
-///
-/// `allow_insecure = true` 时才装上 `InsecureServerCertVerifier`——
-/// 读那个类型上的注释，它说明了代价。
-///
-/// 改造前这里**无条件**装载那个跳过校验的 verifier，也就是说即便连的是
-/// `wss://`，中间人也照样能接管连接。默认走真实校验是本轮的目的之一。
-pub fn create_tls_connector(allow_insecure: bool) -> Option<tokio_tungstenite::Connector> {
-    // 两档都要装 provider，即便默认档马上就 return None。
-    //
-    // 返回 None 之后由 tokio-tungstenite 自己构建 ClientConfig，而 rustls 0.23
-    // 在依赖树里同时存在 ring 与 aws-lc-rs 时（本项目正是如此）无法自动选定
-    // provider，会直接 panic 而不是返回 Err——发生在连接 actor 的 task 里，
-    // 整个重连循环就此死掉。
-    //
-    // 今天 lib.rs 的 run() 开头已经装过一次，所以这行是冗余的；写在这里是因为
-    // 默认档不该依赖一个远在别处的副作用才能不 panic。insecure 档本来就自带
-    // 初始化，只有默认档赤裸着——而它恰恰是绝大多数用户走的那条路。
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    if !allow_insecure {
-        return None;
-    }
-
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let client_config = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_safe_default_protocol_versions()
-        .expect("valid tls protocol versions")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(InsecureServerCertVerifier(provider)))
-        .with_no_client_auth();
-
-    Some(tokio_tungstenite::Connector::Rustls(Arc::new(client_config)))
-}
-
-/// 判断一个 tungstenite 错误是否为 TLS 证书校验失败。
-///
-/// rustls 把证书问题归到 `rustls::Error::InvalidCertificate`，经 tungstenite
-/// 包装后只剩下 IO/Tls 层的字符串，因此这里按错误文本匹配。这不优雅，也不够
-/// 稳固——rustls 改文案就会漏判——但漏判的后果只是退回到通用的「连接失败」
-/// 提示，不会误导用户去关掉校验，所以这个不精确是可接受的方向。
-fn is_cert_error(err: &tokio_tungstenite::tungstenite::Error) -> bool {
-    let text = err.to_string();
-    text.contains("certificate")
-        || text.contains("CertificateError")
-        || text.contains("UnknownIssuer")
-        || text.contains("NotValidForName")
-        || text.contains("invalid peer certificate")
-}
 
 pub struct ConnectionActor {
     config: Arc<RwLock<ConnectionConfig>>,
@@ -198,7 +93,10 @@ impl ConnectionActor {
             };
             log::info!("Connecting to control server: {}", ws_url);
 
-            let connector = create_tls_connector(current_cfg.allow_insecure_tls);
+            // 控制面装证书观察器：证书失败时要把实际看到的指纹报给用户，
+            // 让他能跟服务器上那张证书核对。数据面不装（见 create_tls_connector）。
+            let observer = tls_trust::CertObserver::new();
+            let connector = create_tls_connector(&current_cfg.tls_trust, Some(observer.clone()));
             match tokio_tungstenite::connect_async_tls_with_config(&ws_url, None, false, connector).await {
                 Ok((ws_stream, _)) => {
                     log::info!("Connected to control server");
@@ -358,21 +256,33 @@ impl ConnectionActor {
                 }
                 Err(err) => {
                     // 证书失败要单独报，否则用户只会看到反复重连，
-                    // 完全无从知道是「证书不受信任」还是服务端没起来——
-                    // 而这正是本轮默认开启校验之后，自签证书部署升级时的第一现场。
-                    if is_cert_error(&err) && !current_cfg.allow_insecure_tls {
-                        log::warn!("TLS certificate verification failed: {}", err);
-                        let _ = app_handle.emit(
-                            "tls-cert-failed",
-                            format!(
-                                "无法验证服务器证书：{}。\n\
-                                 若服务端使用自签证书、直连 IP，或证书由非公共 CA 签发，\
-                                 请在「设置」中勾选「允许不安全连接」。",
+                    // 完全无从知道是证书问题还是服务端没起来。
+                    //
+                    // 发的是结构化的分类结果而不是一句拼好的话：处置动作因档而异，
+                    // 拼字符串的做法逼着所有档共用一句建议，而那句建议
+                    // （「勾选允许不安全连接」）对其中几档是错的。
+                    //
+                    // 不按档位过滤：**能走到这里的证书错误，都是用户绕不过的。**
+                    // 早先这里有一道 `!skips_verification()` 守卫，原意是「用户自己
+                    // 关掉的校验，不该再拿校验失败去打扰他」——听着合理，但它假定了
+                    // Insecure 档下不会有证书错误，而那个假定不成立：
+                    // InsecureServerCertVerifier 只放行链、域名、有效期三项，
+                    // 证书**解析**仍然要做（rustls 在签名校验里调
+                    // `EndEntityCert::try_from`）。X.509 v1、畸形 DER 之类照样报错，
+                    // 而它们恰恰是关掉校验也救不回来的那一类。
+                    // 守卫把它们一并吞了，用户关了校验反而连一句解释都看不到，
+                    // 只剩无休止的重连——那正是他最需要知道原因的时刻。
+                    match tls_trust::classify(&err) {
+                        Some(mut failure) => {
+                            failure.observed_cert_sha256 = observer.observed();
+                            log::warn!(
+                                "TLS certificate verification failed [{}]: {}",
+                                failure.kind.tag(),
                                 err
-                            ),
-                        );
-                    } else {
-                        log::warn!("Connection failed: {}, retrying...", err);
+                            );
+                            let _ = app_handle.emit("tls-cert-failed", &failure);
+                        }
+                        _ => log::warn!("Connection failed: {}, retrying...", err),
                     }
                 }
             }

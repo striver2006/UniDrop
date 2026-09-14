@@ -30,6 +30,10 @@ tokio = { version = "1.38", features = ["full"] }
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", features = ["ring"] }
+# 与 tokio-tungstenite 的 rustls-tls-webpki-roots feature 拉进来的是同一份
+# （lock 里 0.26.11，零新增 crate）。显式声明是因为「信任指定证书」这一档
+# 必须自建 ClientConfig，而自建就得自己装根存储。
+webpki-roots = "0.26"
 # ring 本来就在依赖树里（rustls 的 ring feature），这里显式声明是为了直接用它的
 # aead/hkdf。版本必须与 rustls 解析出的一致（当前 0.17.14），否则依赖树会出现两份。
 ring = "0.17"
@@ -42,7 +46,9 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 hmac = "0.12"
 hex = "0.4"
 log = "0.4"
-env_logger = "0.11"
+# 取代 env_logger：后者只往 stderr 写，而 GUI 双击启动时 stderr 被 launchd 收走，
+# 用户报障时拿不出任何日志。插件自带轮转、保留期与各平台标准日志目录。
+tauri-plugin-log = "2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = [
@@ -57,3 +63,13 @@ windows = { version = "0.58", features = [
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", features = ["NSString", "NSArray", "NSURL", "NSData"] }
 objc2-app-kit = { version = "0.2", features = ["NSPasteboard", "NSPasteboardItem"] }
+
+[dev-dependencies]
+# 只为 tls_trust 的端到端分类测试而在：起一个本地自签 TLS 监听器，真握一次手，
+# 验证 tokio-rustls 产出的 io::Error 确实能被本包这份 rustls downcast 回来。
+# 手工构造的错误证明不了这一点——它绕过了"两处 rustls 必须是同一个 crate 实例"
+# 这个前提，而那正是分类唯一可能静默失效的地方。
+rcgen = "0.14"
+# 关掉默认的 aws_lc_rs，跟生产代码一样走 ring：让测试里的 provider 与
+# 真实运行时一致，否则测的就不是同一条路径了。
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }

@@ -59,8 +59,19 @@ fn derive_key_for(
 }
 
 pub fn run() {
-    env_logger::init();
     let _ = rustls::crypto::ring::default_provider().install_default();
+
+    // 启动期日志缓冲。
+    //
+    // tauri-plugin-log 要到 `tauri::Builder::run()` 才把 logger 挂上去，而下面的
+    // 建库、设置反序列化、存量历史认领全发生在那之前——直接 log! 会写进一个
+    // 还没人接管的 logger，整条丢掉。其中就包括「设置解析失败、用户配置被全量
+    // 重置」那一条，恰恰是本文件里后果最严重、也最需要事后排查的一条。
+    //
+    // 所以这一段先攒着，进 `.setup()` 后原样重放。用缓冲而不是把 init_database /
+    // AppState::new 整体搬进 .setup()，是因为后者要动 .manage() 的构造顺序，
+    // 风险与收益不成比例。
+    let mut startup_log: Vec<(log::Level, String)> = Vec::new();
 
     // 1. Initialize SQLite local database and persistent identity (P1-4, P1-5)
     let db = init_database(None).expect("Failed to initialize SQLite database");
@@ -70,7 +81,10 @@ pub fn run() {
         let mut loaded = serde_json::from_str::<commands::settings_cmd::AppSettings>(&json_str)
             .unwrap_or_else(|e| {
                 // 走到这里意味着用户已存的配置会被全量丢弃，必须留下痕迹
-                log::warn!("Failed to parse persisted settings ({}), falling back to defaults", e);
+                startup_log.push((
+                    log::Level::Warn,
+                    format!("Failed to parse persisted settings ({}), falling back to defaults", e),
+                ));
                 commands::settings_cmd::AppSettings::default_config()
             });
         if loaded.server_url == "ws://127.0.0.1:8080" {
@@ -99,11 +113,20 @@ pub fn run() {
     if commands::settings_cmd::validate_account_id(&initial_settings.account_id).is_ok() {
         match storage::db::claim_unowned_history(&db, &initial_settings.account_id) {
             Ok(0) => {}
-            Ok(n) => log::info!("Claimed {} legacy history rows for account {}", n, initial_settings.account_id),
-            Err(e) => log::warn!("Failed to claim legacy history rows: {}", e),
+            Ok(n) => startup_log.push((
+                log::Level::Info,
+                format!("Claimed {} legacy history rows for account {}", n, initial_settings.account_id),
+            )),
+            Err(e) => startup_log.push((
+                log::Level::Warn,
+                format!("Failed to claim legacy history rows: {}", e),
+            )),
         }
     } else {
-        log::warn!("Skipped claiming legacy history: current account id is invalid");
+        startup_log.push((
+            log::Level::Warn,
+            "Skipped claiming legacy history: current account id is invalid".to_string(),
+        ));
     }
 
     let config = ConnectionConfig {
@@ -114,7 +137,15 @@ pub fn run() {
         hostname: app_state::whoami_hostname(),
         os_type: std::env::consts::OS.to_string(),
         app_version: app_state::APP_VERSION.to_string(),
-        allow_insecure_tls: initial_settings.allow_insecure_tls,
+        // 指纹解析失败不能让应用起不来：回落到最安全的一档，
+        // 用户进设置页改指纹时会再看到一次精确的报错。
+        tls_trust: initial_settings.tls_trust_config().unwrap_or_else(|e| {
+            startup_log.push((
+                log::Level::Warn,
+                format!("证书指纹配置无效（{e}），本次启动按「仅信任公共 CA」处理"),
+            ));
+            core::tls_trust::TlsTrustConfig::public_ca()
+        }),
     };
 
     let config_actor = Arc::new(tokio::sync::RwLock::new(config));
@@ -143,6 +174,29 @@ pub fn run() {
     let start_minimized_on_launch = initial_settings.start_minimized;
 
     tauri::Builder::default()
+        // 日志插件放在最前：它之后注册的插件若有启动期日志，才有人接得住。
+        //
+        // 级别压到 Info；tungstenite 两个 crate 单独压到 Warn——它们在 Debug/Info
+        // 级别会把每一帧 WebSocket 都打出来，落盘后正常传一次文件就能刷掉几 MB，
+        // 把真正要看的那几行冲走。
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .level(log::LevelFilter::Info)
+                .level_for("tokio_tungstenite", log::LevelFilter::Warn)
+                .level_for("tungstenite", log::LevelFilter::Warn)
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::LogDir { file_name: Some("unidrop".into()) },
+                ))
+                .target(tauri_plugin_log::Target::new(
+                    tauri_plugin_log::TargetKind::Stdout,
+                ))
+                // 上限与 KeepOne 是刻意的：日志和缓存争同一块磁盘，而本仓库对
+                // 缓存已经立了「按量按时清理」的规矩（见 cache_max_size_mb），
+                // 日志不该是那条规矩之外的例外。最坏占用 2 个文件 4 MB。
+                .max_file_size(2 * 1024 * 1024)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
+                .build(),
+        )
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             // 系统拉起的第二实例（带 --silent）不该抢焦点；用户双击图标的必须唤起
             if !core::startup::should_focus_second_instance(&args) {
@@ -163,6 +217,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(app_state)
         .setup(move |app| {
+            // logger 此时才真正就绪，把启动期攒下的日志原样放出来。
+            for (level, msg) in startup_log.drain(..) {
+                log::log!(level, "{}", msg);
+            }
+
             let app_handle = app.handle().clone();
             let outgoing_tx_actor = outgoing_tx.clone();
             let app_handle_for_actor = app_handle.clone();
@@ -307,9 +366,13 @@ pub fn run() {
 
                                         if let Some((offer, source)) = outbound_entry {
                                             log::info!("Starting Sender task for session {}", answer.session_id);
-                                            let (active_server_url, allow_insecure_tls, psk, acct) = {
+                                            let (active_server_url, tls_trust, psk, acct) = {
                                                 let s = settings_ref.lock().await;
-                                                (s.server_url.clone(), s.allow_insecure_tls,
+                                                // 数据面必须与控制面用同一套信任策略。
+                                                // 解析失败时同样回落到最严的一档——绝不能
+                                                // 因为指纹写错就让这条连接比控制面更宽松。
+                                                (s.server_url.clone(),
+                                                 s.tls_trust_config().unwrap_or_default(),
                                                  s.psk_secret.clone(), s.account_id.clone())
                                             };
                                             // offer.encrypted 是发 OFFER 时就定下的，这里按它派生。
@@ -328,7 +391,7 @@ pub fn run() {
                                             };
                                             tokio::spawn(TransferEngine::start_sender_task(
                                                 active_server_url,
-                                                allow_insecure_tls,
+                                                tls_trust,
                                                 answer.session_id.clone(),
                                                 token.clone(),
                                                 self_device_id.clone(),
@@ -347,9 +410,10 @@ pub fn run() {
                                             };
 
                                             if let Some((offer, sender_device)) = inbound_entry {
-                                                let (auto_inject, active_server_url, allow_insecure_tls, psk, acct) = {
+                                                let (auto_inject, active_server_url, tls_trust, psk, acct) = {
                                                     let s = settings_ref.lock().await;
-                                                    (s.auto_inject, s.server_url.clone(), s.allow_insecure_tls,
+                                                    (s.auto_inject, s.server_url.clone(),
+                                                     s.tls_trust_config().unwrap_or_default(),
                                                      s.psk_secret.clone(), s.account_id.clone())
                                                 };
                                                 let receiver_key = if offer.encrypted {
@@ -366,7 +430,7 @@ pub fn run() {
                                                 log::info!("Starting Receiver task for session {}, auto_inject={}", answer.session_id, auto_inject);
                                                 tokio::spawn(TransferEngine::start_receiver_task(
                                                     active_server_url,
-                                                    allow_insecure_tls,
+                                                    tls_trust,
                                                     answer.session_id.clone(),
                                                     token,
                                                     sender_device,
