@@ -18,7 +18,12 @@ pub fn notification_auth_status(
 
     #[cfg(not(target_os = "macos"))]
     {
-        app.notification().is_permission_granted().ok()
+        use tauri_plugin_notification::PermissionState;
+        match app.notification().permission_state() {
+            Ok(PermissionState::Granted) => Some(true),
+            Ok(_) => Some(false),
+            Err(_) => None,
+        }
     }
 }
 
