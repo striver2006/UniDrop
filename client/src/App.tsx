@@ -22,6 +22,7 @@ import {
   certFailureStatusText,
 } from "./types";
 import { MenuBarHiddenBanner } from "./components/MenuBarHiddenBanner";
+import { NotificationPermBanner } from "./components/NotificationPermBanner";
 import { DeviceList } from "./components/DeviceList";
 import { TransferProgress } from "./components/TransferProgress";
 import { SettingsModal } from "./components/SettingsModal";
@@ -58,6 +59,10 @@ export const App: React.FC = () => {
   /// 「推」（事件）与「拉」（命令）两条通道都要有：开了 start_minimized 时
   /// 窗口是隐藏的，后端探测很可能早于这里注册 listener，只推不拉横幅永远不出现。
   const [trayPlacement, setTrayPlacement] = useState<TrayPlacementPayload | null>(null);
+  /// 系统通知授权状态。null = 本平台无此机制或尚未探测。
+  /// 与 trayPlacement 同一套「推 + 拉」双通道：后端在 setup 里就完成首次探测，
+  /// 那时 listener 大概率还没注册上，只推不拉横幅永远不出现。
+  const [notifAuthGranted, setNotifAuthGranted] = useState<boolean | null>(null);
   /// 连接层错误横幅。kind 决定文案与引导按钮：
   /// "auth" 是 PSK / 账号格式被服务端拒绝，"tls" 是服务器证书校验失败。
   /// 两者的修复动作不同——前者改密钥或账号，后者按证书失败的**具体档位**而定——
@@ -162,6 +167,14 @@ export const App: React.FC = () => {
         setTrayPlacement(tp);
       } catch (e) {
         console.warn("tray placement probe unavailable:", e);
+      }
+
+      // 通知授权状态同理单独 try，理由同上。
+      try {
+        const granted = await invoke<boolean | null>("cmd_get_notification_auth_status");
+        setNotifAuthGranted(granted);
+      } catch (e) {
+        console.warn("notification auth probe unavailable:", e);
       }
     } catch (err: any) {
       console.error("fetch initial data error:", err);
@@ -291,6 +304,15 @@ export const App: React.FC = () => {
       }
     );
 
+    // 通知授权状态变化（启动探测 / 投递失败时后端都会推）。授权在系统侧被
+    // 翻转（重装、改系统设置）不需要重启应用，横幅要能跟着事件出现/消失。
+    const unlistenNotifAuthPromise = listen<{ granted: boolean }>(
+      "notification-auth-status",
+      (event) => {
+        setNotifAuthGranted(event.payload.granted);
+      }
+    );
+
     const unlistenLimitsPromise = listen<ServerLimits | null>("server-limits-updated", (event) => {
       setServerLimits(event.payload ?? null);
     });
@@ -308,6 +330,7 @@ export const App: React.FC = () => {
       unlistenOfferPromise.then((unlisten) => unlisten());
       unlistenSettingsPromise.then((unlisten) => unlisten());
       unlistenTrayPlacementPromise.then((unlisten) => unlisten());
+      unlistenNotifAuthPromise.then((unlisten) => unlisten());
       // 卸载后定时器若仍触发就会对已卸载的组件 setState。StrictMode 下开发期
       // 会 mount→unmount→mount，不清会稳定复现重复定时器。
       dismissTimersRef.current.forEach((timer) => clearTimeout(timer));
@@ -448,6 +471,21 @@ export const App: React.FC = () => {
             setTrayPlacement((prev) => (prev ? { ...prev, force_reveal_optout: true } : prev));
           } catch (e) {
             console.warn("failed to persist tray guidance opt-out:", e);
+          }
+        }}
+      />
+
+      {/* 通知授权横幅排在菜单栏横幅之下：它讲的是「收到东西却没人告诉你」，
+          比连接错误更值得先看见——内容其实已经收下来了。 */}
+      <NotificationPermBanner
+        granted={notifAuthGranted}
+        onOpenSettings={async () => {
+          try {
+            await invoke("cmd_open_notification_settings");
+          } catch (e) {
+            // URL scheme 未文档化，打不开是可能的。横幅里的文字路径始终可见，
+            // 所以这里只提示一句，不必把失败演成故障（同菜单栏横幅的口径）。
+            showNotification("请手动打开：系统设置 → 通知", "error");
           }
         }}
       />

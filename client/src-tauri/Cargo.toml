@@ -1,6 +1,6 @@
 [package]
 name = "unidrop-client"
-version = "0.4.0"
+version = "0.4.1"
 description = "UniDrop Cross-Platform Native Clipboard & File Distribution Client"
 edition = "2021"
 authors = ["UniDrop Team"]
@@ -93,6 +93,9 @@ objc2-user-notifications = { version = "0.3", features = [
     # willPresent 回调被 cfg(all(feature = "UNNotification", feature = "block2"))
     # 门控，缺它则「应用在前台时通知照常显示」根本无从实现。
     "UNNotification",
+    # getNotificationSettings 的授权复核与 UNAuthorizationStatus 都在这里，
+    # 缺它则「授权被系统侧翻转后界面仍以为一切正常」无从探测。
+    "UNNotificationSettings",
     "UNError",
     "block2",
 ] }

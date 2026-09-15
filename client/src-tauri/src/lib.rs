@@ -957,6 +957,8 @@ pub fn run() {
             commands::cmd_get_tray_placement,
             commands::cmd_dismiss_tray_guidance,
             commands::cmd_open_menu_bar_settings,
+            commands::cmd_get_notification_auth_status,
+            commands::cmd_open_notification_settings,
         ])
         .build(tauri::generate_context!())
         .expect("error while building UniDrop application");

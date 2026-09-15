@@ -99,6 +99,35 @@ async fn finalize_history_status(
     crate::core::history_pruner::prune_and_notify(app_handle).await;
 }
 
+/// 把对端 device_id 解析成设备名（在线设备表的 hostname），供通知标题使用。
+///
+/// 查不到时返回 None：发送方恰好离线、设备列表尚未同步都会走到这里，
+/// 调用方退回无设备名的通用标题——辅助信息缺失不该连累整条通知不发。
+async fn resolve_peer_name(app_handle: &AppHandle, device_id: &str) -> Option<String> {
+    let state = app_handle.state::<AppState>();
+    let devs = state.online_devices.lock().await;
+    devs.iter()
+        .find(|d| d.device_id == device_id)
+        .map(|d| d.hostname.clone())
+}
+
+/// PRD §4.1.4 样例「48.5 MB」：一位小数，逐级向下换算。
+fn human_size(bytes: i64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * KB;
+    const GB: f64 = 1024.0 * MB;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.1} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.1} KB", b / KB)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 pub struct TransferEngine {
     pub cache_manager: CacheManager,
 }
@@ -700,7 +729,11 @@ impl TransferEngine {
                 // Err 必须留痕：通知发不出去本身就是哑故障，而「收不到提醒」
                 // 恰恰是这个功能要防的那件事。此前四处都是 let _ =，
                 // 所以 macOS 上通知整整失效了都没有任何信号。
-                if let Err(e) = show_transfer_notification(&app_handle, "UniDrop 接收失败", "数据通道连接失败，请检查服务器地址与证书配置") {
+                let failure_title = match resolve_peer_name(&app_handle, &from_device).await {
+                    Some(name) => format!("来自 {name} 的接收失败"),
+                    None => "UniDrop 接收失败".to_string(),
+                };
+                if let Err(e) = show_transfer_notification(&app_handle, &failure_title, "数据通道连接失败，请检查服务器地址与证书配置") {
                     log::warn!("Failed to show notification: {}", e);
                 }
                 finalize_history_status(&app_handle, &session_id, "FAILED", Some(&format!("数据通道连接失败: {}", e))).await;
@@ -989,7 +1022,12 @@ impl TransferEngine {
                                     }
                                 }
                             }
-                            if let Err(e) = show_transfer_notification(&app_handle, "UniDrop 文本已同步", "已写入系统剪贴板，可直接粘贴") {
+                            // PRD §4.1.4：标题带发送方设备名，用户不点开就知道是谁发来的。
+                            let text_title = match resolve_peer_name(&app_handle, &from_device).await {
+                                Some(name) => format!("来自 {name} 的文本"),
+                                None => "UniDrop 文本已同步".to_string(),
+                            };
+                            if let Err(e) = show_transfer_notification(&app_handle, &text_title, "已写入系统剪贴板，可直接粘贴") {
                                 log::warn!("Failed to show notification: {}", e);
                             }
                             let _ = cache_manager.mark_clipboard_injected(&session_id).await;
@@ -1008,7 +1046,11 @@ impl TransferEngine {
                                     }
                                 }
                             }
-                            if let Err(e) = show_transfer_notification(&app_handle, "UniDrop 图片已同步", "已写入系统剪贴板，可直接粘贴") {
+                            let image_title = match resolve_peer_name(&app_handle, &from_device).await {
+                                Some(name) => format!("来自 {name} 的图片"),
+                                None => "UniDrop 图片已同步".to_string(),
+                            };
+                            if let Err(e) = show_transfer_notification(&app_handle, &image_title, "已写入系统剪贴板，可直接粘贴") {
                                 log::warn!("Failed to show notification: {}", e);
                             }
                             let _ = cache_manager.mark_clipboard_injected(&session_id).await;
@@ -1020,7 +1062,16 @@ impl TransferEngine {
                             } else {
                                 format!("{} (已保存在沙盒，可在面板中点击装载)", offer.preview_summary)
                             };
-                            if let Err(e) = show_transfer_notification(&app_handle, "UniDrop 文件接收完成", &notification_body) {
+                            // PRD §4.1.4 样例：「来自 [MacBook-Pro] 的文件 (3个文件, 48.5 MB)」。
+                            let files_title = match resolve_peer_name(&app_handle, &from_device).await {
+                                Some(name) => format!(
+                                    "来自 {name} 的文件 ({}项, {})",
+                                    offer.total_items,
+                                    human_size(offer.total_size)
+                                ),
+                                None => format!("UniDrop 文件接收完成 ({}项)", offer.total_items),
+                            };
+                            if let Err(e) = show_transfer_notification(&app_handle, &files_title, &notification_body) {
                                 log::warn!("Failed to show notification: {}", e);
                             }
 

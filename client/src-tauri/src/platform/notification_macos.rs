@@ -10,15 +10,17 @@
 //! 本模块用的是 objc2 0.6 那一代（`objc2_v06` / `objc2_foundation_v06`），
 //! 与剪贴板模块的 0.5 并存。两者不交换任何类型，理由见 Cargo.toml 的注释。
 
+use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 
 use block2::{DynBlock, RcBlock};
 use objc2_foundation_v06::{NSBundle, NSError, NSObject, NSObjectProtocol, NSString};
 use objc2_user_notifications::{
-    UNAuthorizationOptions, UNMutableNotificationContent, UNNotification,
+    UNAuthorizationOptions, UNAuthorizationStatus, UNMutableNotificationContent, UNNotification,
     UNNotificationDefaultActionIdentifier, UNNotificationPresentationOptions,
-    UNNotificationRequest, UNNotificationResponse, UNNotificationSound, UNUserNotificationCenter,
-    UNUserNotificationCenterDelegate,
+    UNNotificationRequest, UNNotificationResponse, UNNotificationSettings, UNNotificationSound,
+    UNUserNotificationCenter, UNUserNotificationCenterDelegate,
 };
 use objc2_v06::rc::Retained;
 use objc2_v06::runtime::{Bool, ProtocolObject};
@@ -26,11 +28,46 @@ use objc2_v06::runtime::{Bool, ProtocolObject};
 // 就是这个 trait 的方法，去掉它会 E0599（代码审查中有人据"全文没再出现过
 // AnyThread 字样"提过删除建议，实测编译不过）。
 use objc2_v06::{define_class, msg_send, AnyThread};
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 /// 供 delegate 回调唤起主窗口用。delegate 由 ObjC 运行时在任意线程调起，
 /// 拿不到调用方传来的上下文，只能从这里取。
 static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
+
+/// 最近一次探测到的通知授权状态：0 = 尚未探测，1 = 已授权，2 = 被拒。
+///
+/// 事件（notification-auth-status）是「推」，cmd_get_notification_auth_status
+/// 读这里是「拉」——webview 注册 listener 可能晚于 setup 里的首次探测，
+/// 只推不拉的话横幅在那种时序下永远不会出现。菜单栏放置横幅同理，
+/// 见 window_cmd.rs 里 cmd_get_tray_placement 的注释。
+static AUTH_STATUS: AtomicU8 = AtomicU8::new(0);
+
+/// UNErrorCodeNotificationsNotAllowed。objc2-user-notifications 没有生成
+/// 这个枚举，只能按 UserNotifications/UNError.h 的定义手写常量。
+const UN_ERROR_NOTIFICATIONS_NOT_ALLOWED: isize = 1;
+
+/// 记录并广播授权状态。
+fn publish_auth_status(app: &AppHandle, granted: bool) {
+    AUTH_STATUS.store(if granted { 1 } else { 2 }, Ordering::Relaxed);
+    // 窗口隐藏时 webview 仍然存活、事件仍然送达，React state 会更新——
+    // 用户下次打开主窗口就能看到引导横幅，不必恰好守着窗口等这一刻。
+    if let Err(e) = app.emit(
+        "notification-auth-status",
+        serde_json::json!({ "granted": granted }),
+    ) {
+        log::warn!("Failed to emit notification-auth-status: {}", e);
+    }
+}
+
+/// 拉取最近一次探测到的授权状态。`None` = 尚未探测或不适用
+/// （dev 裸跑被 running_as_app_bundle 拦下的情形），前端据此不显示横幅。
+pub fn cached_auth_status() -> Option<bool> {
+    match AUTH_STATUS.load(Ordering::Relaxed) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
 
 /// delegate 必须由我们自己长期持有：`setDelegate:` 是 **weak property**
 /// （见绑定中 `UNUserNotificationCenter::setDelegate` 的文档注释），
@@ -159,13 +196,12 @@ pub fn init_notifications(app: &AppHandle) {
 
     // 不要 Badge：本应用没有角标需求，多要一项权限只会让授权弹窗更可疑。
     let options = UNAuthorizationOptions::Alert | UNAuthorizationOptions::Sound;
-    let handler = RcBlock::new(|granted: Bool, error: *mut NSError| {
+    let app_for_probe = app.clone();
+    let handler = RcBlock::new(move |granted: Bool, error: *mut NSError| {
         if !error.is_null() {
             let msg = unsafe { (*error).localizedDescription() }.to_string();
             log::warn!("Notification authorization request failed: {}", msg);
-            return;
-        }
-        if granted.as_bool() {
+        } else if granted.as_bool() {
             log::info!("Notification authorization granted");
         } else {
             // 不是错误，但必须留痕：否则「通知不弹」又会变成无从排查的哑故障，
@@ -175,6 +211,30 @@ pub fn init_notifications(app: &AppHandle) {
                  transfer notifications will not be shown until it is enabled in System Settings"
             );
         }
+
+        // request 的 granted 只反映「本次请求」的瞬时结果，反映不了系统侧
+        // 后续的翻转——替换安装后授权记录失效、用户手动改系统设置，都会让
+        // 它与真实状态脱节（2026-09-14 的实机日志：请求报 error 1 的同时
+        // 投递也全部失败，状态只看请求侧就永远解释不了）。getNotificationSettings
+        // 是系统给的权威快照，横幅状态以它为准。
+        let center = UNUserNotificationCenter::currentNotificationCenter();
+        let app_for_settings = app_for_probe.clone();
+        let probe = RcBlock::new(move |settings: NonNull<UNNotificationSettings>| {
+            let status = unsafe { settings.as_ref() }.authorizationStatus();
+            let granted = matches!(
+                status,
+                UNAuthorizationStatus::Authorized
+                    | UNAuthorizationStatus::Provisional
+                    | UNAuthorizationStatus::Ephemeral
+            );
+            log::info!(
+                "Notification authorization status from settings: {:?} (granted: {})",
+                status,
+                granted
+            );
+            publish_auth_status(&app_for_settings, granted);
+        });
+        center.getNotificationSettingsWithCompletionHandler(&probe);
     });
     center.requestAuthorizationWithOptions_completionHandler(options, &handler);
 }
@@ -200,10 +260,20 @@ pub fn show_notification(app: &AppHandle, title: &str, body: &str) -> Result<(),
     let request =
         UNNotificationRequest::requestWithIdentifier_content_trigger(&identifier, &content, None);
 
-    let handler = RcBlock::new(|error: *mut NSError| {
+    let app_for_error = app.clone();
+    let handler = RcBlock::new(move |error: *mut NSError| {
         if !error.is_null() {
             let msg = unsafe { (*error).localizedDescription() }.to_string();
             log::warn!("Failed to deliver notification: {}", msg);
+
+            // 授权在启动后被翻转（重装/系统设置变更）时，最先暴露的就是这里：
+            // 启动探测 granted、投递却报 NotificationsNotAllowed。只记日志的话，
+            // 用户视角仍是「没提示、也没人告诉我为什么」——哑故障原样复发。
+            // 只有 code==1（未授权）才广播 denied：其他错误码（如载荷无效）
+            // 引导用户去开通知开关是误诊。
+            if unsafe { (*error).code() } == UN_ERROR_NOTIFICATIONS_NOT_ALLOWED {
+                publish_auth_status(&app_for_error, false);
+            }
         }
     });
     center.addNotificationRequest_withCompletionHandler(&request, Some(&handler));

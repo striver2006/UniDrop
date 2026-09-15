@@ -76,3 +76,45 @@ pub fn cmd_open_menu_bar_settings() -> Result<(), String> {
         Err("仅 macOS 支持".into())
     }
 }
+
+/// 拉取系统通知授权状态（授权引导横幅的「拉」通道，与
+/// cmd_get_tray_placement 的推拉口径一致）。
+#[tauri::command]
+pub fn cmd_get_notification_auth_status(app: tauri::AppHandle) -> Result<Option<bool>, String> {
+    Ok(crate::platform::notification::notification_auth_status(&app))
+}
+
+/// 打开「系统设置 → 通知」。与 cmd_open_menu_bar_settings 同一批先例：
+/// URL scheme 未文档化，文字路径才是可靠指引，按钮只是顺手。
+#[tauri::command]
+pub fn cmd_open_notification_settings() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        // Ventura 起通知是独立面板；Monterey 及以前挂在旧的 preference id 下，
+        // 所以第一个打不开时回退过去。
+        const CANDIDATES: [&str; 2] = [
+            "x-apple.systempreferences:com.apple.Notifications-Settings.extension",
+            "x-apple.systempreferences:com.apple.preference.notifications",
+        ];
+        for url in CANDIDATES {
+            match std::process::Command::new("open").arg(url).status() {
+                Ok(status) if status.success() => return Ok(()),
+                Ok(_) => continue,
+                Err(e) => return Err(format!("无法打开系统设置：{e}")),
+            }
+        }
+        return Err("无法打开系统设置的通知面板".into());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", "ms-settings:notifications"])
+            .status()
+            .map_err(|e| format!("无法打开系统设置：{e}"))?;
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Err("仅 macOS / Windows 支持".into())
+    }
+}
