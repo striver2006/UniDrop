@@ -14,6 +14,8 @@ pub mod listener_macos;
 pub mod notification_macos;
 #[cfg(target_os = "macos")]
 pub mod tray_placement_macos;
+#[cfg(target_os = "macos")]
+pub mod tray_click_macos;
 
 #[cfg(target_os = "linux")]
 pub mod clipboard_linux;

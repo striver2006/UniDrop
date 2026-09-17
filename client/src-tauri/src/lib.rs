@@ -130,40 +130,7 @@ fn build_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
                 return;
             }
 
-            // 双击去抖：一次双击会发两次抬起，不拦的话变成「唤起 + 收起」，
-            // 窗口闪一下就没了——旧代码双击打不开窗口就是这么来的。
-            // 被吞掉的那次不刷新时间戳，理由见 is_duplicate_left_click。
-            let now = std::time::Instant::now();
-            let duplicate = {
-                let mut last = LAST_LEFT_CLICK
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if crate::core::tray_click::is_duplicate_left_click(
-                    last.map(|t| now.saturating_duration_since(t)),
-                ) {
-                    true
-                } else {
-                    *last = Some(now);
-                    false
-                }
-            };
-            if duplicate {
-                log::debug!("Ignoring the second click of a tray double-click");
-                return;
-            }
-
-            let app = tray.app_handle();
-            if let Some(win) = app.get_webview_window("main") {
-                if crate::core::tray_click::should_hide_on_tray_click(
-                    win.is_visible().unwrap_or(false),
-                    win.is_minimized().unwrap_or(false),
-                    win.is_focused().unwrap_or(false),
-                ) {
-                    let _ = win.hide();
-                } else {
-                    reveal_main_window(app);
-                }
-            }
+            handle_tray_left_click(tray.app_handle());
         })
         .build(app)?;
 
@@ -184,51 +151,109 @@ fn build_tray<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<tau
     // 对「调用方已在主线程」做了特判，直接同步就地执行（lib.rs:239）。
     // 此时事件循环还没 run 起来，靠的正是这条特判——别改成先 spawn 再等。
     #[cfg(target_os = "macos")]
-    if let Err(e) = tray_built.with_inner_tray_icon(|inner| {
-        if let Some(item) = inner.ns_status_item() {
-            item.setAutosaveName(Some(&objc2_foundation_v06::NSString::from_str(
-                platform::tray_placement_macos::TRAY_AUTOSAVE_NAME,
-            )));
+    {
+        let app_handle_for_tray = app.clone();
+        if let Err(e) = tray_built.with_inner_tray_icon(move |inner| {
+            if let Some(item) = inner.ns_status_item() {
+                item.setAutosaveName(Some(&objc2_foundation_v06::NSString::from_str(
+                    platform::tray_placement_macos::TRAY_AUTOSAVE_NAME,
+                )));
 
-            // 诊断：把状态项自身的状态打出来。
-            // macOS 26 下系统侧日志对「能显示」和「不能显示」的应用完全一致
-            // （实测对照过一个同机正常工作的原生应用，托管序列逐行相同），
-            // 所以差异只可能在我们送过去的内容上——图标是否真的设上、按钮多宽、
-            // 状态项是否 visible。这几个值只能在本进程内读到。
-            if let Some(mtm) = objc2_v06::MainThreadMarker::new() {
-                let button = item.button(mtm);
-                let (has_image, image_size, title, button_frame) = match &button {
-                    Some(b) => {
-                        let img = b.image();
-                        (
-                            img.is_some(),
-                            img.as_ref().map(|i| i.size()),
-                            b.title().to_string(),
-                            Some(b.frame()),
-                        )
-                    }
-                    None => (false, None, String::new(), None),
-                };
-                log::info!(
-                    "Status item diagnostics: visible={} length={} has_button={} has_image={} \
-                     image_size={:?} title={:?} button_frame={:?}",
-                    item.isVisible(),
-                    item.length(),
-                    button.is_some(),
-                    has_image,
-                    image_size,
-                    title,
-                    button_frame,
-                );
+                // 诊断：把状态项自身的状态打出来。
+                // macOS 26 下系统侧日志对「能显示」和「不能显示」的应用完全一致
+                // （实测对照过一个同机正常工作的原生应用，托管序列逐行相同），
+                // 所以差异只可能在我们送过去的内容上——图标是否真的设上、按钮多宽、
+                // 状态项是否 visible。这几个值只能在本进程内读到。
+                if let Some(mtm) = objc2_v06::MainThreadMarker::new() {
+                    let button = item.button(mtm);
+                    let (has_image, image_size, title, button_frame) = match &button {
+                        Some(b) => {
+                            let img = b.image();
+                            (
+                                img.is_some(),
+                                img.as_ref().map(|i| i.size()),
+                                b.title().to_string(),
+                                Some(b.frame()),
+                            )
+                        }
+                        None => (false, None, String::new(), None),
+                    };
+                    log::info!(
+                        "Status item diagnostics: visible={} length={} has_button={} has_image={} \
+                         image_size={:?} title={:?} button_frame={:?}",
+                        item.isVisible(),
+                        item.length(),
+                        button.is_some(),
+                        has_image,
+                        image_size,
+                        title,
+                        button_frame,
+                    );
+                }
+
+                // 安装 macOS 原生 target-action 点击处理器（左键唤起窗口，右键呼出菜单）
+                let app_handle = app_handle_for_tray.clone();
+                platform::tray_click_macos::setup_tray_macos(&item, move || {
+                    handle_tray_left_click(&app_handle);
+                });
             }
+        }) {
+            // 设不上不致命：图标可能仍然显示（系统会退回匿名身份），只是位置不再被
+            // 记住、自检也会失去依据。所以留痕但不阻断启动。
+            log::warn!("Failed to set up macOS tray native click handler or autosave name: {}", e);
         }
-    }) {
-        // 设不上不致命：图标可能仍然显示（系统会退回匿名身份），只是位置不再被
-        // 记住、自检也会失去依据。所以留痕但不阻断启动。
-        log::warn!("Failed to set the status item autosave name: {}", e);
     }
 
     Ok(tray_built)
+}
+
+/// 唤起主窗口的唯一入口。
+///
+/// 「隐藏到托盘」与「最小化到任务栏」是两种不同的形态：后者窗口仍是 visible，
+/// 只调 show() + set_focus() 在 Windows 上无法还原，必须先 unminimize()。
+///
+/// 三步顺序在 macOS 上同样是必须品，而且自从 Dock 图标被藏起来（Accessory，
+/// 见 `run()` 里的 set_activation_policy）之后更要命：tao 的 `Window::set_focus`
+/// 有一道前置守卫 `if !is_minimized && is_visible`
+/// （tao-0.35.3/src/platform_impl/macos/window.rs:677），不满足就整个空操作，
+/// 连里面那句 `activateIgnoringOtherApps: YES`（util/async.rs:234）都不会执行——
+/// 处理托盘图标左键点击（唤出或收起主窗口，包含双击去抖与焦点判定）。
+///
+/// 供 Windows/Linux 的 on_tray_icon_event 以及 macOS 原生 target-action 回调共享调用。
+pub(crate) fn handle_tray_left_click<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    // 双击去抖：一次双击会发两次抬起，不拦的话变成「唤起 + 收起」，
+    // 窗口闪一下就没了——旧代码双击打不开窗口就是这么来的。
+    // 被吞掉的那次不刷新时间戳，理由见 is_duplicate_left_click。
+    let now = std::time::Instant::now();
+    let duplicate = {
+        let mut last = LAST_LEFT_CLICK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if crate::core::tray_click::is_duplicate_left_click(
+            last.map(|t| now.saturating_duration_since(t)),
+        ) {
+            true
+        } else {
+            *last = Some(now);
+            false
+        }
+    };
+    if duplicate {
+        log::debug!("Ignoring the second click of a tray double-click");
+        return;
+    }
+
+    if let Some(win) = app.get_webview_window("main") {
+        if crate::core::tray_click::should_hide_on_tray_click(
+            win.is_visible().unwrap_or(false),
+            win.is_minimized().unwrap_or(false),
+            win.is_focused().unwrap_or(false),
+        ) {
+            let _ = win.hide();
+        } else {
+            reveal_main_window(app);
+        }
+    }
 }
 
 /// 唤起主窗口的唯一入口。

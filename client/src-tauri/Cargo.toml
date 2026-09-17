@@ -1,6 +1,6 @@
 [package]
 name = "unidrop-client"
-version = "0.4.1"
+version = "0.4.2"
 description = "UniDrop Cross-Platform Native Clipboard & File Distribution Client"
 edition = "2021"
 authors = ["UniDrop Team"]
@@ -12,6 +12,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2.0.0", features = [] }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
 
 [dependencies]
 # image-png 是托盘模板图所需：菜单栏图标经 Image::from_bytes 载入，而该方法被
@@ -81,6 +84,8 @@ objc2-foundation-v06 = { package = "objc2-foundation", version = "0.3", features
     "NSBundle",
     # NSData：把内嵌的 PNG 字节喂给 NSImage
     "NSData",
+    # NSArray：遍历 NSStatusBarButton 的子视图
+    "NSArray",
 ] }
 objc2-user-notifications = { version = "0.3", features = [
     "UNUserNotificationCenter",
@@ -127,6 +132,8 @@ objc2-app-kit-v06 = { package = "objc2-app-kit", version = "0.3", features = [
     "NSImage",
     # mainMenu / menuBarHeight：状态项窗口高度取自本进程的菜单栏高度，诊断用
     "NSMenu",
+    # NSEvent / NSEventMask：捕获状态项按钮的左键与右键抬起事件
+    "NSEvent",
 ] }
 # 只开 CGWindow 一个 feature：其余 CG 子模块一律不要，多开一个就多一批生成代码
 # 进编译单元，而这里只需要 CGWindowListCopyWindowInfo 与那几个键常量。

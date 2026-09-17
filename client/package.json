@@ -1,7 +1,7 @@
 {
   "name": "unidrop-client-ui",
   "private": true,
-  "version": "0.4.1",
+  "version": "0.4.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,7 +10,8 @@
     "tauri": "tauri",
     "test": "vitest run",
     "test:watch": "vitest",
-    "tauri:build": "if [ -f .env ]; then set -a; . ./.env; set +a; fi; tauri build && sh scripts/notarize-dmg.sh"
+    "tauri:build": "if [ -f .env ]; then set -a; . ./.env; set +a; fi; tauri build && sh scripts/notarize-dmg.sh",
+    "install:mac": "sh scripts/install-mac.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",

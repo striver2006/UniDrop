@@ -118,7 +118,14 @@ pnpm install
 pnpm tauri dev
 
 # 5. 打包正式发行版本 (生产环境优化产物)
+# 通用打包命令：
 pnpm tauri build
+
+# macOS 签名与本地安装（自动带 Developer ID 证书签名，确保通知权限正常）：
+pnpm install:mac
+
+# macOS 完整打包、签名与公证（输出 dmg 镜像）：
+pnpm tauri:build
 ```
 
 ---
