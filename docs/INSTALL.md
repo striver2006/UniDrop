@@ -132,17 +132,20 @@ pnpm tauri:build
 
 ### 3.3 构建产物路径对照
 
-打包完成后，二进制与安装镜像将输出在 `client/src-tauri/target/release/bundle/` 目录：
+打包完成后，各 CPU 架构与平台安装镜像将输出在 `client/src-tauri/target/release/bundle/` 或 `target/<triple>/release/bundle/` 目录：
 
 * **macOS**：
-  * `bundle/dmg/UniDrop_0.1.0_aarch64.dmg`（安装镜像）
+  * `bundle/dmg/UniDrop_{version}_aarch64.dmg`（Apple Silicon M 系列芯片安装镜像）
+  * `bundle/dmg/UniDrop_{version}_x64.dmg`（Intel x86_64 处理器安装镜像）
   * `bundle/macos/UniDrop.app`（独立应用程序包）
 * **Windows**：
-  * `bundle/msi/UniDrop_0.1.0_x64_en-US.msi`（Windows 安装程序）
-  * `bundle/nsis/UniDrop_0.1.0_x64-setup.exe`
+  * `bundle/msi/UniDrop_{version}_x64_zh-CN.msi`（Windows x64 微软安装包向导）
+  * `bundle/nsis/UniDrop_{version}_x64-setup.exe`（Windows x64 NSIS 安装包）
+  * `bundle/nsis/UniDrop_{version}_arm64-setup.exe`（Windows ARM64 骁龙/Surface NSIS 安装包）
 * **Linux**：
-  * `bundle/deb/unidrop_0.1.0_amd64.deb`
-  * `bundle/appimage/unidrop_0.1.0_amd64.AppImage`
+  * `bundle/deb/UniDrop_{version}_amd64.deb`（Debian / Ubuntu / Deepin / UOS 安装包）
+  * `bundle/rpm/UniDrop-{version}-1.x86_64.rpm`（Fedora / RHEL / openSUSE 安装包）
+  * `bundle/appimage/UniDrop_{version}_amd64.AppImage`（通用免安装独立可执行镜像）
 
 ---
 

@@ -14,15 +14,35 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # macOS Apple Silicon (M1/M2/M3/M4)
           - platform: 'macos-latest'
             target: 'aarch64-apple-darwin'
-            bundle_ext: 'dmg'
+            args: '--target aarch64-apple-darwin'
+            name: 'macos-aarch64'
+
+          # macOS Intel (x86_64)
+          - platform: 'macos-latest'
+            target: 'x86_64-apple-darwin'
+            args: '--target x86_64-apple-darwin'
+            name: 'macos-x64'
+
+          # Windows x64 (MSI + NSIS setup .exe)
           - platform: 'windows-latest'
             target: 'x86_64-pc-windows-msvc'
-            bundle_ext: 'msi'
+            args: '--target x86_64-pc-windows-msvc'
+            name: 'windows-x64'
+
+          # Windows ARM64 (NSIS setup .exe)
+          - platform: 'windows-latest'
+            target: 'aarch64-pc-windows-msvc'
+            args: '--target aarch64-pc-windows-msvc --bundles nsis'
+            name: 'windows-arm64'
+
+          # Linux x64 (deb + rpm + AppImage)
           - platform: 'ubuntu-22.04'
             target: 'x86_64-unknown-linux-gnu'
-            bundle_ext: 'deb'
+            args: '--target x86_64-unknown-linux-gnu'
+            name: 'linux-x64'
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -33,7 +53,13 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf libxdo-dev libssl-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf libxdo-dev libssl-dev rpm libfuse2
+
+      - name: Setup MSVC for Windows ARM64
+        if: runner.os == 'Windows' && matrix.target == 'aarch64-pc-windows-msvc'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64_arm64
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -67,11 +93,12 @@ jobs:
           releaseBody: '瞬贴 (UniDrop) - 跨平台原生剪贴板与文件分发系统 / Cross-platform native clipboard and file distribution'
           releaseDraft: false
           prerelease: false
+          args: ${{ matrix.args }}
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: UniDrop-${{ matrix.platform }}
+          name: UniDrop-${{ matrix.name }}
           path: |
             client/src-tauri/target/release/bundle/msi/*.msi
             client/src-tauri/target/release/bundle/dmg/*.dmg
@@ -79,3 +106,9 @@ jobs:
             client/src-tauri/target/release/bundle/deb/*.deb
             client/src-tauri/target/release/bundle/rpm/*.rpm
             client/src-tauri/target/release/bundle/appimage/*.AppImage
+            client/src-tauri/target/${{ matrix.target }}/release/bundle/msi/*.msi
+            client/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            client/src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*.exe
+            client/src-tauri/target/${{ matrix.target }}/release/bundle/deb/*.deb
+            client/src-tauri/target/${{ matrix.target }}/release/bundle/rpm/*.rpm
+            client/src-tauri/target/${{ matrix.target }}/release/bundle/appimage/*.AppImage
