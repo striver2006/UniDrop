@@ -19,6 +19,7 @@ class _SettingsPageState extends State<SettingsPage> {
   late TextEditingController _server;
   late TextEditingController _account;
   late TextEditingController _psk;
+  late TextEditingController _pin;
 
   @override
   void initState() {
@@ -27,6 +28,8 @@ class _SettingsPageState extends State<SettingsPage> {
     _server = TextEditingController(text: s?.serverUrl ?? '');
     _account = TextEditingController(text: s?.accountId ?? '');
     _psk = TextEditingController(text: s?.pskSecret ?? '');
+    _pin = TextEditingController(
+        text: (s?.pinnedCertSha256 ?? const []).join('\n'));
   }
 
   @override
@@ -34,6 +37,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _server.dispose();
     _account.dispose();
     _psk.dispose();
+    _pin.dispose();
     super.dispose();
   }
 
@@ -82,7 +86,14 @@ class _SettingsPageState extends State<SettingsPage> {
               border: OutlineInputBorder(),
             ),
           ),
-          const SizedBox(height: 24),
+          const SizedBox(height: 16),
+          // 常驻保存：文本字段没有失焦即存的语义（AppSettings 是整份落库），
+          // 必须给显式提交入口——此前只有 pinned 档有按钮，其他档输完没法保存。
+          FilledButton(
+            onPressed: () => _saveWith(store, s),
+            child: const Text('保存并重连'),
+          ),
+          const SizedBox(height: 8),
           _Section(title: '接收策略'),
           SegmentedButton<String>(
             segments: const [
@@ -124,6 +135,19 @@ class _SettingsPageState extends State<SettingsPage> {
               if (v != null) _saveWith(store, s, tlsTrustMode: v);
             },
           ),
+          // Pinned 档必填：空指纹会被 core 拒绝（等于没有任何信任来源）。
+          // 一行一条，支持直接粘 openssl 输出（core 侧解析时容错冒号与前后缀）。
+          if (s.tlsTrustMode == 'pinned') ...[
+            const SizedBox(height: 12),
+            TextField(
+              controller: _pin,
+              maxLines: 3,
+              decoration: const InputDecoration(
+                labelText: '证书 SHA-256 指纹（每行一条）',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ],
           const SizedBox(height: 24),
           _Section(title: '服务端限额（只读）'),
           _LimitsCard(limits: store.serverLimits),
@@ -151,6 +175,11 @@ class _SettingsPageState extends State<SettingsPage> {
     bool? e2eeEnabled,
     String? tlsTrustMode,
   }) {
+    final pins = _pin.text
+        .split(RegExp(r'[\n,;]'))
+        .map((l) => l.trim())
+        .where((l) => l.isNotEmpty)
+        .toList();
     final next = AppSettingsDto(
       serverUrl: _server.text.trim(),
       accountId: _account.text.trim(),
@@ -159,7 +188,7 @@ class _SettingsPageState extends State<SettingsPage> {
       receivePolicy: receivePolicy ?? current.receivePolicy,
       e2eeEnabled: e2eeEnabled ?? current.e2eeEnabled,
       tlsTrustMode: tlsTrustMode ?? current.tlsTrustMode,
-      pinnedCertSha256: current.pinnedCertSha256,
+      pinnedCertSha256: pins.isEmpty ? current.pinnedCertSha256 : pins,
       historyMaxEntries: current.historyMaxEntries,
       cacheMaxSizeMb: current.cacheMaxSizeMb,
     );

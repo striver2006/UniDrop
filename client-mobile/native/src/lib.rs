@@ -36,6 +36,30 @@ use unidrop_core::storage::{self, HistoryRepo};
 pub type EventCallback = extern "C" fn(user_data: usize, event_json: *const c_char);
 
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+/// 极简 stderr logger：真机实测的 Rust 日志出口。
+///
+/// Android：debuggable 应用的 stderr 由 logcat 捕获（`adb logcat *:S flutter`）；
+/// iOS：stderr 经 os_log 转发，Console.app / devicectl 可见。
+/// 不引 env_logger / android_logger——移动端没有环境变量可配，
+/// 固定 Info 级、stderr 单目的地足够排障用。
+struct StderrLogger;
+
+impl log::Log for StderrLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[unidrop {}] {}", record.level(), record.args());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+static LOGGER: StderrLogger = StderrLogger;
 static HOST: OnceLock<Host> = OnceLock::new();
 static EVENT_SINK: Mutex<Option<(EventCallback, usize)>> = Mutex::new(None);
 static CALL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -113,6 +137,12 @@ impl HostBridge for JsonBridge {
     }
 }
 
+/// 把一条事件投递给 Dart 宿主。
+///
+/// **内存契约：指针的所有权移交给 Dart**。`NativeCallable.listener`
+/// 是异步投递——原生回调返回之后 Dart 才真正执行处理，因此字符串必须
+/// 在回调返回后继续存活。这里用 `into_raw` 放弃所有权，Dart 侧读完
+/// 后必须调 `unidrop_free_string` 归还；泄漏与否完全由这条约定保证。
 fn push_event(event: &str, payload: serde_json::Value) {
     let json = serde_json::json!({ "event": event, "payload": payload });
     let Ok(text) = CString::new(json.to_string()) else {
@@ -120,7 +150,7 @@ fn push_event(event: &str, payload: serde_json::Value) {
     };
     let guard = EVENT_SINK.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((cb, user_data)) = *guard {
-        cb(user_data, text.as_ptr());
+        cb(user_data, text.into_raw());
     } else {
         log::debug!("event dropped (no callback): {} {}", event, json.to_string());
     }
@@ -177,6 +207,8 @@ pub extern "C" fn unidrop_start(config_json: *const c_char) -> *mut c_char {
 }
 
 fn start_inner(config_json: *const c_char) -> Result<serde_json::Value, String> {
+    let _ = log::set_logger(&LOGGER);
+    log::set_max_level(log::LevelFilter::Info);
     unidrop_core::install_crypto_provider();
     let cfg = take_string(config_json)?;
     let cfg: serde_json::Value = serde_json::from_str(&cfg).map_err(|e| e.to_string())?;

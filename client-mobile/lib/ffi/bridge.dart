@@ -101,7 +101,10 @@ class NativeBridge {
   }
 
   void _onNativeEvent(int user, Pointer<Utf8> json) {
+    // 内存契约（见 native/src/lib.rs::push_event）：所有权已移交 Dart，
+    // 读完必须归还，否则每条事件泄漏一段字符串。
     final text = json.toDartString();
+    _free(json);
     try {
       final decoded = jsonDecode(text);
       if (decoded is Map<String, dynamic>) {

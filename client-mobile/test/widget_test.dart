@@ -1,9 +1,17 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:unidrop_mobile/models.dart';
 import 'package:unidrop_mobile/widgets/adaptive.dart';
 
 void main() {
+  test('lib/main.dart 必须包含 main 入口（防脚本误覆盖后静默绿）', () {
+    final src = File('lib/main.dart').readAsStringSync();
+    expect(RegExp(r'void\s+main\s*\(').hasMatch(src), isTrue,
+        reason: 'main.dart 被覆盖成空壳会让 analyze/test 照常全绿，只在构建期爆炸');
+  });
+
   group('WindowSizeClass 断点（V2 计划 §5.2 的 Pad 适配约定）', () {
     test('compact < 600', () {
       expect(sizeClass(360), WindowSizeClass.compact);
