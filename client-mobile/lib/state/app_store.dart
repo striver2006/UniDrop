@@ -191,6 +191,10 @@ class AppStore extends ChangeNotifier {
     onToast?.call(message);
   }
 
+  /// 公开的用户可见提示通道：给 sheet/页面关闭后的异步续行用
+  /// （那种场景下原 context 已失效，ScaffoldMessenger 拿不到）。
+  void notifyUser(String message) => _toast(message);
+
   void clearToast() {
     toast = null;
     notifyListeners();

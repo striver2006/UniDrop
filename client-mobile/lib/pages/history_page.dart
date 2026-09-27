@@ -156,13 +156,10 @@ class _HistoryDetail extends StatelessWidget {
               FilledButton.icon(
                 icon: const Icon(Icons.share),
                 label: const Text('分享 / 保存到…'),
-                onPressed: () async {
-                  final files = await store2.sessionFiles(entry.sessionId);
-                  if (context.mounted && files.isNotEmpty) {
-                    await store2.platform.shareFiles(files,
-                        subject: entry.previewSummary);
-                  }
-                },
+                // 先收起 bottom sheet 再拉系统分享面板：iOS 上 rootViewController
+                // 已被 sheet 占用时，再 present UIActivityViewController 会被
+                // 系统拒绝（"already presenting"），异常若被吞即「点了没反应」。
+                onPressed: () => _shareAfterSheetDismissed(context, store, entry),
               ),
               const SizedBox(height: 8),
               if (entry.dataType == 'TEXT')
@@ -173,11 +170,9 @@ class _HistoryDetail extends StatelessWidget {
                     final text = await store2.readSessionText(entry.sessionId);
                     if (text != null) {
                       await store2.platform.writeClipboardText(text);
-                      if (context.mounted) {
-                        ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text('已复制到剪贴板')),
-                        );
-                      }
+                      store.notifyUser('已复制到剪贴板');
+                    } else {
+                      store.notifyUser('文本读取失败（缓存文件可能已被清理）');
                     }
                   },
                 ),
@@ -191,5 +186,33 @@ class _HistoryDetail extends StatelessWidget {
         ),
       ),
     );
+  }
+}
+
+/// 收起详情 sheet 后再执行分享，失败一律可见。
+/// 手机端详情是 modal bottom sheet；Pad 双栏详情没有 sheet，pop 是 no-op
+/// 的风险由调用侧保证（双栏不经过此路径时 context 无 Navigator 可 pop
+/// 会抛错——用 maybePop 兜底）。
+Future<void> _shareAfterSheetDismissed(
+    BuildContext context, AppStore store, HistoryEntry entry) async {
+  Navigator.of(context).maybePop();
+  // 等 sheet 完全收起（iOS 上立刻 present 仍可能撞上过渡动画）
+  await Future<void>.delayed(const Duration(milliseconds: 350));
+
+  final List<String> files;
+  try {
+    files = await store.sessionFiles(entry.sessionId);
+  } catch (e) {
+    store.notifyUser('读取会话文件失败：$e');
+    return;
+  }
+  if (files.isEmpty) {
+    store.notifyUser('缓存文件已被清理，无法分享');
+    return;
+  }
+  try {
+    await store.platform.shareFiles(files, subject: entry.previewSummary);
+  } catch (e) {
+    store.notifyUser('分享失败：$e');
   }
 }
