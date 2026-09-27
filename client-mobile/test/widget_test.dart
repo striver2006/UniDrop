@@ -69,6 +69,23 @@ void main() {
       // 桌面字段全量回填，防止保存时抹掉未展示的设置
       expect(j.containsKey('history_max_entries'), isTrue);
       expect(j.containsKey('transfer_card_retain_secs'), isTrue);
+
+      // 移动端已暴露的存储字段必须透传用户值（曾硬编码 30/24/2048，
+      // 用户改完保存会被静默抹回默认）
+      final s2 = AppSettingsDto.fromJson({
+        ...j as Map<String, dynamic>,
+        'history_max_entries': 50,
+        'transfer_card_retain_secs': 10,
+        'cache_ttl_hours': 12,
+        'cache_max_size_mb': 512,
+        'auto_inject': true,
+      });
+      final j2 = s2.toJson();
+      expect(j2['history_max_entries'], 50);
+      expect(j2['transfer_card_retain_secs'], 10);
+      expect(j2['cache_ttl_hours'], 12);
+      expect(j2['cache_max_size_mb'], 512);
+      expect(j2['auto_inject'], isTrue);
     });
   });
 }

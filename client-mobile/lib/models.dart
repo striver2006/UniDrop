@@ -164,6 +164,8 @@ class AppSettingsDto {
     required this.tlsTrustMode,
     required this.pinnedCertSha256,
     required this.historyMaxEntries,
+    required this.transferCardRetainSecs,
+    required this.cacheTtlHours,
     required this.cacheMaxSizeMb,
   });
 
@@ -176,6 +178,8 @@ class AppSettingsDto {
   String tlsTrustMode; // public_ca | pinned | insecure
   List<String> pinnedCertSha256;
   int historyMaxEntries;
+  int transferCardRetainSecs;
+  int cacheTtlHours;
   int cacheMaxSizeMb;
 
   factory AppSettingsDto.fromJson(Map<String, dynamic> j) => AppSettingsDto(
@@ -194,6 +198,9 @@ class AppSettingsDto {
             .map((e) => e.toString())
             .toList(),
         historyMaxEntries: (j['history_max_entries'] as num?)?.toInt() ?? 100,
+        transferCardRetainSecs:
+            (j['transfer_card_retain_secs'] as num?)?.toInt() ?? 30,
+        cacheTtlHours: (j['cache_ttl_hours'] as num?)?.toInt() ?? 24,
         cacheMaxSizeMb: (j['cache_max_size_mb'] as num?)?.toInt() ?? 10240,
       );
 
@@ -208,10 +215,11 @@ class AppSettingsDto {
         'pinned_cert_sha256': pinnedCertSha256,
         // 桌面字段全量回填，防止保存时把未展示的设置抹掉：
         // AppSettings 是「整份落库」语义（见 core::settings 模块注释）。
+        // 未在移动端暴露的字段（start_minimized / sweep 间隔）给桌面默认值。
         'start_minimized': false,
         'history_max_entries': historyMaxEntries,
-        'transfer_card_retain_secs': 30,
-        'cache_ttl_hours': 24,
+        'transfer_card_retain_secs': transferCardRetainSecs,
+        'cache_ttl_hours': cacheTtlHours,
         'cache_max_size_mb': cacheMaxSizeMb,
         'cache_sweep_interval_minutes': 60,
         'legacy_allow_insecure_tls': tlsTrustMode == 'insecure',

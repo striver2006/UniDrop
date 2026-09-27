@@ -26,11 +26,16 @@ class _SettingsPageState extends State<SettingsPage> {
   late TextEditingController _account;
   late TextEditingController _psk;
   late TextEditingController _pin;
+  late TextEditingController _historyMax;
+  late TextEditingController _retainSecs;
+  late TextEditingController _cacheTtl;
+  late TextEditingController _cacheMaxMb;
 
   /// 本地编辑态：初始从持久化设置取，保存前不落库。
   late String _trustMode;
   late String _policy;
   late bool _e2ee;
+  bool _autoInject = false;
 
   bool _saving = false;
 
@@ -49,9 +54,14 @@ class _SettingsPageState extends State<SettingsPage> {
     _account = TextEditingController();
     _psk = TextEditingController();
     _pin = TextEditingController();
+    _historyMax = TextEditingController();
+    _retainSecs = TextEditingController();
+    _cacheTtl = TextEditingController();
+    _cacheMaxMb = TextEditingController();
     _trustMode = 'public_ca';
     _policy = 'always';
     _e2ee = true;
+    _autoInject = false;
     final s = context.read<AppStore>().settings;
     if (s != null) _hydrate(s);
   }
@@ -69,9 +79,14 @@ class _SettingsPageState extends State<SettingsPage> {
     _account.text = s.accountId;
     _psk.text = s.pskSecret;
     _pin.text = s.pinnedCertSha256.join('\n');
+    _historyMax.text = s.historyMaxEntries.toString();
+    _retainSecs.text = s.transferCardRetainSecs.toString();
+    _cacheTtl.text = s.cacheTtlHours.toString();
+    _cacheMaxMb.text = s.cacheMaxSizeMb.toString();
     _trustMode = s.tlsTrustMode;
     _policy = s.receivePolicy;
     _e2ee = s.e2eeEnabled;
+    _autoInject = s.autoInject;
   }
 
   @override
@@ -80,6 +95,10 @@ class _SettingsPageState extends State<SettingsPage> {
     _account.dispose();
     _psk.dispose();
     _pin.dispose();
+    _historyMax.dispose();
+    _retainSecs.dispose();
+    _cacheTtl.dispose();
+    _cacheMaxMb.dispose();
     super.dispose();
   }
 
@@ -168,8 +187,54 @@ class _SettingsPageState extends State<SettingsPage> {
             onSelectionChanged: (v) => setState(() => _policy = v.first),
           ),
           const SizedBox(height: 8),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('接收文本/图片后自动复制'),
+            subtitle: const Text('免去手动装载，收到即可直接粘贴'),
+            value: _autoInject,
+            onChanged: (v) => setState(() => _autoInject = v),
+          ),
+          const SizedBox(height: 24),
+          _Section(title: '存储与清理'),
+          TextField(
+            controller: _historyMax,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(
+              labelText: '历史保留条数（0 = 不限）',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _retainSecs,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(
+              labelText: '完成卡片保持秒数（0 = 不自动消失）',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _cacheTtl,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(
+              labelText: '收件保留小时数（0 = 不按时间清理）',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _cacheMaxMb,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(
+              labelText: '收件容量上限 MB（0 = 不限容量）',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: 8),
           Text(
-            '「仅 Wi-Fi」：蜂窝网络下大文件转确认，文本与小图片仍自动接收。',
+            '手机存储有限，建议容量 2048 MB 起步；收件目录 iOS 在「文件」App 的'
+            '瞬贴目录下可见。',
             style: theme.textTheme.bodySmall
                 ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
           ),
@@ -247,17 +312,21 @@ class _SettingsPageState extends State<SettingsPage> {
       return;
     }
 
+    int parseNum(TextEditingController c, int fallback) =>
+        int.tryParse(c.text.trim()) ?? fallback;
     final next = AppSettingsDto(
       serverUrl: _server.text.trim(),
       accountId: _account.text.trim(),
       pskSecret: _psk.text,
-      autoInject: current.autoInject,
+      autoInject: _autoInject,
       receivePolicy: _policy,
       e2eeEnabled: _e2ee,
       tlsTrustMode: _trustMode,
       pinnedCertSha256: pins,
-      historyMaxEntries: current.historyMaxEntries,
-      cacheMaxSizeMb: current.cacheMaxSizeMb,
+      historyMaxEntries: parseNum(_historyMax, current.historyMaxEntries),
+      transferCardRetainSecs: parseNum(_retainSecs, current.transferCardRetainSecs),
+      cacheTtlHours: parseNum(_cacheTtl, current.cacheTtlHours),
+      cacheMaxSizeMb: parseNum(_cacheMaxMb, current.cacheMaxSizeMb),
     );
 
     setState(() => _saving = true);
