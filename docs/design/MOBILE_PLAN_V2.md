@@ -178,7 +178,34 @@ v1 选定 **Tauri 2 Mobile**，核心论据是「复用 Rust core + 复用 React
 
 **未完成 / 待后续 Session**（沿用 v1 规划）：Android 前台服务常驻（M3）、
 iOS APNs + Share Extension（M4，需服务端 S2/S3）、断点续传（M2.5）、
-移动端系统通知前台化展示、鸿蒙平台壳生成与 DevEco 构建（需华为 Flutter SDK）、
-真机五端互操作矩阵（v1 §7.2）。
+移动端系统通知前台化展示、真机五端互操作矩阵（v1 §7.2）。
+
+### Session 2（2026-09-27 下午 · 真机实测 + 鸿蒙攻坚）
+
+**真机实测修复（Mi 10 / CZB-iPhone，全部闭环并装机）**：
+FFI 事件字符串所有权（NativeCallable 异步投递读到空串）→ 设置页指纹输入框
+与常驻保存（切 pinned 档死锁 + 键盘遮挡丢配置）→ 键盘无法收回锁死页面 →
+iOS 白屏根因（静态库符号不进动态导出表，-exported_symbols_list 显式导出）→
+Android release 三连（INTERNET 权限只在 debug manifest / Impeller Vulkan
+在 MIUI 渲染空屏回退 Skia）→ 半开死链（控制面 read 45s 空闲超时，服务端
+PONG 为锚）→ 切网重连误伤在途握手（connectivity 同型波动回调，改为类型
+真变才重连；Mi10→iPhone 图片失败即此）→ 分享面板从 sheet 内 present 被拒
+（先收 sheet 再分享）→ 设置回显时序（IndexedStack 常驻页面 vs 异步
+settings 的 hydrate）→ 历史时间 UTC 显示 + SEND 记录误报「已清理」→
+设置项补齐（存储四项 + 自动复制，toJson 透传钉了测试）→ App 图标（Mac
+同源箭头 + 移动渐变配色）→ iOS 签名改个人 team B8QGM665TS（k_bo@163.com）。
+
+**实测确认可用**：Android 全链路（认证/设备发现/收发/历史/自动注入剪贴板）；
+iOS 认证与接收（用户实测收图）；Mac↔Android 双向传输（服务端日志留痕）。
+
+**鸿蒙攻坚（部分落地）**：华为 Flutter 生态唯一工具链完整的基座是
+3.7.12/Dart 2.19（3.22 分支无 ohos 工具）。已落地：Rust ohos .so release
+编译链（build_native_ohos.sh）、Dart 层 2.19 兼容化（官方 3.44 回归全绿）、
+pubspec.ohos.yaml 依赖变体（openharmony-sig 插件 fork + connectivity
+4.x/6.x 运行时 shim）、ohos 工程壳 + prepare_ohos_plugin_wrappers.sh、
+flutter_tools 两处 patch（模块级 profile 容错 + 扁平布局模块名 '.'）。
+卡点：flutter build hap 的插件 har 生成链穿透七层生态断层后止步于
+pnpm×华为源运行时 bug（ERR_INVALID_THIS）；恢复路径：等 3.22+ ohos 分支
+工具链成熟，或用 DevEco GUI 打开 ohos/ 工程做 hvigor 迁移构建。
 
 ---
