@@ -611,4 +611,81 @@ mod tests {
         assert_eq!(patched.account_id, "mobile-user");
         assert_eq!(patched.server_url, base.server_url, "未覆盖字段必须保留");
     }
+
+    /// 启动链冒烟：Dart bootstrap 的挂起排查用。
+    /// 复现 unidrop_start → unidrop_invoke(get_devices/get_settings) →
+    /// 轮询事件拿 invoke-result 的完整链路；任何环节挂起/超时都会在这里暴露。
+    /// 单独二进制跑（RUNTIME 是 OnceLock，进程内只能 start 一次）：
+    /// `cargo test -p unidrop-mobile-native bootstrap_smoke -- --nocapture --test-threads=1`
+    #[test]
+    fn bootstrap_smoke_start_invoke_poll() {
+        let dir = std::env::temp_dir().join("unidrop-bootstrap-smoke");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = format!(
+            "{{\"db_path\":\"{}/db.sqlite\",\"cache_dir\":\"{}/cache\",\"device_name\":\"smoke\"}}",
+            dir.display(),
+            dir.display()
+        );
+
+        // 1. start（10 秒上限：Dart 侧是同步 FFI 调用，挂这里 UI 就白屏/转圈）
+        let cfg_c = CString::new(cfg).unwrap();
+        let resp = unsafe {
+            let ptr = unidrop_start(cfg_c.as_ptr());
+            assert!(!ptr.is_null());
+            let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+            unidrop_free_string(ptr);
+            s
+        };
+        eprintln!("[smoke] start: {}", &resp[..resp.len().min(300)]);
+        assert!(resp.contains("\"ok\":true"), "start 失败: {resp}");
+
+        // 2. 依次 invoke get_devices / get_settings，轮询等 invoke-result
+        for cmd in ["get_devices", "get_settings"] {
+            let cmd_c = CString::new(format!("{{\"cmd\":\"{cmd}\"}}")).unwrap();
+            let resp = unsafe {
+                let ptr = unidrop_invoke(cmd_c.as_ptr());
+                assert!(!ptr.is_null());
+                let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+                unidrop_free_string(ptr);
+                s
+            };
+            eprintln!("[smoke] {cmd} enqueue: {}", &resp[..resp.len().min(200)]);
+            assert!(resp.contains("\"ok\":true"), "{cmd} 入队失败: {resp}");
+            let call_id: String = serde_json::from_str::<serde_json::Value>(&resp)
+                .unwrap()["call_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut got: Option<String> = None;
+            while std::time::Instant::now() < deadline {
+                while let Some(ev) = poll_event_owned() {
+                    if ev.contains(&call_id) {
+                        got = Some(ev);
+                    }
+                }
+                if got.is_some() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let got = got.unwrap_or_else(|| panic!("{cmd} 10 秒内无 invoke-result——链路挂起"));
+            eprintln!("[smoke] {cmd} result: {}", &got[..got.len().min(400)]);
+            assert!(got.contains("\"ok\":true"), "{cmd} 执行失败: {got}");
+        }
+    }
+
+    fn poll_event_owned() -> Option<String> {
+        unsafe {
+            let ptr = unidrop_poll_event();
+            if ptr.is_null() {
+                return None;
+            }
+            let s = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+            unidrop_free_string(ptr);
+            Some(s)
+        }
+    }
 }

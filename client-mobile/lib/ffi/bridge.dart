@@ -49,15 +49,18 @@ class NativeBridge {
     if (Platform.isIOS || Platform.isMacOS) {
       // 静态链接进 App 二进制，从自身进程符号表找。
       _lib = DynamicLibrary.process();
-    } else if (Platform.isAndroid) {
-      // Android：打包产物里的动态库（classloader namespace 含应用 libs 目录）。
-      _lib = DynamicLibrary.open('libunidrop_mobile.so');
-    } else {
-      // 鸿蒙：dlopen 的搜索路径不含应用 libs 目录（与 Android 的
-      // namespace 机制不同），裸文件名必失败；nativeLibraryPath 固定为
-      // libs/arm64，挂在 el2/base 下，用安装后的绝对路径打开。
+      return _lib!;
+    }
+    // Android 与鸿蒙共用此分支：华为 Flutter 分支的 operatingSystem 在
+    // 鸿蒙上伪装成 android，无法用 Platform 区分两端，只能按「先试谁」
+    // 区分——鸿蒙的 dlopen 搜索路径不含应用 libs 目录（无 classloader
+    // namespace 机制），裸文件名必失败，必须用安装后的绝对路径；Android
+    // 上该绝对路径不存在，回落裸名由 namespace 解析。
+    try {
       _lib = DynamicLibrary.open(
           '/data/storage/el2/base/libs/arm64/libunidrop_mobile.so');
+    } on ArgumentError {
+      _lib = DynamicLibrary.open('libunidrop_mobile.so');
     }
     return _lib!;
   }
