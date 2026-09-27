@@ -24,12 +24,18 @@ export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER="$OHOS_LLVM/aarch64-unknow
 echo "==> cargo build aarch64-unknown-linux-ohos ($PROFILE_DIR)"
 (cd .. && cargo build -p unidrop-mobile-native --target aarch64-unknown-linux-ohos ${PROFILE_FLAG})
 
-# ohos 工程的 libs 目录（flutter create --platforms ohos 生成后存在）
-DEST="ohos/libs/arm64-v8a"
-if [[ ! -d ohos ]]; then
+# hvigor 只打包 entry 模块内的 libs（so 放 ohos/libs 不会进 HAP，装到真机
+# 后以「启动失败：dynamic library not found」形式暴露），两处都放以兼顾
+# flutter 工具链与 DevEco 直配两条构建路径。
+if [[ -d ohos ]]; then
+  DEST="ohos/entry/libs/arm64-v8a"
+  ALT="ohos/libs/arm64-v8a"
+else
   echo "ohos/ 工程尚未生成（见 README 鸿蒙章节），先拷到暂存目录"
   DEST="build/ohos-libs/arm64-v8a"
+  ALT=""
 fi
 mkdir -p "$DEST"
 cp "../target/aarch64-unknown-linux-ohos/$PROFILE_DIR/libunidrop_mobile.so" "$DEST/"
+if [[ -n "$ALT" ]]; then mkdir -p "$ALT"; cp "../target/aarch64-unknown-linux-ohos/$PROFILE_DIR/libunidrop_mobile.so" "$ALT/"; fi
 echo "==> $DEST/libunidrop_mobile.so"

@@ -53,6 +53,13 @@ impl log::Log for StderrLogger {
     fn log(&self, record: &log::Record) {
         if self.enabled(record.metadata()) {
             eprintln!("[unidrop {}] {}", record.level(), record.args());
+            // 排障双写：ohos 的 stderr 不进 hilog，落到文件由 hdc 拉取。
+            if let Some(path) = DEBUG_LOG_PATH.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(f, "[{}] {}", record.level(), record.args());
+                }
+            }
         }
     }
 
@@ -60,6 +67,9 @@ impl log::Log for StderrLogger {
 }
 
 static LOGGER: StderrLogger = StderrLogger;
+
+/// 排障日志文件路径（start 时指向 cache_dir 下的 unidrop-debug.log）。
+static DEBUG_LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 #[cfg(target_os = "android")]
 fn install_logger() {
@@ -254,6 +264,12 @@ fn start_inner(config_json: *const c_char) -> Result<serde_json::Value, String> 
     let cfg = take_string(config_json)?;
     let cfg: serde_json::Value = serde_json::from_str(&cfg).map_err(|e| e.to_string())?;
 
+    // 排障日志双写的落点（见 StderrLogger 注释）。
+    if let Some(dir) = cfg.get("cache_dir").and_then(|v| v.as_str()) {
+        *DEBUG_LOG_PATH.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(PathBuf::from(dir).join("unidrop-debug.log"));
+    }
+
     let db_path: String = cfg
         .get("db_path")
         .and_then(|v| v.as_str())
@@ -324,7 +340,13 @@ fn start_inner(config_json: *const c_char) -> Result<serde_json::Value, String> 
             device_id: device_id.clone(),
             psk_secret: initial_settings.psk_secret.clone(),
             hostname: device_name.clone(),
-            os_type: std::env::consts::OS.to_string(),
+            // aarch64-unknown-linux-ohos 上 consts::OS 报 "linux"，服务端
+            // roster 与统计需要真实平台标识。
+            os_type: if cfg!(target_os = "ohos") {
+                "ohos".to_string()
+            } else {
+                std::env::consts::OS.to_string()
+            },
             app_version: unidrop_core::app_state::APP_VERSION.to_string(),
             tls_trust,
         };
@@ -489,6 +511,7 @@ async fn dispatch(
         "send_text" => {
             let target = args.get("target_device").and_then(|v| v.as_str()).ok_or("缺少 target_device")?.to_string();
             let text = args.get("text").and_then(|v| v.as_str()).ok_or("缺少 text")?.to_string();
+            log::info!("send_text command: target={} len={}", target, text.len());
             let sid = unidrop_core::send_flow::send_bytes_flow(
                 state, &JsonBridge, target, "TEXT", "clipboard.txt", text.into_bytes(),
             )

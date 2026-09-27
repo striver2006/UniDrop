@@ -156,6 +156,7 @@ async fn dispatch_offer(
     }
 
     state.outgoing_tx.send(offer_env).await.map_err(|e| e.to_string())?;
+    log::info!("dispatch_offer: session {} to {} enqueued to actor", session_id, target_device);
 
     {
         // 账号在这里取而不是更早：settings 锁与 db_conn 锁不要交叠持有。

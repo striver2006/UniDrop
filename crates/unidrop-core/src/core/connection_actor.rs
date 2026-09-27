@@ -244,9 +244,13 @@ impl ConnectionActor {
                                         continue;
                                     }
                                 };
-                                if let Err(e) = write.send(Message::Text(text)).await {
-                                    log::warn!("failed to send outgoing message to server: {}", e);
-                                    break;
+                                log::info!("actor sending outgoing envelope ({} bytes)", text.len());
+                                match write.send(Message::Text(text)).await {
+                                    Ok(()) => log::info!("actor outgoing envelope written to ws"),
+                                    Err(e) => {
+                                        log::warn!("failed to send outgoing message to server: {}", e);
+                                        break;
+                                    }
                                 }
                             }
 

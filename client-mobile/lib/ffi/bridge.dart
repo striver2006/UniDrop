@@ -49,9 +49,15 @@ class NativeBridge {
     if (Platform.isIOS || Platform.isMacOS) {
       // 静态链接进 App 二进制，从自身进程符号表找。
       _lib = DynamicLibrary.process();
-    } else {
-      // Android / 鸿蒙：打包产物里的动态库。
+    } else if (Platform.isAndroid) {
+      // Android：打包产物里的动态库（classloader namespace 含应用 libs 目录）。
       _lib = DynamicLibrary.open('libunidrop_mobile.so');
+    } else {
+      // 鸿蒙：dlopen 的搜索路径不含应用 libs 目录（与 Android 的
+      // namespace 机制不同），裸文件名必失败；nativeLibraryPath 固定为
+      // libs/arm64，挂在 el2/base 下，用安装后的绝对路径打开。
+      _lib = DynamicLibrary.open(
+          '/data/storage/el2/base/libs/arm64/libunidrop_mobile.so');
     }
     return _lib!;
   }

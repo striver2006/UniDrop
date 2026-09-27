@@ -1,6 +1,20 @@
 {
   "app": {
-    "signingConfigs": [],
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "/Users/chenzhenbo/.ohos/config/default_ohos_6RG-ZRtSL31zz_eHxSgpclmYQYuH0maDWs9UnFnDqKA=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001BE445AA5DF24E8B2421FF46E550FE026072BA9906C9E943BC947FE31ED884A5611C668BD9D0FD39",
+          "profile": "/Users/chenzhenbo/.ohos/config/default_ohos_6RG-ZRtSL31zz_eHxSgpclmYQYuH0maDWs9UnFnDqKA=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "/Users/chenzhenbo/.ohos/config/default_ohos_6RG-ZRtSL31zz_eHxSgpclmYQYuH0maDWs9UnFnDqKA=.p12",
+          "storePassword": "0000001B5ECD67809FBCAA2D6744CFD081008C5E4A7443167E171A9BB311D236B4B338DC71B3E8EBD75872"
+        }
+      }
+    ],
     "products": [
       {
         "name": "default",
