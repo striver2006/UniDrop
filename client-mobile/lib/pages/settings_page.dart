@@ -1,4 +1,10 @@
 /// 设置页：服务器 / 账号 / 密钥 / 接收策略 / E2EE / TLS 信任 / 限额只读展示。
+///
+/// 表单语义：所有可编辑字段（含档位类开关）只改**本地编辑态**，
+/// 由 AppBar 右上角的「保存」统一提交——AppSettings 是整份落库的
+/// read-modify-write 模型，散点即时保存会把用户改到一半的字段一起
+/// 带出去；此前「切 pinned 档立即保存」更是死锁：空指纹被 core 拒绝，
+/// 设置回不去，指纹输入框（条件渲染）永远不出现。
 
 library;
 
@@ -21,6 +27,13 @@ class _SettingsPageState extends State<SettingsPage> {
   late TextEditingController _psk;
   late TextEditingController _pin;
 
+  /// 本地编辑态：初始从持久化设置取，保存前不落库。
+  late String _trustMode;
+  late String _policy;
+  late bool _e2ee;
+
+  bool _saving = false;
+
   @override
   void initState() {
     super.initState();
@@ -30,6 +43,9 @@ class _SettingsPageState extends State<SettingsPage> {
     _psk = TextEditingController(text: s?.pskSecret ?? '');
     _pin = TextEditingController(
         text: (s?.pinnedCertSha256 ?? const []).join('\n'));
+    _trustMode = s?.tlsTrustMode ?? 'public_ca';
+    _policy = s?.receivePolicy ?? 'always';
+    _e2ee = s?.e2eeEnabled ?? true;
   }
 
   @override
@@ -55,13 +71,31 @@ class _SettingsPageState extends State<SettingsPage> {
     }
 
     return Scaffold(
-      appBar: AppBar(title: const Text('设置')),
+      appBar: AppBar(
+        title: const Text('设置'),
+        // 保存入口放在 AppBar：键盘弹出时表单底部的按钮会被顶出视口，
+        // 用户「填完没处点」正是上一版丢配置的原因。
+        actions: [
+          TextButton(
+            onPressed: _saving ? null : () => _save(store, s),
+            child: _saving
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Text('保存'),
+          ),
+        ],
+      ),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
           _Section(title: '服务器'),
           TextField(
             controller: _server,
+            autocorrect: false,
+            enableSuggestions: false,
             decoration: const InputDecoration(
               labelText: '服务器地址',
               hintText: 'wss://drop.yourdomain.com:58921',
@@ -71,6 +105,8 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 12),
           TextField(
             controller: _account,
+            autocorrect: false,
+            enableSuggestions: false,
             decoration: const InputDecoration(
               labelText: '账号标识',
               helperText: '1-64 位字母、数字与 . _ @ -',
@@ -81,19 +117,19 @@ class _SettingsPageState extends State<SettingsPage> {
           TextField(
             controller: _psk,
             obscureText: true,
+            autocorrect: false,
+            enableSuggestions: false,
             decoration: const InputDecoration(
               labelText: '共享密钥（PSK）',
               border: OutlineInputBorder(),
             ),
           ),
-          const SizedBox(height: 16),
-          // 常驻保存：文本字段没有失焦即存的语义（AppSettings 是整份落库），
-          // 必须给显式提交入口——此前只有 pinned 档有按钮，其他档输完没法保存。
-          FilledButton(
-            onPressed: () => _saveWith(store, s),
+          const SizedBox(height: 8),
+          FilledButton.tonal(
+            onPressed: _saving ? null : () => _save(store, s),
             child: const Text('保存并重连'),
           ),
-          const SizedBox(height: 8),
+          const SizedBox(height: 16),
           _Section(title: '接收策略'),
           SegmentedButton<String>(
             segments: const [
@@ -101,8 +137,8 @@ class _SettingsPageState extends State<SettingsPage> {
               ButtonSegment(value: 'wifi_only', label: Text('仅 Wi-Fi')),
               ButtonSegment(value: 'ask', label: Text('每次询问')),
             ],
-            selected: {s.receivePolicy},
-            onSelectionChanged: (v) => _saveWith(store, s, receivePolicy: v.first),
+            selected: {_policy},
+            onSelectionChanged: (v) => setState(() => _policy = v.first),
           ),
           const SizedBox(height: 8),
           Text(
@@ -116,12 +152,12 @@ class _SettingsPageState extends State<SettingsPage> {
             contentPadding: EdgeInsets.zero,
             title: const Text('端到端加密（E2EE）'),
             subtitle: const Text('对端不支持时自动回落明文并提示'),
-            value: s.e2eeEnabled,
-            onChanged: (v) => _saveWith(store, s, e2eeEnabled: v),
+            value: _e2ee,
+            onChanged: (v) => setState(() => _e2ee = v),
           ),
           const SizedBox(height: 8),
           DropdownButtonFormField<String>(
-            initialValue: s.tlsTrustMode,
+            value: _trustMode,
             decoration: const InputDecoration(
               labelText: 'TLS 信任策略',
               border: OutlineInputBorder(),
@@ -131,19 +167,23 @@ class _SettingsPageState extends State<SettingsPage> {
               DropdownMenuItem(value: 'pinned', child: Text('仅信任指定证书指纹')),
               DropdownMenuItem(value: 'insecure', child: Text('跳过证书校验（不安全）')),
             ],
+            // 只改本地态：选 pinned 立即出指纹输入框，校验留给「保存」。
             onChanged: (v) {
-              if (v != null) _saveWith(store, s, tlsTrustMode: v);
+              if (v != null) setState(() => _trustMode = v);
             },
           ),
           // Pinned 档必填：空指纹会被 core 拒绝（等于没有任何信任来源）。
           // 一行一条，支持直接粘 openssl 输出（core 侧解析时容错冒号与前后缀）。
-          if (s.tlsTrustMode == 'pinned') ...[
+          if (_trustMode == 'pinned') ...[
             const SizedBox(height: 12),
             TextField(
               controller: _pin,
               maxLines: 3,
+              autocorrect: false,
+              enableSuggestions: false,
               decoration: const InputDecoration(
                 labelText: '证书 SHA-256 指纹（每行一条）',
+                hintText: '68e1d200…',
                 border: OutlineInputBorder(),
               ),
             ),
@@ -168,41 +208,47 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  void _saveWith(
-    AppStore store,
-    AppSettingsDto current, {
-    String? receivePolicy,
-    bool? e2eeEnabled,
-    String? tlsTrustMode,
-  }) {
+  Future<void> _save(AppStore store, AppSettingsDto current) async {
     final pins = _pin.text
         .split(RegExp(r'[\n,;]'))
         .map((l) => l.trim())
         .where((l) => l.isNotEmpty)
         .toList();
+
+    if (_trustMode == 'pinned' && pins.isEmpty) {
+      _toast('请填写证书指纹：Pinned 档没有指纹等于不信任任何证书');
+      return;
+    }
+
     final next = AppSettingsDto(
       serverUrl: _server.text.trim(),
       accountId: _account.text.trim(),
       pskSecret: _psk.text,
       autoInject: current.autoInject,
-      receivePolicy: receivePolicy ?? current.receivePolicy,
-      e2eeEnabled: e2eeEnabled ?? current.e2eeEnabled,
-      tlsTrustMode: tlsTrustMode ?? current.tlsTrustMode,
-      pinnedCertSha256: pins.isEmpty ? current.pinnedCertSha256 : pins,
+      receivePolicy: _policy,
+      e2eeEnabled: _e2ee,
+      tlsTrustMode: _trustMode,
+      pinnedCertSha256: pins,
       historyMaxEntries: current.historyMaxEntries,
       cacheMaxSizeMb: current.cacheMaxSizeMb,
     );
-    store.saveSettings(next).then((_) {
-      if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(const SnackBar(content: Text('已保存并重连')));
-      }
-    }).catchError((Object e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('保存失败：$e')));
-      }
-    });
+
+    setState(() => _saving = true);
+    try {
+      await store.saveSettings(next);
+      _toast('已保存，正在重连');
+    } catch (e) {
+      _toast('保存失败：$e');
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  void _toast(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
   }
 }
 
