@@ -22,6 +22,20 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^5.0.0
+  flutter_launcher_icons: ^0.14.1
+
+# 移动端图标：与 Mac 端同源（client/src-tauri/icons/icon.png 的双向传输箭头），
+# 配色升级为移动图标风格（靛蓝→青渐变 + 白色箭头，与 App 主题色一致）。
+# 重新生成：dart run flutter_launcher_icons
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: assets/icon/icon_1024.png
+  adaptive_icon_background: assets/icon/adaptive_background.png
+  adaptive_icon_foreground: assets/icon/adaptive_foreground.png
+  remove_alpha_ios: true
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/icon/
