@@ -1,0 +1,88 @@
+name: Mobile CI
+
+# 移动端（iOS / Android / 鸿蒙）的静态验证：
+# - unidrop-core + FFI 层的四个交叉编译 target cargo check（防桌面 cfg 漏改
+#   把移动端编译弄挂——PR 阶段暴露比发版阶段暴露便宜得多）
+# - Flutter analyze + test（Dart 层）
+# 真机 / 模拟器构建与签名走本地脚本（scripts/build_native_*.sh）与后续的
+# 发版 workflow，这里只做每 PR 必须绿的闸门。
+on:
+  push:
+    branches: [ "main", "master" ]
+    paths:
+      - "crates/**"
+      - "client-mobile/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/mobile-ci.yml"
+  pull_request:
+    branches: [ "main", "master" ]
+    paths:
+      - "crates/**"
+      - "client-mobile/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+jobs:
+  cross-check:
+    name: Cross-compile Check (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-linux-android
+          - x86_64-linux-android
+          - aarch64-apple-ios
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          targets: ${{ matrix.target }}
+
+      # iOS target 在 Linux 上无链接器可用，check-only 不触发链接，
+      # 但 clang/cc 的探测需要占位环境；Android 用 NDK 工具链。
+      - name: Setup Android NDK (Android targets)
+        if: endsWith(matrix.target, 'linux-android')
+        run: |
+          ANDROID_ROOT=/usr/local/lib/android/sdk
+          NDK=$ANDROID_ROOT/ndk-bundle
+          echo "ANDROID_NDK_HOME=$NDK" >> $GITHUB_ENV
+
+      - name: cargo check
+        run: cargo check -p unidrop-mobile-native --target ${{ matrix.target }}
+        env:
+          CC_aarch64_linux_android: ${{ endsWith(matrix.target, 'linux-android') && format('{0}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang', env.ANDROID_NDK_HOME) || '' }}
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ endsWith(matrix.target, 'linux-android') && format('{0}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang', env.ANDROID_NDK_HOME) || '' }}
+
+  # 鸿蒙 target（aarch64-unknown-linux-ohos）需要 DevEco 的 OHOS llvm（tier-3），
+  # GitHub runner 上没有官方渠道；放到 self-hosted 或本机跑：
+  #   scripts/check_ohos.sh
+  # 这里保留 host 单测作为核心逻辑的兜底闸门。
+
+  core-tests:
+    name: Core & FFI Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo test -p unidrop-core -p unidrop-mobile-native
+
+  flutter:
+    name: Flutter Analyze & Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: client-mobile
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - run: flutter pub get
+      - run: flutter analyze
+      - run: flutter test

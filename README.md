@@ -10,6 +10,7 @@
   <a href="https://go.dev/"><img src="https://img.shields.io/badge/go-1.22+-00ADD8.svg" alt="Go Version"></a>
   <a href="https://tauri.app/"><img src="https://img.shields.io/badge/tauri-2.0-FFC131.svg" alt="Tauri"></a>
   <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.78+-orange.svg" alt="Rust Version"></a>
+  <a href="https://flutter.dev/"><img src="https://img.shields.io/badge/flutter-移动端-02569B.svg" alt="Flutter"></a>
 </p>
 
 ---
@@ -17,6 +18,10 @@
 ## 🌟 核心特性 (Features)
 
 * **原生剪贴板无感装载**：突破传统文件传输工具必须“打开特定目录再复制”的割裂体验，远端文件传输就绪后直接注入宿主机原生系统剪贴板（Windows `CF_HDROP` / macOS `fileURL` / Linux `text/uri-list`），在任意目录直接 `Ctrl+V` / `Cmd+V` 落地！
+* **三端移动客户端**：iOS / Android / 鸿蒙（HarmonyOS NEXT）一套 Flutter 代码，
+  手机与 Pad 自适应布局（compact / medium / expanded 断点，Pad 双栏）。
+  与桌面端共享同一份 Rust 核心（`crates/unidrop-core`：协议 / ARQ / E2EE / TLS / 存储），
+  线协议零漂移；移动端默认「仅 Wi-Fi 自动接收」，蜂窝网络下大文件转确认。
 * **双通道可靠架构**：
   * **控制面（Control Plane）**：基于 WSS 长连接实现心跳保活、设备在线表同步与传输邀约协商。
   * **数据面（Data Plane）**：基于单次传输授权令牌（Data Plane Auth Token）的中继安全管道，支持 64 字节定长帧头、4MB 流水线滑动窗口（Window Size=4）、动态 RTO 与选择性重传（ACK / NACK）。
@@ -85,6 +90,12 @@
 │   ├── src-tauri/                  # Rust 原生后台守护核心
 │   │   ├── src/core/               # PathGuard 路径安全、滑动窗口、传输引擎、缓存管理
 │   │   ├── src/platform/           # Win32 / macOS / Linux 底层剪贴板注入与监听
+│   ├── client-mobile/              # 移动端（iOS / Android / 鸿蒙，Flutter）
+│   │   ├── lib/                    # Dart UI + FFI 桥（手机/Pad 自适应）
+│   │   └── native/                 # Rust FFI 层（C ABI：JSON 命令 + 事件回调）
+│   ├── crates/
+│   │   └── unidrop-core/           # 平台无关核心：协议/ARQ/E2EE/TLS/存储/信令路由
+│   │                               # （桌面 Tauri 壳与移动 Flutter 壳共享）
 │   │   ├── src/protocol/           # 跨平台协议对齐定义
 │   │   └── src/storage/            # SQLite 本地任务、位图、设置与长期设备 ID 持久化
 │   └── src/                        # 前端轻量面板 (React 18 + Vite + Tailwind)

@@ -145,6 +145,40 @@ v1 选定 **Tauri 2 Mobile**，核心论据是「复用 Rust core + 复用 React
 
 ## 7. 执行记录
 
-（随实施更新）
+### Session 1（2026-09-27，本计划当日落地）
+
+| # | 交付 | 状态 | 证据 |
+| :--- | :--- | :--- | :--- |
+| E1 | Cargo workspace + `crates/unidrop-core` 抽取（git mv 保历史；HostBridge 抽象；信令路由 / 发送流程 / 设置保存下沉；receive_policy 三档） | ✅ | commit `5acbfa2`；`cargo test --workspace` 151(core)+14(desktop) 全绿 |
+| E2 | `client-mobile/native` FFI crate（JSON 命令 + 事件回调 + 移动默认 wifi_only） | ✅ | commit `d7aba41`；四 target `cargo check` 通过：android(aarch64/x86_64)、ios(设备/模拟器)、**ohos(aarch64，DevEco llvm)** |
+| E3 | Flutter 工程（四页签 + 自适应壳 + FFI 桥 + 平台服务 + 构建脚本） | ✅ | commit `d8f41c8`；`flutter analyze` 零问题、6 Dart 测试通过 |
+| E4 | Android / iOS 构建闭环 | ✅ | `app-debug.apk` 含双 ABI `.so`；iOS 真机 no-codesign 构建通过，`Runner.debug.dylib` 含 7603 个 Rust 符号（force_load） |
+| E5 | 接收策略落地 | ✅ | `signal_router.rs` 三档判定 + Ask 超时看门狗 + 蜂窝阈值守卫测试 |
+| E6 | 文档（本计划 + client-mobile/README + 根 README 平台矩阵） | ✅ | — |
+
+**执行中的既有缺口修复**：v1 §1.3-A（无条件自动接受）已由 receive_policy 落地关闭；
+§1.3-B（`CLIPBOARD_INJECTED` 回执）与 §1.3-C（断点续传）仍按 v1 排期（后续 Session）。
+
+**执行中发现并绕过的坑**（留给后续维护者）：
+
+1. iOS 静态库必须 `-force_load`：FFI 符号经 `DynamicLibrary.process()` 运行时查找，
+   没有静态引用，普通链接会被 dead-strip 整库丢弃（症状：构建成功但运行时
+   `Failed to lookup symbol`）。
+2. Flutter 3.44 默认 Swift Package Manager：自定义 Podfile 反而破坏构建
+   （「non-standard Podfile」迁移报错）；本地静态库改走 xcconfig 直链
+   （`OTHER_LDFLAGS[sdk=…]`，真机/模拟器目录分开——同为 arm64 无法 lipo 合并）。
+3. pbxproj 残留的 CocoaPods phase（Check Pods Manifest.lock / Pods_Runner 链接）
+   在去 Podfile 化后必须清掉，否则 xcodebuild 报 sandbox not in sync。
+4. **Xcode 27 + Flutter 3.44.6 的模拟器构建存在环境级 bug**（Flutter.framework
+   debug 产物架构校验失败，空白工程同挂）——与本项目无关，真机构建不受影响，
+   Flutter 升级后自愈。
+5. `file_picker` 8.1 与 compileSdk 36 的新 Gradle 插件冲突（AAR metadata 校验），
+   升至 10.x 解决；`share_plus` 11 恢复 `SharePlus.instance.share` API。
+6. Xcode 27 最低 deployment target 为 15.0（模板的 13.0 需上调）。
+
+**未完成 / 待后续 Session**（沿用 v1 规划）：Android 前台服务常驻（M3）、
+iOS APNs + Share Extension（M4，需服务端 S2/S3）、断点续传（M2.5）、
+移动端系统通知前台化展示、鸿蒙平台壳生成与 DevEco 构建（需华为 Flutter SDK）、
+真机五端互操作矩阵（v1 §7.2）。
 
 ---

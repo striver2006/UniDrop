@@ -5,11 +5,17 @@ on:
     branches: [ "main", "master" ]
     paths:
       - "client/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/client-ci.yml"
   pull_request:
     branches: [ "main", "master" ]
     paths:
       - "client/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
 
 jobs:
   build-frontend:
@@ -57,10 +63,10 @@ jobs:
       - name: Setup Rust Toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
 
+      # workspace 化后产物目录移到仓库根 target/；这里跑全部成员
+      # （桌面壳 + unidrop-core + mobile FFI 的单测）。
       - name: Check Rust Code
-        working-directory: client/src-tauri
-        run: cargo check
+        run: cargo check --workspace
 
       - name: Run Rust Tests
-        working-directory: client/src-tauri
-        run: cargo test
+        run: cargo test --workspace
