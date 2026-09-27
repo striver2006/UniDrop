@@ -73,7 +73,7 @@ void main() {
       // 移动端已暴露的存储字段必须透传用户值（曾硬编码 30/24/2048，
       // 用户改完保存会被静默抹回默认）
       final s2 = AppSettingsDto.fromJson({
-        ...j as Map<String, dynamic>,
+        ...j,
         'history_max_entries': 50,
         'transfer_card_retain_secs': 10,
         'cache_ttl_hours': 12,

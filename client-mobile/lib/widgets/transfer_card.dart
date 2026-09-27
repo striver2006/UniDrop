@@ -13,16 +13,21 @@ class TransferCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final t = transfer;
-    final color = switch (t.status) {
-      'COMPLETED' => Colors.green,
-      'FAILED' => theme.colorScheme.error,
-      _ => theme.colorScheme.primary,
-    };
-    final statusLabel = switch (t.status) {
-      'COMPLETED' => '已完成',
-      'FAILED' => '失败',
-      _ => t.isReceive ? '接收中' : '发送中',
-    };
+    final Color color;
+    final String statusLabel;
+    switch (t.status) {
+      case 'COMPLETED':
+        color = Colors.green;
+        statusLabel = '已完成';
+        break;
+      case 'FAILED':
+        color = theme.colorScheme.error;
+        statusLabel = '失败';
+        break;
+      default:
+        color = theme.colorScheme.primary;
+        statusLabel = t.isReceive ? '接收中' : '发送中';
+    }
 
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),

@@ -28,15 +28,25 @@ class OnlineDevice {
       );
 
   /// 平台图标语义：桌面三平台 + 三移动端。
-  String get platformLabel => switch (osType) {
-        'macos' => 'macOS',
-        'windows' => 'Windows',
-        'linux' => 'Linux',
-        'ios' => 'iPhone/iPad',
-        'android' => 'Android',
-        'ohos' => '鸿蒙',
-        _ => osType,
-      };
+  // switch 表达式是 Dart 3 语法——鸿蒙 Flutter 基座是 3.7/Dart 2.19，
+  // 全 lib/ 保持 2.19 兼容（官方 3.44 同样合法），三端一套代码。
+  String get platformLabel {
+    switch (osType) {
+      case 'macos':
+        return 'macOS';
+      case 'windows':
+        return 'Windows';
+      case 'linux':
+        return 'Linux';
+      case 'ios':
+        return 'iPhone/iPad';
+      case 'android':
+        return 'Android';
+      case 'ohos':
+        return '鸿蒙';
+    }
+    return osType;
+  }
 
   bool get isMobile => osType == 'ios' || osType == 'android' || osType == 'ohos';
 }
@@ -189,11 +199,7 @@ class AppSettingsDto {
         autoInject: j['auto_inject'] as bool? ?? false,
         receivePolicy: (j['receive_policy'] as String?) ?? 'always',
         e2eeEnabled: j['e2ee_enabled'] as bool? ?? true,
-        tlsTrustMode: switch (j['tls_trust_mode']) {
-          'pinned' => 'pinned',
-          'insecure' => 'insecure',
-          _ => 'public_ca',
-        },
+        tlsTrustMode: _trustModeOf(j['tls_trust_mode']),
         pinnedCertSha256: (j['pinned_cert_sha256'] as List<dynamic>? ?? [])
             .map((e) => e.toString())
             .toList(),
@@ -255,6 +261,12 @@ class ConfirmRequest {
         totalItems: (j['total_items'] as num?)?.toInt() ?? 0,
         timeoutSecs: (j['timeout_secs'] as num?)?.toInt() ?? 30,
       );
+}
+
+String _trustModeOf(dynamic v) {
+  if (v == 'pinned') return 'pinned';
+  if (v == 'insecure') return 'insecure';
+  return 'public_ca';
 }
 
 String humanBytes(num n) {

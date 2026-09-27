@@ -44,6 +44,22 @@ class DevicesPage extends StatelessWidget {
 class _EmptyDevices extends StatelessWidget {
   const _EmptyDevices();
 
+  // Dart 2.19 兼容（鸿蒙 3.7 基座）：switch 表达式降级为 if 链
+  Widget _connectionStateText(
+      String state, String? error, ThemeData theme) {
+    switch (state) {
+      case 'connecting':
+        return const Text('正在连接服务器…');
+      case 'auth_failed':
+        return const Text('鉴权失败：请检查设置中的账号与密钥');
+      case 'cert_failed':
+        return const Text('证书校验失败：请检查 TLS 信任配置');
+      case 'start_failed':
+        return Text('启动失败：${error ?? ''}');
+    }
+    return const Text('暂无其他设备在线');
+  }
+
   @override
   Widget build(BuildContext context) {
     final store = context.watch<AppStore>();
@@ -55,13 +71,7 @@ class _EmptyDevices extends StatelessWidget {
           Icon(Icons.devices_other,
               size: 56, color: theme.colorScheme.onSurfaceVariant),
           const SizedBox(height: 12),
-          switch (store.connectionState) {
-            'connecting' => const Text('正在连接服务器…'),
-            'auth_failed' => const Text('鉴权失败：请检查设置中的账号与密钥'),
-            'cert_failed' => const Text('证书校验失败：请检查 TLS 信任配置'),
-            'start_failed' => Text('启动失败：${store.connectionError ?? ''}'),
-            _ => const Text('暂无其他设备在线'),
-          },
+          _connectionStateText(store.connectionState, store.connectionError, theme),
         ],
       ),
     );
@@ -100,15 +110,29 @@ class _DeviceTile extends StatelessWidget {
   }
 
   Widget _platformIcon(OnlineDevice d) {
-    final icon = switch (d.osType) {
-      'macos' => Icons.laptop_mac,
-      'windows' => Icons.laptop_windows,
-      'linux' => Icons.terminal,
-      'ios' => Icons.phone_iphone,
-      'android' => Icons.phone_android,
-      'ohos' => Icons.smartphone,
-      _ => Icons.device_unknown,
-    };
+    final IconData icon;
+    switch (d.osType) {
+      case 'macos':
+        icon = Icons.laptop_mac;
+        break;
+      case 'windows':
+        icon = Icons.laptop_windows;
+        break;
+      case 'linux':
+        icon = Icons.terminal;
+        break;
+      case 'ios':
+        icon = Icons.phone_iphone;
+        break;
+      case 'android':
+        icon = Icons.phone_android;
+        break;
+      case 'ohos':
+        icon = Icons.smartphone;
+        break;
+      default:
+        icon = Icons.device_unknown;
+    }
     return CircleAvatar(child: Icon(icon, size: 22));
   }
 }

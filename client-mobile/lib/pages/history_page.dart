@@ -80,11 +80,17 @@ class _HistoryTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final color = switch (entry.status) {
-      'COMPLETED' => Colors.green,
-      'FAILED' => theme.colorScheme.error,
-      _ => theme.colorScheme.primary,
-    };
+    final Color color;
+    switch (entry.status) {
+      case 'COMPLETED':
+        color = Colors.green;
+        break;
+      case 'FAILED':
+        color = theme.colorScheme.error;
+        break;
+      default:
+        color = theme.colorScheme.primary;
+    }
 
     return ListTile(
       leading: Icon(entry.isReceive ? Icons.download : Icons.upload,
@@ -133,9 +139,9 @@ class _HistoryDetail extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final store = context.watch<AppStore>();
-    final entry = store.history
-        .where((e) => e.sessionId == sessionId)
-        .firstOrNull;
+    final matches =
+        store.history.where((e) => e.sessionId == sessionId).toList();
+    final entry = matches.isEmpty ? null : matches.first;
     if (entry == null) {
       return const Center(child: Text('记录不存在（可能已被清理）'));
     }

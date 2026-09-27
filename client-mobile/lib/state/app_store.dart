@@ -97,6 +97,7 @@ class AppStore extends ChangeNotifier {
             .where((d) => d.deviceId != selfInfo?.deviceId)
             .toList();
         notifyListeners();
+        break;
       case 'transfer-progress':
         final t = ActiveTransfer.fromJson((payload as Map).cast<String, dynamic>());
         transfers[t.sessionId] = t;
@@ -113,13 +114,16 @@ class AppStore extends ChangeNotifier {
           _scheduleHistoryRefresh();
         }
         notifyListeners();
+        break;
       case 'transfer-offer-received':
         // WifiOnly/Always 下的自动接收：Rust 已应答，这里只刷新历史
         _scheduleHistoryRefresh();
+        break;
       case 'confirm-receive':
         pendingConfirm =
             ConfirmRequest.fromJson((payload as Map).cast<String, dynamic>());
         notifyListeners();
+        break;
       case 'confirm-expired':
         final sid = (payload as Map?)?['session_id'] as String?;
         if (pendingConfirm?.sessionId == sid) {
@@ -127,40 +131,50 @@ class AppStore extends ChangeNotifier {
           _toast('接收确认已超时，本次传输被拒绝');
           notifyListeners();
         }
+        break;
       case 'auth-success':
         connectionState = 'online';
         connectionError = null;
         notifyListeners();
+        break;
       case 'auth-failed':
         connectionState = 'auth_failed';
         connectionError = payload?.toString();
         _toast('连接被服务端拒绝：请检查账号与密钥');
         notifyListeners();
+        break;
       case 'tls-cert-failed':
         connectionState = 'cert_failed';
         connectionError = payload?.toString();
         _toast('服务器证书校验失败，请在设置中检查信任配置');
         notifyListeners();
+        break;
       case 'server-limits-updated':
         serverLimits = payload == null
             ? null
             : ServerLimits.fromJson((payload as Map).cast<String, dynamic>());
         notifyListeners();
+        break;
       case 'e2ee-fallback':
         e2eeFallbackNotice = payload?.toString();
         _toast(e2eeFallbackNotice!);
         notifyListeners();
+        break;
       case 'e2ee-offer-rejected':
         _toast(payload?.toString() ?? '收到无法解密的传输，已拒收');
         notifyListeners();
+        break;
       case 'history-pruned':
       case 'account-changed':
         refreshHistory();
+        break;
       case 'show-notification':
         final map = (payload as Map?)?.cast<String, dynamic>() ?? {};
         _toast('${map['title'] ?? ''}\n${map['body'] ?? ''}');
+        break;
       case 'clipboard-write':
         _handleClipboardWrite((payload as Map).cast<String, dynamic>());
+        break;
       default:
         break;
     }

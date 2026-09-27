@@ -1,0 +1,9 @@
+{
+  "name": "unidrop_mobile_ohos",
+  "version": "0.4.2",
+  "dependencies": {},
+  "devDependencies": {
+    "@ohos/hvigor": "6.26.8",
+    "@ohos/hvigor-ohos-plugin": "6.26.8"
+  }
+}

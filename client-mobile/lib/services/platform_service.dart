@@ -19,15 +19,23 @@ import 'package:share_plus/share_plus.dart';
 
 import '../ffi/bridge.dart';
 
+/// 路径三分配置（record 是 Dart 3 语法，2.19 兼容用小类）。
+class PathConfig {
+  PathConfig({required this.dbPath, required this.cacheDir});
+
+  final String dbPath;
+  final String cacheDir;
+}
+
 class PlatformService {
   /// 数据库与收件目录。对应 V2 计划 §4 的路径三分策略：
   /// - SQLite → 应用支撑目录（参与系统备份，绝不可放缓存区）
   /// - 收件缓存 → 文档目录下的 UniDrop（iOS 文件 App 可见；
   ///   Android/ohos 外部私有目录）
-  Future<({String dbPath, String cacheDir})> resolvePaths() async {
+  Future<PathConfig> resolvePaths() async {
     final support = await getApplicationSupportDirectory();
     final docs = await getApplicationDocumentsDirectory();
-    return (
+    return PathConfig(
       dbPath: '${support.path}/unidrop.db',
       cacheDir: '${docs.path}/UniDrop',
     );
@@ -62,11 +70,27 @@ class PlatformService {
   /// sender 的 ANSWER 随断连丢失，60s 后服务端判 idle 失败）。
   /// 半开死链的兜底仍由 core 侧 45s read 超时负责。
   StreamSubscription<void> watchNetwork() {
-    String map(List<ConnectivityResult> results) {
-      if (results.contains(ConnectivityResult.ethernet)) return 'ethernet';
-      if (results.contains(ConnectivityResult.wifi)) return 'wifi';
-      if (results.contains(ConnectivityResult.mobile)) return 'cellular';
-      return 'unknown';
+    // connectivity 的返回形态随大版本变化（4.x 单枚举、6.x List），
+    // 鸿蒙（pubspec.ohos.yaml 钉 4.x）与 Android/iOS（主 pubspec 钉 6.x）
+    // 共用本文件——运行时判别，两种形态都吃。
+    String map(dynamic result) {
+      if (result is List) {
+        if (result.contains(ConnectivityResult.ethernet)) return 'ethernet';
+        if (result.contains(ConnectivityResult.wifi)) return 'wifi';
+        if (result.contains(ConnectivityResult.mobile)) return 'cellular';
+        return 'unknown';
+      }
+      final ConnectivityResult r = result as ConnectivityResult;
+      switch (r) {
+        case ConnectivityResult.ethernet:
+          return 'ethernet';
+        case ConnectivityResult.wifi:
+          return 'wifi';
+        case ConnectivityResult.mobile:
+          return 'cellular';
+        default:
+          return 'unknown';
+      }
     }
 
     String? lastKind;
@@ -105,25 +129,41 @@ class PlatformService {
 
   /// 选文件（多选）。返回可读路径——file_picker 在 iOS/Android 上都会把
   /// 选中内容落到应用可读位置，Rust 侧因此不需要感知 content://。
+  ///
+  /// 鸿蒙暂无 file_picker 的 ohos 实现（openharmony-sig 适配在途）：
+  /// MissingPluginException 时返回 null，UI 据此提示「该平台暂不支持选文件」，
+  /// 不让一次能力缺失演成崩溃。
   Future<List<String>?> pickFiles() async {
-    final result = await FilePicker.platform.pickFiles(allowMultiple: true);
-    if (result == null) return null;
-    return result.files
-        .where((f) => f.path != null)
-        .map((f) => f.path!)
-        .toList();
+    try {
+      final result = await FilePicker.platform.pickFiles(allowMultiple: true);
+      if (result == null) return null;
+      return result.files
+          .where((f) => f.path != null)
+          .map((f) => f.path!)
+          .toList();
+    } on MissingPluginException {
+      return null;
+    }
   }
 
   /// 分享一组文件（接收后的「保存到… / 用其他应用打开」等价路径）。
+  /// 鸿蒙暂无 ohos 实现：抛出的 MissingPluginException 转成失败结果由调用方提示。
   Future<void> shareFiles(List<String> paths, {String? subject}) async {
-    await SharePlus.instance.share(
-      ShareParams(files: paths.map((p) => XFile(p)).toList(), subject: subject),
-    );
+    try {
+      await Share.shareXFiles(paths.map((p) => XFile(p)).toList(),
+          subject: subject);
+    } on MissingPluginException {
+      throw UnsupportedError('该平台暂不支持系统分享');
+    }
   }
 
   /// 分享纯文本。
   Future<void> shareText(String text) async {
-    await SharePlus.instance.share(ShareParams(text: text));
+    try {
+      await Share.share(text);
+    } on MissingPluginException {
+      throw UnsupportedError('该平台暂不支持系统分享');
+    }
   }
 
   /// 写文本到系统剪贴板（接收 TEXT 自动注入 / 手动复制用）。

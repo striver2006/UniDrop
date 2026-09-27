@@ -43,3 +43,14 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# ohos 构建产物与华为工具 crash 报告
+client-mobile/ohos/build/
+client-mobile/ohos/oh_modules/
+client-mobile/ohos/entry/build/
+client-mobile/ohos/har/
+client-mobile/ohos/.hvigor/
+client-mobile/ohos/libs/
+client-mobile/ohos/local.properties
+client-mobile/flutter_*.log
+client-mobile/pubspec.ohos.lock
