@@ -1,19 +1,24 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use rusqlite::Connection;
 use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 
-use crate::commands::settings_cmd::AppSettings;
 use crate::core::cache_manager::CacheManager;
 use crate::core::connection_actor::ConnectionConfig;
 use crate::core::transfer_engine::{TransferEngine, TransferSource};
 use crate::protocol::{ControlEnvelope, OnlineDevice, ServerLimits, TransferOfferPayload};
+use crate::settings::AppSettings;
 
-/// 应用版本的唯一事实源，编译期取自 Cargo.toml 的 `version`。
+/// 应用版本的唯一事实源，编译期取自 workspace 的 `version`。
 ///
-/// 此前这里和 `lib.rs` 各写了一份 "0.1.0" 字面量，而 Cargo.toml、
-/// tauri.conf.json、package.json 都已是 0.1.1——对端设备列表里显示的版本号
-/// 因此始终停在 0.1.0。字面量不会随发版更新，用 env! 从根上断掉这种漂移。
+/// 此前这里和桌面壳各写了一份 "0.1.0" 字面量，而各处 manifest 都已是更新版本
+/// ——对端设备列表里显示的版本号因此始终停在旧值。字面量不会随发版更新，
+/// 用 env! 从根上断掉这种漂移。
+///
+/// **三端（桌面 / 移动）共享本 crate，因此天然同号**——这正是
+/// `peer_supports_e2ee` 版本门槛想要的形态。发版时只改 workspace 的
+/// `[workspace.package] version` 一处。
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct AppState {
@@ -34,9 +39,21 @@ pub struct AppState {
     /// 服务端在 AUTH_RESPONSE 里下发的传输限额。
     ///
     /// `None` 有两种来源，行为相同：尚未连上，或对端是不发这个字段的老服务端。
-    /// 两种情况都**不做本地预检**，沿用 `clipboard_cmd` 里的兜底常量——
+    /// 两种情况都**不做本地预检**，沿用 `send_flow` 里的兜底常量——
     /// 绝不能当成「无限制」或「全部为 0」来用。
     pub server_limits: Arc<Mutex<Option<ServerLimits>>>,
+}
+
+/// 宿主相关的启动参数。
+///
+/// 桌面壳填：hostname 来自 `whoami`，cache_dir 为 None（沿用各平台默认缓存目录）。
+/// 移动壳填：hostname 来自平台设备名（iOS `UIDevice.name` / Android `Build.MODEL` /
+/// 鸿蒙 `deviceInfo.marketName`），cache_dir 必须显式给——移动端没有可靠的环境变量
+/// 兜底，且收件目录须落在用户可见位置（iOS Documents/UniDrop、
+/// Android/ohos 外部私有目录），详见 V2 计划 §4。
+pub struct HostEnv {
+    pub hostname: String,
+    pub cache_dir: Option<PathBuf>,
 }
 
 impl AppState {
@@ -47,19 +64,20 @@ impl AppState {
         initial_settings: AppSettings,
         config_actor: Arc<RwLock<ConnectionConfig>>,
         reconnect_notify: Arc<Notify>,
+        host: HostEnv,
     ) -> Self {
-        let cache_manager = CacheManager::new(db_conn.clone()).expect("Failed to initialize CacheManager");
+        let cache_manager =
+            CacheManager::with_dir(db_conn.clone(), host.cache_dir).expect("Failed to initialize CacheManager");
         let transfer_engine = Arc::new(TransferEngine::new(cache_manager.clone()));
-
-        let hostname = whoami_hostname();
-        let os_type = std::env::consts::OS.to_string();
-        let app_version = APP_VERSION.to_string();
 
         Self {
             device_id,
-            hostname,
-            os_type,
-            app_version,
+            hostname: host.hostname,
+            // std::env::consts::OS 在桌面产出 windows/macos/linux，
+            // 在移动端产出 ios/android，在鸿蒙产出 ohos——与服务端的
+            // 自由字符串约定（仅存储与日志）正好对齐。
+            os_type: std::env::consts::OS.to_string(),
+            app_version: APP_VERSION.to_string(),
             db_conn,
             cache_manager,
             transfer_engine,
@@ -74,27 +92,12 @@ impl AppState {
     }
 }
 
-/// Resolves the real host name via gethostname (works for GUI-launched apps on
-/// macOS where the HOSTNAME env var is never set), trimming the mDNS ".local"
-/// suffix. Env vars are only a fallback for containerized environments.
-pub fn whoami_hostname() -> String {
-    if let Ok(name) = whoami::fallible::hostname() {
-        let trimmed = name.trim_end_matches(".local").trim().to_string();
-        if !trimmed.is_empty() {
-            return trimmed;
-        }
-    }
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "localhost".to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 版本号必须与 Cargo.toml 同步。此前 lib.rs 与本文件各写死一份 "0.1.0"，
-    /// 而 Cargo.toml 早已是 0.1.1，对端设备列表因此一直显示旧版本。
+    /// 版本号必须与 workspace manifest 同步。此前这里与桌面壳各写死一份 "0.1.0"，
+    /// 而版本早已更新，对端设备因此一直显示旧版本。
     #[test]
     fn app_version_tracks_cargo_manifest() {
         assert_eq!(APP_VERSION, env!("CARGO_PKG_VERSION"));

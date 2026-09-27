@@ -8,7 +8,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, Manager};
+
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::Message;
@@ -19,7 +19,8 @@ use crate::core::cache_manager::CacheManager;
 use crate::core::tls_trust::create_tls_connector;
 use crate::core::path_guard::PathGuard;
 use crate::core::sliding_window::SlidingWindow;
-use crate::platform::show_transfer_notification;
+use crate::host::{emit_json, HostBridge};
+
 use crate::protocol::{
     ActionType, BinaryHeader, ChunkType, ControlEnvelope, FLAG_ENCRYPTED, HEADER_SIZE,
     TransferItemPayload, TransferOfferPayload,
@@ -75,8 +76,7 @@ fn redact_query_token(url: &str) -> String {
 /// 注意 `conn` guard 的作用域**就是本函数体**。任何需要再次取 `db_conn` 锁的动作
 /// （例如修剪历史）都不能写进这里——`tokio::sync::Mutex` 不可重入，会永久死锁。
 /// 终态请改用 `finalize_history_status`。
-async fn update_history_status(app_handle: &AppHandle, session_id: &str, status: &str, error: Option<&str>) {
-    let state = app_handle.state::<AppState>();
+async fn update_history_status(state: &AppState, session_id: &str, status: &str, error: Option<&str>) {
     let conn = state.db_conn.lock().await;
     if let Err(e) = HistoryRepo::update_task_status(&conn, session_id, status, error) {
         log::warn!("Failed to update history status for {}: {}", session_id, e);
@@ -90,21 +90,21 @@ async fn update_history_status(app_handle: &AppHandle, session_id: &str, status:
 /// 六个终态调用点若各自手写两行，早晚有人把修剪塞进 `update_history_status`
 /// 内部——那是静默死锁，整个应用卡住且不报任何错。
 async fn finalize_history_status(
-    app_handle: &AppHandle,
+    state: &AppState,
+    bridge: &dyn HostBridge,
     session_id: &str,
     status: &str,
     error: Option<&str>,
 ) {
-    update_history_status(app_handle, session_id, status, error).await;
-    crate::core::history_pruner::prune_and_notify(app_handle).await;
+    update_history_status(state, session_id, status, error).await;
+    crate::core::history_pruner::prune_and_notify(state, bridge).await;
 }
 
 /// 把对端 device_id 解析成设备名（在线设备表的 hostname），供通知标题使用。
 ///
 /// 查不到时返回 None：发送方恰好离线、设备列表尚未同步都会走到这里，
 /// 调用方退回无设备名的通用标题——辅助信息缺失不该连累整条通知不发。
-async fn resolve_peer_name(app_handle: &AppHandle, device_id: &str) -> Option<String> {
-    let state = app_handle.state::<AppState>();
+async fn resolve_peer_name(state: &AppState, device_id: &str) -> Option<String> {
     let devs = state.online_devices.lock().await;
     devs.iter()
         .find(|d| d.device_id == device_id)
@@ -323,7 +323,8 @@ impl TransferEngine {
         // 把它们再传一遍只会多两个参数，且多一处「用错 session_id 派生」的机会。
         e2ee_key: Option<ring::aead::LessSafeKey>,
         outgoing_tx: mpsc::Sender<ControlEnvelope>,
-        app_handle: AppHandle,
+        state: Arc<AppState>,
+        bridge: Arc<dyn HostBridge>,
     ) {
         // 四处同源之一：与 prepare_offer 算 total_chunks 时用的块长必须一致。
         let chunk_len = crate::core::e2ee::plaintext_chunk_len(e2ee_key.is_some());
@@ -358,7 +359,7 @@ impl TransferEngine {
             Ok(s) => s,
             Err(e) => {
                 log::error!("Sender failed to connect to /ws/data: {}", e);
-                let _ = app_handle.emit("transfer-progress", ActiveTransfer {
+                emit_json(bridge.as_ref(), "transfer-progress", &ActiveTransfer {
                     session_id: session_id.clone(),
                     preview_summary: offer.preview_summary.clone(),
                     total_size: offer.total_size,
@@ -368,7 +369,7 @@ impl TransferEngine {
                     status: "FAILED".to_string(),
                     data_type: offer.data_type.clone(),
                 });
-                finalize_history_status(&app_handle, &session_id, "FAILED", Some(&format!("数据通道连接失败: {}", e))).await;
+                finalize_history_status(state.as_ref(), bridge.as_ref(), &session_id, "FAILED", Some(&format!("数据通道连接失败: {}", e))).await;
                 let fail_env = ControlEnvelope {
                     version: 1,
                     trace_id: Uuid::new_v4().to_string(),
@@ -460,7 +461,7 @@ impl TransferEngine {
         let total_size = offer.total_size;
 
         // Emit initial progress
-        let _ = app_handle.emit("transfer-progress", ActiveTransfer {
+        emit_json(bridge.as_ref(), "transfer-progress", &ActiveTransfer {
             session_id: session_id.clone(),
             preview_summary: offer.preview_summary.clone(),
             total_size,
@@ -535,7 +536,7 @@ impl TransferEngine {
                                             } else {
                                                 100.0
                                             };
-                                            let _ = app_handle.emit("transfer-progress", ActiveTransfer {
+                                            emit_json(bridge.as_ref(), "transfer-progress", &ActiveTransfer {
                                                 session_id: session_id.clone(),
                                                 preview_summary: offer.preview_summary.clone(),
                                                 total_size,
@@ -608,7 +609,7 @@ impl TransferEngine {
             };
             let _ = outgoing_tx.send(complete_env).await;
 
-            let _ = app_handle.emit("transfer-progress", ActiveTransfer {
+            emit_json(bridge.as_ref(), "transfer-progress", &ActiveTransfer {
                 session_id: session_id.clone(),
                 preview_summary: offer.preview_summary.clone(),
                 total_size,
@@ -618,11 +619,11 @@ impl TransferEngine {
                 status: "COMPLETED".to_string(),
                 data_type: offer.data_type.clone(),
             });
-            finalize_history_status(&app_handle, &session_id, "COMPLETED", None).await;
+            finalize_history_status(state.as_ref(), bridge.as_ref(), &session_id, "COMPLETED", None).await;
         } else {
             // N4: Emit FAILED status and send TRANSFER_FAILURE on interrupted/aborted transfer
             log::error!("Sender transfer failed or was interrupted for session {}", session_id);
-            let _ = app_handle.emit("transfer-progress", ActiveTransfer {
+            emit_json(bridge.as_ref(), "transfer-progress", &ActiveTransfer {
                 session_id: session_id.clone(),
                 preview_summary: offer.preview_summary.clone(),
                 total_size,
@@ -632,7 +633,7 @@ impl TransferEngine {
                 status: "FAILED".to_string(),
                 data_type: offer.data_type.clone(),
             });
-            finalize_history_status(&app_handle, &session_id, "FAILED", Some("传输中断或超出重试上限")).await;
+            finalize_history_status(state.as_ref(), bridge.as_ref(), &session_id, "FAILED", Some("传输中断或超出重试上限")).await;
 
             let fail_env = ControlEnvelope {
                 version: 1,
@@ -666,7 +667,8 @@ impl TransferEngine {
         // 不一致时要么把密文当明文写盘（文件损坏），要么对明文做 AEAD 解密（全块失败）。
         e2ee_key: Option<ring::aead::LessSafeKey>,
         outgoing_tx: mpsc::Sender<ControlEnvelope>,
-        app_handle: AppHandle,
+        state: Arc<AppState>,
+        bridge: Arc<dyn HostBridge>,
     ) {
         // 四处同源之一：写盘定位必须与发送端切块用同一个块长。
         let chunk_len = crate::core::e2ee::plaintext_chunk_len(e2ee_key.is_some());
@@ -716,7 +718,7 @@ impl TransferEngine {
             Ok(s) => s,
             Err(e) => {
                 log::error!("Receiver failed to connect to /ws/data: {}", e);
-                let _ = app_handle.emit("transfer-progress", ActiveTransfer {
+                emit_json(bridge.as_ref(), "transfer-progress", &ActiveTransfer {
                     session_id: session_id.clone(),
                     preview_summary: offer.preview_summary.clone(),
                     total_size: offer.total_size,
@@ -729,14 +731,12 @@ impl TransferEngine {
                 // Err 必须留痕：通知发不出去本身就是哑故障，而「收不到提醒」
                 // 恰恰是这个功能要防的那件事。此前四处都是 let _ =，
                 // 所以 macOS 上通知整整失效了都没有任何信号。
-                let failure_title = match resolve_peer_name(&app_handle, &from_device).await {
+                let failure_title = match resolve_peer_name(state.as_ref(), &from_device).await {
                     Some(name) => format!("来自 {name} 的接收失败"),
                     None => "UniDrop 接收失败".to_string(),
                 };
-                if let Err(e) = show_transfer_notification(&app_handle, &failure_title, "数据通道连接失败，请检查服务器地址与证书配置") {
-                    log::warn!("Failed to show notification: {}", e);
-                }
-                finalize_history_status(&app_handle, &session_id, "FAILED", Some(&format!("数据通道连接失败: {}", e))).await;
+                bridge.notify(&failure_title, "数据通道连接失败，请检查服务器地址与证书配置");
+                finalize_history_status(state.as_ref(), bridge.as_ref(), &session_id, "FAILED", Some(&format!("数据通道连接失败: {}", e))).await;
                 let fail_env = ControlEnvelope {
                     version: 1,
                     trace_id: Uuid::new_v4().to_string(),
@@ -764,7 +764,7 @@ impl TransferEngine {
         let total_size = offer.total_size;
 
         // Emit initial receive progress
-        let _ = app_handle.emit("transfer-progress", ActiveTransfer {
+        emit_json(bridge.as_ref(), "transfer-progress", &ActiveTransfer {
             session_id: session_id.clone(),
             preview_summary: offer.preview_summary.clone(),
             total_size,
@@ -924,7 +924,7 @@ impl TransferEngine {
                 } else {
                     100.0
                 };
-                let _ = app_handle.emit("transfer-progress", ActiveTransfer {
+                emit_json(bridge.as_ref(), "transfer-progress", &ActiveTransfer {
                     session_id: session_id.clone(),
                     preview_summary: offer.preview_summary.clone(),
                     total_size,
@@ -970,7 +970,7 @@ impl TransferEngine {
                 if all_valid {
                     fully_completed = true;
                     log::info!("All files successfully verified with SHA-256 for session {}", session_id);
-                    let _ = app_handle.emit("transfer-progress", ActiveTransfer {
+                    emit_json(bridge.as_ref(), "transfer-progress", &ActiveTransfer {
                         session_id: session_id.clone(),
                         preview_summary: offer.preview_summary.clone(),
                         total_size,
@@ -994,7 +994,6 @@ impl TransferEngine {
                     // 按主键的查询，而收益是「所有写剪贴板的路径都受账号约束」
                     // 这句话可以成立。不一致时只发通知、不写剪贴板。
                     let still_owned = {
-                        let state = app_handle.state::<AppState>();
                         let current = { state.settings.lock().await.account_id.clone() };
                         let conn = state.db_conn.lock().await;
                         crate::storage::HistoryRepo::session_belongs_to(&conn, &session_id, &current)
@@ -1012,8 +1011,9 @@ impl TransferEngine {
                             if let Some(path) = completed_paths.first() {
                                 if let Ok(bytes) = fs::read(path) {
                                     let text = String::from_utf8_lossy(&bytes).to_string();
+                                    let bridge_for_clip = bridge.clone();
                                     let write_result = tokio::task::spawn_blocking(move || {
-                                        crate::platform::write_text_to_clipboard(&text)
+                                        bridge_for_clip.write_clipboard_text(text)
                                     })
                                     .await
                                     .unwrap_or_else(|_| Err("clipboard task panicked".to_string()));
@@ -1023,21 +1023,20 @@ impl TransferEngine {
                                 }
                             }
                             // PRD §4.1.4：标题带发送方设备名，用户不点开就知道是谁发来的。
-                            let text_title = match resolve_peer_name(&app_handle, &from_device).await {
+                            let text_title = match resolve_peer_name(state.as_ref(), &from_device).await {
                                 Some(name) => format!("来自 {name} 的文本"),
                                 None => "UniDrop 文本已同步".to_string(),
                             };
-                            if let Err(e) = show_transfer_notification(&app_handle, &text_title, "已写入系统剪贴板，可直接粘贴") {
-                                log::warn!("Failed to show notification: {}", e);
-                            }
+                            bridge.notify(&text_title, "已写入系统剪贴板，可直接粘贴");
                             let _ = cache_manager.mark_clipboard_injected(&session_id).await;
                         }
                         "IMAGE" if still_owned => {
                             // Clipboard image: write PNG directly into the system clipboard
                             if let Some(path) = completed_paths.first() {
                                 if let Ok(bytes) = fs::read(path) {
+                                    let bridge_for_clip = bridge.clone();
                                     let write_result = tokio::task::spawn_blocking(move || {
-                                        crate::platform::write_image_to_clipboard(&bytes)
+                                        bridge_for_clip.write_clipboard_image(bytes)
                                     })
                                     .await
                                     .unwrap_or_else(|_| Err("clipboard task panicked".to_string()));
@@ -1046,13 +1045,11 @@ impl TransferEngine {
                                     }
                                 }
                             }
-                            let image_title = match resolve_peer_name(&app_handle, &from_device).await {
+                            let image_title = match resolve_peer_name(state.as_ref(), &from_device).await {
                                 Some(name) => format!("来自 {name} 的图片"),
                                 None => "UniDrop 图片已同步".to_string(),
                             };
-                            if let Err(e) = show_transfer_notification(&app_handle, &image_title, "已写入系统剪贴板，可直接粘贴") {
-                                log::warn!("Failed to show notification: {}", e);
-                            }
+                            bridge.notify(&image_title, "已写入系统剪贴板，可直接粘贴");
                             let _ = cache_manager.mark_clipboard_injected(&session_id).await;
                         }
                         _ => {
@@ -1063,7 +1060,7 @@ impl TransferEngine {
                                 format!("{} (已保存在沙盒，可在面板中点击装载)", offer.preview_summary)
                             };
                             // PRD §4.1.4 样例：「来自 [MacBook-Pro] 的文件 (3个文件, 48.5 MB)」。
-                            let files_title = match resolve_peer_name(&app_handle, &from_device).await {
+                            let files_title = match resolve_peer_name(state.as_ref(), &from_device).await {
                                 Some(name) => format!(
                                     "来自 {name} 的文件 ({}项, {})",
                                     offer.total_items,
@@ -1071,15 +1068,14 @@ impl TransferEngine {
                                 ),
                                 None => format!("UniDrop 文件接收完成 ({}项)", offer.total_items),
                             };
-                            if let Err(e) = show_transfer_notification(&app_handle, &files_title, &notification_body) {
-                                log::warn!("Failed to show notification: {}", e);
-                            }
+                            bridge.notify(&files_title, &notification_body);
 
                             // P1-9: Auto inject into clipboard if configured
                             if auto_inject && still_owned && !completed_paths.is_empty() {
                                 let paths_clone = completed_paths.clone();
+                                let bridge_for_clip = bridge.clone();
                                 tokio::task::spawn_blocking(move || {
-                                    crate::platform::inject_files_to_clipboard(&paths_clone)
+                                    bridge_for_clip.inject_files_to_clipboard(paths_clone)
                                 })
                                 .await
                                 .ok();
@@ -1088,7 +1084,7 @@ impl TransferEngine {
                             }
                         }
                     }
-                    finalize_history_status(&app_handle, &session_id, "COMPLETED", None).await;
+                    finalize_history_status(state.as_ref(), bridge.as_ref(), &session_id, "COMPLETED", None).await;
                 } else {
                     let fail_env = ControlEnvelope {
                         version: 1,
@@ -1114,7 +1110,7 @@ impl TransferEngine {
             log::error!("Receiver loop exited prematurely or validation failed for session {}", session_id);
             let _ = fs::remove_dir_all(&session_root);
 
-            let _ = app_handle.emit("transfer-progress", ActiveTransfer {
+            emit_json(bridge.as_ref(), "transfer-progress", &ActiveTransfer {
                 session_id: session_id.clone(),
                 preview_summary: offer.preview_summary.clone(),
                 total_size,
@@ -1132,7 +1128,7 @@ impl TransferEngine {
             } else {
                 ("接收连接中断或校验失败", true)
             };
-            finalize_history_status(&app_handle, &session_id, "FAILED", Some(reason)).await;
+            finalize_history_status(state.as_ref(), bridge.as_ref(), &session_id, "FAILED", Some(reason)).await;
 
             if send_generic_failure {
                 let fail_env = ControlEnvelope {

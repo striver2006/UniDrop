@@ -4,11 +4,11 @@ use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tokio::sync::{mpsc, Notify, RwLock};
-use tauri::Emitter;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 use crate::core::tls_trust::{self, create_tls_connector};
+use crate::host::HostBridge;
 use crate::protocol::{ActionType, AuthChallengePayload, AuthRequestPayload, AuthResponsePayload, ControlEnvelope};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -66,14 +66,14 @@ impl ConnectionActor {
 
     /// Background loop with exponential backoff and jitter, with instant wakeup on configuration change.
     ///
-    /// `app_handle` 只用于一件事：把 TLS 证书校验失败直接报到界面上。
+    /// `bridge` 只用于一件事：把 TLS 证书校验失败直接报到界面上。
     /// 它必须走这条路而不是既有的 `incoming_tx`——握手失败发生在 WebSocket
     /// 建立**之前**，此时根本不存在可以塞进通道的 ControlEnvelope。
     ///
     /// 也考虑过合成一条 AUTH_RESPONSE 丢进 incoming_tx 来复用 `auth-failed`，
     /// 但那是把传输层错误伪装成鉴权失败：事件名会就此名不副实，
-    /// lib.rs 里那段 AUTH_RESPONSE 处理逻辑（它还负责存服务端限额）也会被污染。
-    pub async fn run(mut self, incoming_tx: mpsc::Sender<ControlEnvelope>, app_handle: tauri::AppHandle) {
+    /// 信令路由里那段 AUTH_RESPONSE 处理逻辑（它还负责存服务端限额）也会被污染。
+    pub async fn run(mut self, incoming_tx: mpsc::Sender<ControlEnvelope>, bridge: Arc<dyn HostBridge>) {
         let mut backoff = Duration::from_secs(1);
         let max_backoff = Duration::from_secs(30);
 
@@ -280,7 +280,7 @@ impl ConnectionActor {
                                 failure.kind.tag(),
                                 err
                             );
-                            let _ = app_handle.emit("tls-cert-failed", &failure);
+                            crate::host::emit_json(bridge.as_ref(), "tls-cert-failed", &failure);
                         }
                         _ => log::warn!("Connection failed: {}, retrying...", err),
                     }

@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use crate::commands::settings_cmd::AppSettings;
+use crate::settings::AppSettings;
 
 /// 缓存文件默认保留小时数
 pub const DEFAULT_CACHE_TTL_HOURS: u32 = 24;

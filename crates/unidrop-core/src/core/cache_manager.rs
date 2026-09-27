@@ -14,8 +14,16 @@ pub struct CacheManager {
 }
 
 impl CacheManager {
-    pub fn new(db_conn: Arc<Mutex<Connection>>) -> Result<Self, String> {
-        let cache_root = Self::resolve_default_cache_dir();
+    /// 按宿主显式给定的目录构造；`None` 沿用各平台默认缓存目录（桌面）。
+    ///
+    /// 移动端必须显式传：`std::env::temp_dir()` 在 iOS 上指向不可写的 `/tmp`，
+    /// 且收件目录要落在用户可见位置（iOS Documents / Android 外部私有目录），
+    /// 详见 `resolve_default_cache_dir` 尾部的兜底注释与 V2 计划 §4。
+    pub fn with_dir(
+        db_conn: Arc<Mutex<Connection>>,
+        cache_root: Option<PathBuf>,
+    ) -> Result<Self, String> {
+        let cache_root = cache_root.unwrap_or_else(Self::resolve_default_cache_dir);
         fs::create_dir_all(&cache_root).map_err(|e| format!("failed to create cache dir: {}", e))?;
 
         Ok(Self {

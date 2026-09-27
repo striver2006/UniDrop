@@ -15,7 +15,7 @@ use crate::storage::{HistoryRepo, TransferHistoryEntry};
 const HISTORY_DISPLAY_CAP: u32 = 200;
 
 #[tauri::command]
-pub async fn cmd_list_history(state: State<'_, AppState>) -> Result<Vec<TransferHistoryEntry>, String> {
+pub async fn cmd_list_history(state: State<'_, std::sync::Arc<AppState>>) -> Result<Vec<TransferHistoryEntry>, String> {
     let account_id = { state.settings.lock().await.account_id.clone() };
     let conn = state.db_conn.lock().await;
     HistoryRepo::list_history(&conn, &account_id, HISTORY_DISPLAY_CAP).map_err(|e| e.to_string())
@@ -26,7 +26,7 @@ pub async fn cmd_list_history(state: State<'_, AppState>) -> Result<Vec<Transfer
 /// 见 `HistoryRepo::session_belongs_to` 的注释：过滤列表只保证「看不见」，
 /// 挡不住「点得动」。切账号后界面若还残留着旧账号的卡片，用户点下去就会
 /// 真的读到另一个账号的文件。
-pub(crate) async fn ensure_session_owned(state: &State<'_, AppState>, session_id: &str) -> Result<(), String> {
+pub(crate) async fn ensure_session_owned(state: &State<'_, std::sync::Arc<AppState>>, session_id: &str) -> Result<(), String> {
     let account_id = { state.settings.lock().await.account_id.clone() };
     let conn = state.db_conn.lock().await;
     if HistoryRepo::session_belongs_to(&conn, session_id, &account_id) {
@@ -41,7 +41,7 @@ pub(crate) async fn ensure_session_owned(state: &State<'_, AppState>, session_id
 #[tauri::command]
 pub async fn cmd_save_transfer_as(
     app: AppHandle,
-    state: State<'_, AppState>,
+    state: State<'_, std::sync::Arc<AppState>>,
     session_id: String,
 ) -> Result<Option<u32>, String> {
     ensure_session_owned(&state, &session_id).await?;
@@ -108,7 +108,7 @@ pub async fn cmd_save_transfer_as(
 
 /// Reveals the first cached file of a session in the platform file manager.
 #[tauri::command]
-pub async fn cmd_reveal_session(state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+pub async fn cmd_reveal_session(state: State<'_, std::sync::Arc<AppState>>, session_id: String) -> Result<(), String> {
     ensure_session_owned(&state, &session_id).await?;
     let files = state.cache_manager.get_session_files(&session_id).await?;
     let target = files.first().ok_or("该会话在缓存中无文件（可能已被清理）")?;
@@ -140,7 +140,7 @@ mod tests {
     /// 在删掉任意一处调用后不会让任何既有测试变红——而「点得动」这条防线
     /// 恰恰完全依赖那几处调用在位。
     ///
-    /// `State<'_, AppState>` 在单测里构造不出来（需要完整的 Tauri 运行时），
+    /// `State<'_, std::sync::Arc<AppState>>` 在单测里构造不出来（需要完整的 Tauri 运行时），
     /// 所以这里退而求其次做源码级断言。它确实脆弱——改个变量名就会红——
     /// 但对「接线」这类东西，脆弱正是想要的：任何触碰都该让人重新确认一遍
     /// 闸门还在。若将来重构使断言失效，**先确认闸门仍在再改断言**，

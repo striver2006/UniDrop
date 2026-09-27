@@ -3,13 +3,13 @@ use crate::app_state::AppState;
 use crate::protocol::OnlineDevice;
 
 #[tauri::command]
-pub async fn cmd_get_online_devices(state: State<'_, AppState>) -> Result<Vec<OnlineDevice>, String> {
+pub async fn cmd_get_online_devices(state: State<'_, std::sync::Arc<AppState>>) -> Result<Vec<OnlineDevice>, String> {
     let devices = state.online_devices.lock().await;
     Ok(devices.clone())
 }
 
 #[tauri::command]
-pub async fn cmd_get_self_info(state: State<'_, AppState>) -> Result<OnlineDevice, String> {
+pub async fn cmd_get_self_info(state: State<'_, std::sync::Arc<AppState>>) -> Result<OnlineDevice, String> {
     Ok(OnlineDevice {
         device_id: state.device_id.clone(),
         hostname: state.hostname.clone(),

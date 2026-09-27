@@ -24,7 +24,7 @@ use crate::protocol::ServerLimits;
 /// 显示 0 会被读成「配额为零」，显示默认值会让用户以为那就是实际生效的值。
 #[tauri::command]
 pub async fn cmd_get_server_limits(
-    state: State<'_, AppState>,
+    state: State<'_, std::sync::Arc<AppState>>,
 ) -> Result<Option<ServerLimits>, String> {
     let limits = state.server_limits.lock().await;
     Ok(limits.clone())
