@@ -61,3 +61,13 @@ cache/
 .trivium/state.json
 .trivium/config.local.yaml
 *.trivium-backup
+
+# Flutter / mobile build artifacts
+client-mobile/.dart_tool/
+client-mobile/.flutter-plugins*
+client-mobile/build/
+client-mobile/android/app/src/main/jniLibs/
+client-mobile/ios/NativeSources/lib/
+client-mobile/native/Cargo.lock
+*.ipa
+*.aab
