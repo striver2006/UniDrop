@@ -34,18 +34,44 @@ class _SettingsPageState extends State<SettingsPage> {
 
   bool _saving = false;
 
+  /// 表单是否已从 store 回填过。
+  ///
+  /// IndexedStack 常驻的页面在 App 启动瞬间就 initState，而 store.settings
+  /// 要等核心启动 + get_settings 返回后才就绪——只靠 initState 取值，
+  /// 拿到的是加载完成前的空值，表现为「保存后回显不对、重开配置被清空」。
+  /// settings 就绪后补一次水；此后不再自动覆盖（用户编辑优先）。
+  bool _hydrated = false;
+
   @override
   void initState() {
     super.initState();
+    _server = TextEditingController();
+    _account = TextEditingController();
+    _psk = TextEditingController();
+    _pin = TextEditingController();
+    _trustMode = 'public_ca';
+    _policy = 'always';
+    _e2ee = true;
     final s = context.read<AppStore>().settings;
-    _server = TextEditingController(text: s?.serverUrl ?? '');
-    _account = TextEditingController(text: s?.accountId ?? '');
-    _psk = TextEditingController(text: s?.pskSecret ?? '');
-    _pin = TextEditingController(
-        text: (s?.pinnedCertSha256 ?? const []).join('\n'));
-    _trustMode = s?.tlsTrustMode ?? 'public_ca';
-    _policy = s?.receivePolicy ?? 'always';
-    _e2ee = s?.e2eeEnabled ?? true;
+    if (s != null) _hydrate(s);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final s = context.read<AppStore>().settings;
+    if (s != null && !_hydrated) _hydrate(s);
+  }
+
+  void _hydrate(AppSettingsDto s) {
+    _hydrated = true;
+    _server.text = s.serverUrl;
+    _account.text = s.accountId;
+    _psk.text = s.pskSecret;
+    _pin.text = s.pinnedCertSha256.join('\n');
+    _trustMode = s.tlsTrustMode;
+    _policy = s.receivePolicy;
+    _e2ee = s.e2eeEnabled;
   }
 
   @override
