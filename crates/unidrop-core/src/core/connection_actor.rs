@@ -204,6 +204,15 @@ impl ConnectionActor {
                     }
 
                     // 4. Heartbeat & Forwarding loop
+                    //
+                    // READ_IDLE_TIMEOUT：半开死链的发现手段。服务端对每个
+                    // HEARTBEAT_PING 都回 PONG（control_ws.go:264-269），因此
+                    // 正常连接上任何 45 秒窗口内必有下行帧；一个帧都没有
+                    // 只能是对端/路径已死而本端 TCP 栈尚未感知（移动端
+                    // Wi-Fi↔蜂窝切换、NAT 超时的典型形态）。此时 write 心跳
+                    // 仍会"成功"（落内核缓冲），永远等不到读错误——必须靠
+                    // 读侧超时主动判死，退避重连兜底由 reconnect_notify 提供。
+                    const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
                     let mut ping_interval = tokio::time::interval(Duration::from_secs(15));
                     loop {
                         tokio::select! {
@@ -241,14 +250,22 @@ impl ConnectionActor {
                                 }
                             }
 
-                            msg = read.next() => {
+                            msg = tokio::time::timeout(READ_IDLE_TIMEOUT, read.next()) => {
                                 match msg {
-                                    Some(Ok(Message::Text(text))) => {
-                                        if let Ok(env) = serde_json::from_str::<ControlEnvelope>(&text) {
-                                            let _ = incoming_tx.send(env).await;
-                                        }
+                                    Err(_idle) => {
+                                        log::warn!(
+                                            "control link idle for 45s (no frames incl. heartbeat pong), treating as dead and reconnecting"
+                                        );
+                                        break;
                                     }
-                                    _ => break, // Connection closed
+                                    Ok(msg) => match msg {
+                                        Some(Ok(Message::Text(text))) => {
+                                            if let Ok(env) = serde_json::from_str::<ControlEnvelope>(&text) {
+                                                let _ = incoming_tx.send(env).await;
+                                            }
+                                        }
+                                        _ => break, // Connection closed
+                                    },
                                 }
                             }
                         }

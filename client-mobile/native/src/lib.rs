@@ -60,6 +60,23 @@ impl log::Log for StderrLogger {
 }
 
 static LOGGER: StderrLogger = StderrLogger;
+
+#[cfg(target_os = "android")]
+fn install_logger() {
+    // Android：stderr 在 release 应用里被直接丢弃，日志必须进 logcat。
+    // tag 固定 unidrop：`adb logcat -s unidrop` 即可只看本应用核心日志。
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_tag("unidrop")
+            .with_max_level(log::LevelFilter::Info),
+    );
+}
+
+#[cfg(not(target_os = "android"))]
+fn install_logger() {
+    let _ = log::set_logger(&LOGGER);
+    log::set_max_level(log::LevelFilter::Info);
+}
 static HOST: OnceLock<Host> = OnceLock::new();
 static EVENT_SINK: Mutex<Option<(EventCallback, usize)>> = Mutex::new(None);
 static CALL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -207,8 +224,7 @@ pub extern "C" fn unidrop_start(config_json: *const c_char) -> *mut c_char {
 }
 
 fn start_inner(config_json: *const c_char) -> Result<serde_json::Value, String> {
-    let _ = log::set_logger(&LOGGER);
-    log::set_max_level(log::LevelFilter::Info);
+    install_logger();
     unidrop_core::install_crypto_provider();
     let cfg = take_string(config_json)?;
     let cfg: serde_json::Value = serde_json::from_str(&cfg).map_err(|e| e.to_string())?;

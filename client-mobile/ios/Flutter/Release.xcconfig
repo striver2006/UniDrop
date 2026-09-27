@@ -4,5 +4,5 @@
 // 真机与模拟器各一份（同为 arm64 无法 lipo 合并），按 SDK 选择目录。
 // -force_load 是必须的：FFI 符号经 DynamicLibrary.process() 在运行时查找，
 // 没有静态引用，普通链接会被 dead-strip 丢弃整个静态库。
-OTHER_LDFLAGS[sdk=iphoneos*] = $(inherited) -force_load "$(SRCROOT)/NativeSources/lib/device/libunidrop_mobile.a"
-OTHER_LDFLAGS[sdk=iphonesimulator*] = $(inherited) -force_load "$(SRCROOT)/NativeSources/lib/sim/libunidrop_mobile.a"
+OTHER_LDFLAGS[sdk=iphoneos*] = $(inherited) -force_load "$(SRCROOT)/NativeSources/lib/device/libunidrop_mobile.a" -Wl,-exported_symbols_list,"$(SRCROOT)/NativeSources/exported_symbols.txt"
+OTHER_LDFLAGS[sdk=iphonesimulator*] = $(inherited) -force_load "$(SRCROOT)/NativeSources/lib/sim/libunidrop_mobile.a" -Wl,-exported_symbols_list,"$(SRCROOT)/NativeSources/exported_symbols.txt"

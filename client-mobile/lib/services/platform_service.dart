@@ -61,11 +61,16 @@ class PlatformService {
       return 'unknown';
     }
 
-    Future<void> report() async {
+    Future<void> report({bool changed = false}) async {
       try {
         final results = await Connectivity().checkConnectivity();
         await NativeBridge.instance
             .invoke('set_network', {'kind': map(results)});
+        // 切网即重连：旧链路在网切换后大概率已半开（TCP 无感知死亡），
+        // 与 core 侧 45s read 超时构成双保险——这里把发现延迟从 45s 压到毫秒级。
+        if (changed) {
+          await NativeBridge.instance.invoke('reconnect');
+        }
       } catch (_) {
         // 探测失败按 unknown 上报过一次兜底即可，不断流
         await NativeBridge.instance.invoke('set_network', {'kind': 'unknown'});
@@ -74,7 +79,7 @@ class PlatformService {
 
     report();
     late final StreamSubscription<void> sub;
-    sub = Connectivity().onConnectivityChanged.listen((_) => report());
+    sub = Connectivity().onConnectivityChanged.listen((_) => report(changed: true));
     return sub;
   }
 

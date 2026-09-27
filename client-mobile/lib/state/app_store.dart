@@ -51,31 +51,40 @@ class AppStore extends ChangeNotifier {
   bool _disposed = false;
 
   Future<void> bootstrap() async {
-    final paths = await platform.resolvePaths();
-    final deviceName = await platform.deviceName();
-    final result = await native.start(
-      dbPath: paths.dbPath,
-      cacheDir: paths.cacheDir,
-      deviceName: deviceName,
-    );
-    if (result['ok'] == true) {
-      selfInfo = OnlineDevice.fromJson((result['data'] as Map).cast<String, dynamic>());
-    } else {
+    // 全程兜底：native 层的任何异常（FFI 符号缺失、路径不可写…）都必须变成
+    // UI 可见的 start_failed 状态——否则 provider 构造抛异常，MaterialApp
+    // 根本不会构建，用户看到的是无解释的白屏。
+    try {
+      final paths = await platform.resolvePaths();
+      final deviceName = await platform.deviceName();
+      final result = await native.start(
+        dbPath: paths.dbPath,
+        cacheDir: paths.cacheDir,
+        deviceName: deviceName,
+      );
+      if (result['ok'] == true) {
+        selfInfo = OnlineDevice.fromJson((result['data'] as Map).cast<String, dynamic>());
+      } else {
+        connectionState = 'start_failed';
+        connectionError = result['error']?.toString();
+        notifyListeners();
+        return;
+      }
+
+      _networkSub = platform.watchNetwork();
+      _sub = native.events.stream.listen(_onEvent, onError: (Object e) {
+        debugPrint('event stream error: $e');
+      });
+
+      await refreshDevices();
+      await refreshSettings();
+      await refreshLimits();
+      await refreshHistory();
+    } catch (e) {
       connectionState = 'start_failed';
-      connectionError = result['error']?.toString();
+      connectionError = '核心初始化失败：$e';
       notifyListeners();
-      return;
     }
-
-    _networkSub = platform.watchNetwork();
-    _sub = native.events.stream.listen(_onEvent, onError: (Object e) {
-      debugPrint('event stream error: $e');
-    });
-
-    await refreshDevices();
-    await refreshSettings();
-    await refreshLimits();
-    await refreshHistory();
   }
 
   void _onEvent(Map<String, dynamic> envelope) {

@@ -1,0 +1,7 @@
+# DynamicLibrary.process() 只认动态符号表里的导出符号；
+# 静态库 force_load 进主二进制后默认不导出，必须显式列在这里。
+_unidrop_start
+_unidrop_invoke
+_unidrop_stop
+_unidrop_free_string
+_unidrop_set_event_callback
