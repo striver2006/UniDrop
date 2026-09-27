@@ -25,6 +25,13 @@ class UniClipApp extends StatelessWidget {
       create: (_) => AppStore()..bootstrap(),
       child: MaterialApp(
         title: 'UniClip 瞬贴',
+        // 点空白收起键盘：iOS 没有系统返回键，不处理这个手势的话
+        // 键盘会一直盖住底部导航，用户被锁死在当前页（实测卡点）。
+        // GestureDetector 只在没有子组件消费 tap 时才触发，不影响列表与控件。
+        builder: (context, child) => GestureDetector(
+          onTap: () => FocusManager.instance.primaryFocus?.unfocus(),
+          child: child,
+        ),
         theme:
             ThemeData(colorSchemeSeed: const Color(0xFF3F51B5), useMaterial3: true),
         darkTheme: ThemeData(

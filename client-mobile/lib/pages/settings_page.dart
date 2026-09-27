@@ -89,6 +89,7 @@ class _SettingsPageState extends State<SettingsPage> {
         ],
       ),
       body: ListView(
+        keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
         padding: const EdgeInsets.all(16),
         children: [
           _Section(title: '服务器'),
@@ -157,7 +158,7 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           const SizedBox(height: 8),
           DropdownButtonFormField<String>(
-            value: _trustMode,
+            initialValue: _trustMode,
             decoration: const InputDecoration(
               labelText: 'TLS 信任策略',
               border: OutlineInputBorder(),
