@@ -16,7 +16,7 @@ class HistoryPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final store = context.watch<AppStore>();
-    final class_ = sizeClass(MediaQuery.sizeOf(context).width);
+    final class_ = sizeClass(MediaQuery.of(context).size.width);
 
     final list = ListView.builder(
       padding: const EdgeInsets.symmetric(vertical: 8),
@@ -31,7 +31,6 @@ class HistoryPage extends StatelessWidget {
             } else {
               showModalBottomSheet(
                 context: context,
-                showDragHandle: true,
                 isScrollControlled: true,
                 builder: (_) => _HistoryDetail(sessionId: entry.sessionId),
               );

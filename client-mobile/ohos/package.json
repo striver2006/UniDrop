@@ -3,7 +3,8 @@
   "version": "0.4.2",
   "dependencies": {},
   "devDependencies": {
-    "@ohos/hvigor": "6.26.8",
-    "@ohos/hvigor-ohos-plugin": "6.26.8"
+    "@ohos/hvigor": "4.0.2",
+    "@ohos/hvigor-ohos-plugin": "4.0.2",
+    "typescript": "4.9.5"
   }
 }

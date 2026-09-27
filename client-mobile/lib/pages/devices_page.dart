@@ -16,7 +16,7 @@ class DevicesPage extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final store = context.watch<AppStore>();
-    final class_ = sizeClass(MediaQuery.sizeOf(context).width);
+    final class_ = sizeClass(MediaQuery.of(context).size.width);
 
     final list = ListView.builder(
       padding: const EdgeInsets.symmetric(vertical: 8),
@@ -97,11 +97,10 @@ class _DeviceTile extends StatelessWidget {
       onTap: () {
         final store = context.read<AppStore>();
         store.setSendTarget(device);
-        final class_ = sizeClass(MediaQuery.sizeOf(context).width);
+        final class_ = sizeClass(MediaQuery.of(context).size.width);
         if (!class_.useTwoPane) {
           showModalBottomSheet(
             context: context,
-            showDragHandle: true,
             builder: (_) => const _SendPanel(),
           );
         }

@@ -59,7 +59,6 @@ class TransferCard extends StatelessWidget {
                   ? 1
                   : (t.progress / 100).clamp(0.0, 1.0),
               minHeight: 6,
-              borderRadius: BorderRadius.circular(3),
             ),
             const SizedBox(height: 6),
             Text(

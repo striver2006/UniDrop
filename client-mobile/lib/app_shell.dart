@@ -43,7 +43,7 @@ class AppShell extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final class_ = sizeClass(MediaQuery.sizeOf(context).width);
+    final class_ = sizeClass(MediaQuery.of(context).size.width);
     if (class_.useRail) {
       return const _RailShell();
     }

@@ -14,8 +14,9 @@
 */
 
 { 
-  "hvigorVersion": "6.26.8",
+  "hvigorVersion": "4.0.2",
   "dependencies": {
-    "@ohos/hvigor-ohos-plugin": "6.26.8"
+    "@ohos/hvigor-ohos-plugin": "4.0.2",
+    "typescript": "4.9.5"
   }
 }

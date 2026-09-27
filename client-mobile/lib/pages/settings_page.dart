@@ -177,14 +177,13 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           const SizedBox(height: 16),
           _Section(title: '接收策略'),
-          SegmentedButton<String>(
-            segments: const [
-              ButtonSegment(value: 'always', label: Text('全部自动')),
-              ButtonSegment(value: 'wifi_only', label: Text('仅 Wi-Fi')),
-              ButtonSegment(value: 'ask', label: Text('每次询问')),
+          Wrap(
+            spacing: 8,
+            children: [
+              _policyChip('always', '全部自动'),
+              _policyChip('wifi_only', '仅 Wi-Fi'),
+              _policyChip('ask', '每次询问'),
             ],
-            selected: {_policy},
-            onSelectionChanged: (v) => setState(() => _policy = v.first),
           ),
           const SizedBox(height: 8),
           SwitchListTile(
@@ -249,7 +248,7 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           const SizedBox(height: 8),
           DropdownButtonFormField<String>(
-            initialValue: _trustMode,
+            value: _trustMode, // ignore: deprecated_member_use
             decoration: const InputDecoration(
               labelText: 'TLS 信任策略',
               border: OutlineInputBorder(),
@@ -297,6 +296,14 @@ class _SettingsPageState extends State<SettingsPage> {
           const SizedBox(height: 32),
         ],
       ),
+    );
+  }
+
+  Widget _policyChip(String value, String label) {
+    return ChoiceChip(
+      label: Text(label),
+      selected: _policy == value,
+      onSelected: (_) => setState(() => _policy = value),
     );
   }
 

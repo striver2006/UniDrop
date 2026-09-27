@@ -1,3 +1,4 @@
+#include? "Pods/Target Support Files/Pods-Runner/Pods-Runner.debug.xcconfig"
 #include "Generated.xcconfig"
 
 // Rust 核心静态库（scripts/build_native_ios.sh 产出；符号经 DynamicLibrary.process 查找）。

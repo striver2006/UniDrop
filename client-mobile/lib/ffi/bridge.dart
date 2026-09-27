@@ -14,16 +14,16 @@ import 'dart:io';
 
 import 'package:ffi/ffi.dart';
 
+typedef _PollEventC = Pointer<Utf8> Function();
+typedef _PollEventDart = Pointer<Utf8> Function();
+
 typedef _StartC = Pointer<Utf8> Function(Pointer<Utf8>);
 typedef _StartDart = Pointer<Utf8> Function(Pointer<Utf8>);
 typedef _InvokeC = Pointer<Utf8> Function(Pointer<Utf8>);
 typedef _InvokeDart = Pointer<Utf8> Function(Pointer<Utf8>);
 typedef _FreeStringC = Void Function(Pointer<Utf8>);
 typedef _FreeStringDart = void Function(Pointer<Utf8>);
-typedef _SetEventCallbackC = Void Function(
-    Pointer<NativeFunction<Void Function(UintPtr, Pointer<Utf8>)>>, UintPtr);
-typedef _SetEventCallbackDart = void Function(
-    Pointer<NativeFunction<Void Function(UintPtr, Pointer<Utf8>)>>, int);
+
 
 class NativeBridge {
   NativeBridge._();
@@ -40,7 +40,9 @@ class NativeBridge {
   /// UI 层订阅它刷新设备列表 / 传输卡片 / 确认弹窗。
   final events = StreamController<Map<String, dynamic>>.broadcast();
 
-  NativeCallable<Void Function(UintPtr, Pointer<Utf8>)>? _eventCallable;
+  /// 事件轮询定时器（33ms ≈ 30fps 的事件粒度，FFI 调用为纳秒级，开销可忽略）。
+  /// Dart 2.19（鸿蒙 3.7 基座）无 NativeCallable，轮询是跨版本统一通道。
+  Timer? _pollTimer;
 
   DynamicLibrary _open() {
     if (_lib != null) return _lib!;
@@ -62,11 +64,18 @@ class NativeBridge {
     required String deviceName,
   }) {
     final lib = _open();
-    _eventCallable ??=
-        NativeCallable<Void Function(UintPtr, Pointer<Utf8>)>.listener(_onNativeEvent);
-    final setC = lib.lookupFunction<_SetEventCallbackC, _SetEventCallbackDart>(
-        'unidrop_set_event_callback');
-    setC(_eventCallable!.nativeFunction, 0);
+    final poll = lib.lookupFunction<_PollEventC, _PollEventDart>('unidrop_poll_event');
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(const Duration(milliseconds: 33), (_) {
+      // 一次 tick 排空积压（传输高峰期事件可能连发）
+      while (true) {
+        final ptr = poll();
+        if (ptr == nullptr) break;
+        final text = ptr.toDartString();
+        _free(ptr);
+        _onEventText(text);
+      }
+    });
 
     final config = jsonEncode({
       'db_path': dbPath,
@@ -100,11 +109,7 @@ class NativeBridge {
     fn(ptr);
   }
 
-  void _onNativeEvent(int user, Pointer<Utf8> json) {
-    // 内存契约（见 native/src/lib.rs::push_event）：所有权已移交 Dart，
-    // 读完必须归还，否则每条事件泄漏一段字符串。
-    final text = json.toDartString();
-    _free(json);
+  void _onEventText(String text) {
     try {
       final decoded = jsonDecode(text);
       if (decoded is Map<String, dynamic>) {

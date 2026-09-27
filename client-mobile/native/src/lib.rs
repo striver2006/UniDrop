@@ -79,6 +79,11 @@ fn install_logger() {
 }
 static HOST: OnceLock<Host> = OnceLock::new();
 static EVENT_SINK: Mutex<Option<(EventCallback, usize)>> = Mutex::new(None);
+
+/// 事件轮询队列（Dart 2.19 无 NativeCallable，轮询是跨版本统一通道；
+/// 有回调注册时队列同样写入——轮询与回调并存，由 Dart 侧选用）。
+static EVENT_QUEUE: Mutex<std::collections::VecDeque<CString>> =
+    Mutex::new(std::collections::VecDeque::new());
 static CALL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Dart 上报的网络类型缓存。0=Unknown 1=WiFi 2=Cellular 3=Ethernet。
@@ -165,11 +170,31 @@ fn push_event(event: &str, payload: serde_json::Value) {
     let Ok(text) = CString::new(json.to_string()) else {
         return;
     };
+    // 轮询队列：所有权随 unidrop_poll_event 移交 Dart
+    EVENT_QUEUE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push_back(text);
     let guard = EVENT_SINK.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((cb, user_data)) = *guard {
-        cb(user_data, text.into_raw());
-    } else {
-        log::debug!("event dropped (no callback): {} {}", event, json.to_string());
+        // 回调路径：克隆一份（队列里那份仍由 poll 消费方释放）
+        if let Ok(clone) = CString::new(json.to_string()) {
+            cb(user_data, clone.into_raw());
+        }
+    }
+}
+
+/// 取一条待处理事件（非阻塞）。无事件返回 null；返回值所有权归调用方，
+/// 须以 unidrop_free_string 归还。
+#[no_mangle]
+pub extern "C" fn unidrop_poll_event() -> *mut c_char {
+    let front = EVENT_QUEUE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pop_front();
+    match front {
+        Some(text) => text.into_raw(),
+        None => std::ptr::null_mut(),
     }
 }
 
