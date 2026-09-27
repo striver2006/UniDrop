@@ -53,6 +53,14 @@ class PlatformService {
 
   /// 持续把网络类型上报给 Rust（WifiOnly 接收策略的数据源）。
   /// 启动即报一次，之后每次变化再报——切网那一瞬就该换策略。
+  ///
+  /// 重连只在网络**类型真正变化**时触发（wifi→cellular 等）。
+  /// connectivity_plus 在部分 ROM 上会对同型波动频繁回调（Wi-Fi 信号
+  /// 重估、IPv6 刷新都算"变化"）；若照单全收地断开重连，正在握手的
+  /// 传输（OFFER 已发、带 token 的 ANSWER 在途）会被窗口期吞掉——
+  /// Mi 10 → iPhone 的图片传输失败即此（receiver 已连数据面干等，
+  /// sender 的 ANSWER 随断连丢失，60s 后服务端判 idle 失败）。
+  /// 半开死链的兜底仍由 core 侧 45s read 超时负责。
   StreamSubscription<void> watchNetwork() {
     String map(List<ConnectivityResult> results) {
       if (results.contains(ConnectivityResult.ethernet)) return 'ethernet';
@@ -61,14 +69,18 @@ class PlatformService {
       return 'unknown';
     }
 
+    String? lastKind;
+
     Future<void> report({bool changed = false}) async {
       try {
         final results = await Connectivity().checkConnectivity();
-        await NativeBridge.instance
-            .invoke('set_network', {'kind': map(results)});
-        // 切网即重连：旧链路在网切换后大概率已半开（TCP 无感知死亡），
-        // 与 core 侧 45s read 超时构成双保险——这里把发现延迟从 45s 压到毫秒级。
-        if (changed) {
+        final kind = map(results);
+        final previous = lastKind;
+        lastKind = kind;
+        await NativeBridge.instance.invoke('set_network', {'kind': kind});
+        // 只在类型真正变化时重连：同型波动（信号重估等）断开重连
+        // 会吞掉在途的传输握手。
+        if (changed && previous != null && previous != kind) {
           await NativeBridge.instance.invoke('reconnect');
         }
       } catch (_) {
