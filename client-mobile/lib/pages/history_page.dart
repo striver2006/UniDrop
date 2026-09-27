@@ -111,10 +111,17 @@ class _HistoryTile extends StatelessWidget {
     );
   }
 
+  /// SQLite 的 CURRENT_TIMESTAMP 存 UTC；展示给用户必须转本地时区，
+  /// 否则差 8 小时的时间会让人误判文件的保留状态。
   String _briefTime(HistoryEntry e) {
     final raw = e.createdAt ?? e.completedAt;
     if (raw == null) return '';
-    return raw.length >= 16 ? raw.substring(0, 16) : raw;
+    final utc = DateTime.tryParse('${raw}Z');
+    if (utc == null) return raw.length >= 16 ? raw.substring(0, 16) : raw;
+    final local = utc.toLocal();
+    String two(int v) => v.toString().padLeft(2, '0');
+    return '${local.year}-${two(local.month)}-${two(local.day)} '
+        '${two(local.hour)}:${two(local.minute)}';
   }
 }
 
@@ -177,8 +184,13 @@ class _HistoryDetail extends StatelessWidget {
                   },
                 ),
             ] else
+              // SEND 方向本来就不在本地缓存（源文件在发送者自己的设备上），
+              // 只有 RECEIVE 才存在「缓存被清理」的语义——混用一句话会让
+              // 用户误以为发送也丢了东西（实测困惑点）。
               Text(
-                '缓存文件已被清理（超出保留策略）',
+                entry.isReceive
+                    ? '缓存文件已被清理（超出保留策略）'
+                    : '发送的文件不保留副本（原件在你的设备上）',
                 style: theme.textTheme.bodySmall
                     ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
               ),
