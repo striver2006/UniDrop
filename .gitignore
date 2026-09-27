@@ -71,3 +71,6 @@ client-mobile/ios/NativeSources/lib/
 client-mobile/native/Cargo.lock
 *.ipa
 *.aab
+client-mobile/ohos/oh_modules/
+client-mobile/ohos/entry/oh_modules/
+client-mobile/ohos/entry/src/main/ets/plugins/GeneratedPluginRegistrant.ets
