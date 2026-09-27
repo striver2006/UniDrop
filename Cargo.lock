@@ -5135,6 +5135,7 @@ dependencies = [
 name = "unidrop-mobile-native"
 version = "0.4.2"
 dependencies = [
+ "base64 0.22.1",
  "log",
  "serde",
  "serde_json",

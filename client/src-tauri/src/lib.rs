@@ -471,7 +471,7 @@ pub fn run() {
             let state_for_router = app_state_for_core.clone();
             let state_for_recovery = app_state_for_core.clone();
             let state_for_sweep = app_state_for_core.clone();
-            let router = SignalRouter::new(state_for_router, bridge.clone());
+            let router = std::sync::Arc::new(SignalRouter::new(state_for_router, bridge.clone()));
             tauri::async_runtime::spawn(async move {
                 // router.spawn 内部再用 tokio::spawn 拆后台任务——此刻已在
                 // tauri 的 tokio runtime 上下文里，裸 tokio::spawn 是合法的。

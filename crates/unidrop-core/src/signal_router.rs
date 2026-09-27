@@ -51,6 +51,9 @@ pub struct ConfirmPending {
     pub received_at: Instant,
 }
 
+/// 可克隆（字段全为 Arc）：宿主通常持有一份 `Arc<SignalRouter>` 供确认应答
+/// （`respond_pending_offer`）使用，`spawn` 内部再克隆一份进消费循环。
+#[derive(Clone)]
 pub struct SignalRouter {
     state: Arc<AppState>,
     bridge: Arc<dyn HostBridge>,
@@ -70,17 +73,20 @@ impl SignalRouter {
         }
     }
 
-    /// 启动连接 actor 与信令消费循环。返回后立即返回，全部在后台 task 中运行。
-    pub fn spawn(self, actor: ConnectionActor) {
-        let (internal_tx, internal_rx) = mpsc::channel(128);
+    /// 启动连接 actor 与信令消费循环。立即返回，全部在后台 task 中运行。
+    ///
+    /// 必须在 tokio runtime 上下文中调用（内部裸 `tokio::spawn`）；
+    /// 桌面壳在 `tauri::async_runtime::spawn` 里调它，移动 FFI 在自建
+    /// runtime 的 block_on 里调它，两者都满足。
+    pub fn spawn(self: &Arc<Self>, actor: ConnectionActor) {
+        let (internal_tx, mut internal_rx) = mpsc::channel(128);
         tokio::spawn(actor.run(internal_tx, self.bridge.clone()));
-        tokio::spawn(self.consume(internal_rx));
-    }
-
-    async fn consume(self, mut internal_rx: mpsc::Receiver<ControlEnvelope>) {
-        while let Some(env) = internal_rx.recv().await {
-            self.handle_envelope(env).await;
-        }
+        let router = Arc::clone(self);
+        tokio::spawn(async move {
+            while let Some(env) = internal_rx.recv().await {
+                router.handle_envelope(env).await;
+            }
+        });
     }
 
     /// 用户对 Ask 档确认弹窗的应答入口（桌面面板 / 移动 FFI 均调这里）。
