@@ -204,8 +204,15 @@ iOS 认证与接收（用户实测收图）；Mac↔Android 双向传输（服�
 pubspec.ohos.yaml 依赖变体（openharmony-sig 插件 fork + connectivity
 4.x/6.x 运行时 shim）、ohos 工程壳 + prepare_ohos_plugin_wrappers.sh、
 flutter_tools 两处 patch（模块级 profile 容错 + 扁平布局模块名 '.'）。
-卡点：flutter build hap 的插件 har 生成链穿透七层生态断层后止步于
-pnpm×华为源运行时 bug（ERR_INVALID_THIS）；恢复路径：等 3.22+ ohos 分支
-工具链成熟，或用 DevEco GUI 打开 ohos/ 工程做 hvigor 迁移构建。
+卡点（Session 2 续·深入至 14 层）：ERR_INVALID_THIS 已解（wrapper pnpm
+7.30×新 node，升 8.15.9）；依赖矩阵第三版解通（file_picker 5/share_plus
+7.0.2/win32 override 4.1.4）；hvigorfile 形态正解（4.0.2 用 appTasks +
+typescript@4.9.5 显式依赖，ts 加载已验证）；插件 har 以源码 har 预制绕过；
+FFI 事件改轮询模式（2.19 无 NativeCallable，三端统一）。
+**最终止步**：主工程 assembleHap 在 hvigor 4.0.2 的 product 版本模型 ×
+2026 SDK（API 26）目录结构处（getModuleProductPath undefined）——2023 工具
+与 2026 SDK 的双向不互认。恢复路径：a) DevEco Studio GUI 打开 ohos/ 工程
+迁移构建+自动签名；b) 等 openharmony-sig 3.22+ ohos 工具分支。全部环境
+事实与正解形态已固化至 scripts/*.sh 与记忆。
 
 ---
