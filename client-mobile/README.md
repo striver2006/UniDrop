@@ -51,16 +51,24 @@ flutter run                                # 连接设备/模拟器
 ## 鸿蒙（HarmonyOS NEXT）构建与调试
 
 鸿蒙端 Dart 代码与本仓库完全一致（`lib/` 无平台分支），差异在平台壳与工具链。
-工具链基座：**openharmony-sig flutter_flutter 3.7.12（Dart 2.19）** + DevEco Studio
-自带 hvigor6（`flutter build hap` 经 `ohos/hvigorw` 委托给 DevEco，已是端到端一条命令）。
+工具链基座：**openharmony-sig flutter_flutter `3.7.12-ohos-1.0.4` 标签**
+（Dart 2.19；含 ROM 更新后 debug 闪退修复，见 fork FAQ #7/#8）+ 其专属构件桶
+（`flutter-ohos.obs.cn-south-1.myhuaweicloud.com`，AOT 的 gen_snapshot 与设备引擎
+版本严格配套，不能用官方桶的混）+ DevEco Studio 自带 hvigor6。
 
 ```bash
 # 0. 一次性环境准备
 ln -sfn 26.0.0 ~/Library/OpenHarmony/Sdk/26   # 华为工具的设备发现只认纯数字目录名
+# Apple Silicon Mac 需要 Rosetta（fork 的 gen_snapshot 只有 x86_64）：
+#   sudo softwareupdate --install-rosetta --agree-to-license
 export PATH="/Users/chenzhenbo/DevLib/Flutter-Ohos/bin:\
 /Users/chenzhenbo/Library/OpenHarmony/Sdk/26.0.0/toolchains:\
-/Applications/DevEco-Studio.app/Contents/tools/ohpm/bin:$PATH"
-export PUB_HOSTED_URL=https://pub.flutter-io.cn FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn
+/Applications/DevEco-Studio.app/Contents/tools/ohpm/bin:\
+/Applications/DevEco-Studio.app/Contents/tools/hvigor/bin:$PATH"
+export PUB_HOSTED_URL=https://pub.flutter-io.cn
+export FLUTTER_STORAGE_BASE_URL=https://flutter-ohos.obs.cn-south-1.myhuaweicloud.com
+# 注意：FLUTTER_STORAGE_BASE_URL 换源后须删 <flutter>/bin/cache 再构建
+# （fork README FAQ #2）；另需 `flutter config --enable-ohos`。
 
 # 1. 切依赖到鸿蒙变体（pubspec.ohos.yaml；切回用 main）
 ./scripts/use_ohos_deps.sh ohos
@@ -68,11 +76,16 @@ export PUB_HOSTED_URL=https://pub.flutter-io.cn FLUTTER_STORAGE_BASE_URL=https:/
 # 2. Rust → 鸿蒙 .so（改过 crates/ 或 native/ 后重跑；产物进 ohos/entry/libs/arm64-v8a/）
 ./scripts/build_native_ohos.sh --release
 
-# 3. 出包（kernel 编译 + ohpm + hvigor 签名一体），安装到真机
-flutter build hap --debug
+# 3. 出包（AOT/kernel + ohpm + hvigor 签名一体），安装到真机
+flutter build hap --release    # 或 --debug
 hdc install -r ohos/entry/build/default/outputs/default/entry-default-signed.hap
 hdc shell aa start -a EntryAbility -b com.unidrop.unidrop_mobile
 ```
+
+**本地工具链补丁**（Flutter-Ohos 检出内的未上游改动，换检出须重带）：
+`project.dart` 的 `isUsingGradle` 只认 Groovy——官方 3.44 起新工程默认
+`build.gradle.kts`，不认则 manifest 路径错算、embedding 误判 v1 致 ohos
+构建致命退出。已补认 `.kts`（当前检出 3.7.12-ohos-1.0.4 已带）。
 
 **真机调试与排障**（stderr 不进 hilog，通道断流时 attach 也不可用）：
 - Rust 核心日志：`{cache_dir}/unidrop-debug.log`；Dart bootstrap 面包屑：
@@ -84,6 +97,9 @@ hdc shell aa start -a EntryAbility -b com.unidrop.unidrop_mobile
   hdc shell "aa start -a EntryAbility -b com.unidrop.unidrop_mobile -U \
     'unidropmobile://setup?server=wss%3A%2F%2F<host>%3A<port>&account=<账号>&psk=<密钥>&trust=pinned&pin=<sha256指纹>'"
   ```
+- **降级安装陷阱**：`install -r` 遇 versionCode 回退（工具从 pubspec build 号
+  同步）会留下旧 native 库——`Wrong full snapshot version` 闪退即此；
+  先 `hdc uninstall` 再装。
 
 **当前平台限制**（fork 引擎 Dart→ArkTS platform channel 断流的实测规避，
 根因待 fork 修复后回退）：剪贴板读写/文件选择/系统分享不可用
