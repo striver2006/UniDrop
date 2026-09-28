@@ -368,13 +368,25 @@ class AppStore extends ChangeNotifier {
   Future<bool> sendClipboardText(String targetDevice) async {
     final text = await platform.readClipboardText();
     if (text == null) {
-      _toast('剪贴板没有可发送的文本');
+      // 鸿蒙 channel 断流时 Clipboard.getData 超时兜底为 null——「读不到」
+      // 不是「没有」，文案必须说实话并指向手动输入路径。
+      _toast(isOhosRuntime() ? '鸿蒙剪贴板暂不可读，请用下方手动输入' : '剪贴板没有可发送的文本');
+      return false;
+    }
+    return sendText(targetDevice, text);
+  }
+
+  /// 发送指定文本（鸿蒙手动输入路径；其他平台的直接调用入口）。
+  Future<bool> sendText(String targetDevice, String text) async {
+    final t = text.trim();
+    if (t.isEmpty) {
+      _toast('请输入要发送的文本');
       return false;
     }
     try {
       await native.invokeData(
-          'send_text', {'target_device': targetDevice, 'text': text});
-      _toast('已发起发送：文本（${text.length} 字）');
+          'send_text', {'target_device': targetDevice, 'text': t});
+      _toast('已发起发送：文本（${t.length} 字）');
       return true;
     } catch (e) {
       _toast('发送失败：$e');

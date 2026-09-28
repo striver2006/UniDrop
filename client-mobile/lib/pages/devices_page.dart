@@ -11,6 +11,7 @@ import '../dbg.dart';
 import '../models.dart';
 import '../state/app_store.dart';
 import '../widgets/adaptive.dart';
+import '../widgets/ohos_keyboard.dart';
 
 class DevicesPage extends StatelessWidget {
   const DevicesPage({super.key});
@@ -103,6 +104,8 @@ class _DeviceTile extends StatelessWidget {
         if (!class_.useTwoPane) {
           showModalBottomSheet(
             context: context,
+            // 鸿蒙手动输入会带屏上键盘，面板超高需可滚动+占满高度
+            isScrollControlled: true,
             builder: (_) => const _SendPanel(),
           );
         }
@@ -138,9 +141,24 @@ class _DeviceTile extends StatelessWidget {
   }
 }
 
-/// 快捷发送面板：发给目标设备（文件 / 剪贴板文本）。
-class _SendPanel extends StatelessWidget {
+/// 快捷发送面板：发给目标设备（文件 / 剪贴板文本 / 鸿蒙手动输入）。
+class _SendPanel extends StatefulWidget {
   const _SendPanel();
+
+  @override
+  State<_SendPanel> createState() => _SendPanelState();
+}
+
+class _SendPanelState extends State<_SendPanel> {
+  final _manualCtl = TextEditingController();
+  OhosKeyboardTarget? _kbdTarget;
+  final bool _isOhos = isOhosRuntime();
+
+  @override
+  void dispose() {
+    _manualCtl.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -158,7 +176,7 @@ class _SendPanel extends StatelessWidget {
       );
     }
 
-    return Padding(
+    return SingleChildScrollView(
       padding: const EdgeInsets.all(20),
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -195,9 +213,44 @@ class _SendPanel extends StatelessWidget {
               if (sent && context.mounted) Navigator.of(context).maybePop();
             },
           ),
+          // 鸿蒙 channel 断流期間剪贴板/系统键盘都不可用：手动输入是主路径。
+          if (_isOhos) ...[
+            const SizedBox(height: 16),
+            OhosField(
+              target: OhosKeyboardTarget(
+                  controller: _manualCtl, label: '手动输入文本'),
+              active: _kbdTarget != null,
+              hint: '剪贴板不可读时的发送入口',
+              onActivate: () => setState(() {
+                _kbdTarget = OhosKeyboardTarget(
+                    controller: _manualCtl, label: '手动输入文本');
+              }),
+            ),
+            const SizedBox(height: 10),
+            FilledButton.tonalIcon(
+              icon: const Icon(Icons.send),
+              label: const Text('发送该文本'),
+              onPressed: () async {
+                final sent =
+                    await store.sendText(target.deviceId, _manualCtl.text);
+                if (sent) {
+                  _manualCtl.clear();
+                  if (context.mounted) Navigator.of(context).maybePop();
+                }
+              },
+            ),
+            if (_kbdTarget != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 10),
+                child: OhosKeyboardPanel(
+                  target: _kbdTarget!,
+                  onDone: () => setState(() => _kbdTarget = null),
+                ),
+              ),
+          ],
           // 鸿蒙 channel 断流期間剪贴板/键盘都不可用，debug 构建给一个
           // 固定文本探针打通发送链验收；release 构建不含此入口。
-          if (kDebugMode && isOhosRuntime()) ...[
+          if (kDebugMode && _isOhos) ...[
             const SizedBox(height: 10),
             OutlinedButton.icon(
               icon: const Icon(Icons.send),
