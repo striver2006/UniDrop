@@ -1,33 +1,28 @@
-# 鸿蒙构建专用依赖变体（scripts/use_ohos_deps.sh 切换软链）。
-# 基座：openharmony-sig flutter_flutter 3.7.12（Dart 2.19）——华为 3.22+
-# 分支工具链未成熟（详见 docs/design/MOBILE_PLAN_V2.md 鸿蒙章节与执行记录）。
-# 与主 pubspec 的差异：SDK 约束放宽到 2.19、插件降到 2.19 可解版本、
-# path_provider/device_info_plus/connectivity_plus 走 openharmony-sig fork。
 name: unidrop_mobile
 description: "UniClip（瞬贴）移动端：iOS / Android / 鸿蒙共享一套 Dart 代码"
 publish_to: 'none'
 version: 0.4.3+2
 
 environment:
-  sdk: ">=2.19.0 <4.0.0"
+  sdk: ^3.12.0
 
 dependencies:
   flutter:
     sdk: flutter
-  cupertino_icons: ^1.0.6
-  provider: ^6.0.0
-  ffi: ^2.0.1
-  path_provider: ^2.0.0
-  device_info_plus: ^8.0.0
-  connectivity_plus: ^4.0.0
-  file_picker: ^5.0.0
-  share_plus: 7.0.2
+  cupertino_icons: ^1.0.8
+  provider: ^6.1.2
+  ffi: ^2.1.3
+  path_provider: ^2.1.4
+  device_info_plus: ^11.0.0
+  connectivity_plus: ^6.0.5
+  file_picker: ^10.0.0
+  share_plus: ^11.0.0
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  flutter_lints: ^2.0.0
-  flutter_launcher_icons: ^0.13.1
+  flutter_lints: ^5.0.0
+  flutter_launcher_icons: ^0.14.1
 
 # 移动端图标：与 Mac 端同源（client/src-tauri/icons/icon.png 的双向传输箭头），
 # 配色升级为移动图标风格（靛蓝→青渐变 + 白色箭头，与 App 主题色一致）。
@@ -45,25 +40,3 @@ flutter:
   assets:
     - assets/icon/
 
-# win32 只在 Windows 桌面构建被链接；移动端构建不碰它。
-# 各插件对 win32 的版本要求交叉冲突（file_picker 要 5.x、device_info_plus 8 要 <5），
-# 以 override 统一，对三移动端零影响。
-dependency_overrides:
-  win32: 4.1.4
-  # 鸿蒙：openharmony-sig 的插件适配版（ohos 平台实现）。
-  # 官方 pub 上的这些插件不含 ohos 端，运行时会 MissingPluginException。
-  path_provider:
-    git:
-      url: "https://gitee.com/openharmony-sig/flutter_packages.git"
-      path: "packages/path_provider/path_provider"
-      ref: "master"
-  device_info_plus:
-    git:
-      url: "https://gitee.com/openharmony-sig/flutter_plus_plugins.git"
-      path: "packages/device_info_plus/device_info_plus"
-      ref: "master"
-  connectivity_plus:
-    git:
-      url: "https://gitee.com/openharmony-sig/flutter_plus_plugins.git"
-      path: "packages/connectivity_plus/connectivity_plus"
-      ref: "master"

@@ -26,14 +26,19 @@ on:
 jobs:
   cross-check:
     name: Cross-compile Check (${{ matrix.target }})
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - aarch64-linux-android
-          - x86_64-linux-android
-          - aarch64-apple-ios
+        include:
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+          - target: x86_64-linux-android
+            os: ubuntu-latest
+          # iOS target 需要 xcrun（ring/aws-lc-sys/libsqlite3-sys 的 build
+          # script 实测会调它），Linux runner 上没有——走 macos runner。
+          - target: aarch64-apple-ios
+            os: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -41,20 +46,19 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
-      # iOS target 在 Linux 上无链接器可用，check-only 不触发链接，
-      # 但 clang/cc 的探测需要占位环境；Android 用 NDK 工具链。
-      - name: Setup Android NDK (Android targets)
+      # GitHub runner 的 NDK 在 $ANDROID_NDK_LATEST_HOME（ndk-bundle 早已不存在）；
+      # CC/linker 按 target 三元组拼（x86_64 与 aarch64 前缀不同）。
+      - name: Configure Android NDK (Android targets)
         if: endsWith(matrix.target, 'linux-android')
         run: |
-          ANDROID_ROOT=/usr/local/lib/android/sdk
-          NDK=$ANDROID_ROOT/ndk-bundle
-          echo "ANDROID_NDK_HOME=$NDK" >> $GITHUB_ENV
+          TRIPLE="${{ matrix.target }}"
+          CLANG="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${TRIPLE}24-clang"
+          test -x "$CLANG" || { echo "NDK clang 不存在: $CLANG"; ls "$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/" | head; exit 1; }
+          echo "CC_$(echo "$TRIPLE" | tr '-' '_')=$CLANG" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_$(echo "$TRIPLE" | tr 'a-z-' 'A-Z_')_LINKER=$CLANG" >> "$GITHUB_ENV"
 
       - name: cargo check
         run: cargo check -p unidrop-mobile-native --target ${{ matrix.target }}
-        env:
-          CC_aarch64_linux_android: ${{ endsWith(matrix.target, 'linux-android') && format('{0}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang', env.ANDROID_NDK_HOME) || '' }}
-          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: ${{ endsWith(matrix.target, 'linux-android') && format('{0}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang', env.ANDROID_NDK_HOME) || '' }}
 
   # 鸿蒙 target（aarch64-unknown-linux-ohos）需要 DevEco 的 OHOS llvm（tier-3），
   # GitHub runner 上没有官方渠道；放到 self-hosted 或本机跑：
