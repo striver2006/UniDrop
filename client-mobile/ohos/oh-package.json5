@@ -9,9 +9,12 @@
   "dependencies": {
     "@ohos/flutter_ohos": "file:./har/flutter.har"
   },
-  "devDependencies": {
-      },
+  "devDependencies": {},
   "overrides": {
-    "@ohos/flutter_ohos": "file:./har/flutter.har"
+    "@ohos/flutter_ohos": "file:./har/flutter.har",
+    "path_provider_ohos": "file:./har/path_provider_ohos.har",
+    "connectivity_plus": "file:./har/connectivity_plus.har",
+    "device_info_plus": "file:./har/device_info_plus.har",
+    "@ohos/flutter_module": "file:./entry"
   }
 }

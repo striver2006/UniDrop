@@ -63,6 +63,17 @@
     ],
     "requestPermissions": [
       {"name" :  "ohos.permission.INTERNET"},
+      {
+        // 读蓝牙本机名（华为设备蓝牙名默认跟随「关于本机」设备名称），
+        // 用于 roster 上报真实设备名；user_grant 且无需 profile 放行，
+        // 零售机可装。运行时在 EntryAbility 弹窗申请。
+        "name": "ohos.permission.ACCESS_BLUETOOTH",
+        "reason": "$string:device_name_permission_reason",
+        "usedScene": {
+          "abilities": ["EntryAbility"],
+          "when": "inuse"
+        }
+      }
     ]
   }
 }

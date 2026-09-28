@@ -11,6 +11,10 @@
     {
       "name": "EntryAbility_label",
       "value": "瞬贴"
+    },
+    {
+      "name": "device_name_permission_reason",
+      "value": "用于读取本机设备名称，在设备列表中向其他设备显示"
     }
   ]
 }

@@ -23,6 +23,9 @@ import AbilityConstant from '@ohos.app.ability.AbilityConstant';
 import settings from '@ohos.settings';
 import deviceInfo from '@ohos.deviceInfo';
 import fs from '@ohos.file.fs';
+import abilityAccessCtrl, { Permissions } from '@ohos.abilityAccessCtrl';
+import connection from '@ohos.bluetooth.connection';
+import window from '@ohos.window';
 
 export default class EntryAbility extends FlutterAbility {
   configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -31,9 +34,14 @@ export default class EntryAbility extends FlutterAbility {
     this.registerDeviceNameChannel(flutterEngine)
   }
 
-  // 上报对端 roster 的真实设备名：「设置→关于本机」的设备名称
-  // （settings.general.DEVICE_NAME）；API 20+ 需 READ_LOCAL_DEVICE_NAME
-  // 权限，未授权/取不到回落市场机型名（marketName，如「Pura 70 Ultra」）。
+  // 上报对端 roster 的真实设备名。取数优先级：
+  // 1. 「设置→关于本机」设备名称（settings.general.DEVICE_NAME）——
+  //    READ_LOCAL_DEVICE_NAME 需 AGC profile 放行（provisionEnable），
+  //    profile 未放行时只回出厂默认名（机型）；
+  // 2. 蓝牙本机名（connection.getLocalName，user_grant 的
+  //    ACCESS_BLUETOOTH 即可，零售机可装可授），华为设备蓝牙名默认
+  //    跟随设备名称；
+  // 3. 市场机型名（marketName，如「Pura 70 Ultra」）。
   private registerDeviceNameChannel(engine: FlutterEngine) {
     const channel = new MethodChannel(
       engine.dartExecutor.getBinaryMessenger(), 'unidrop/device_name');
@@ -43,25 +51,72 @@ export default class EntryAbility extends FlutterAbility {
           result.notImplemented();
           return;
         }
+        const btName = this.bluetoothLocalName();
         try {
           settings.getValue(this.context, settings.general.DEVICE_NAME)
             .then((v) => {
-              result.success(v.length > 0 ? v : deviceInfo.marketName);
+              console.log('UniClip deviceName sources: settings=' + v + ' bt=' + btName);
+              result.success(this.pickDeviceName(v, btName));
             })
             .catch(() => {
-              result.success(deviceInfo.marketName);
+              console.log('UniClip deviceName sources: settings=<err> bt=' + btName);
+              result.success(this.pickDeviceName('', btName));
             });
         } catch (e) {
-          result.success(deviceInfo.marketName);
+          result.success(this.pickDeviceName('', btName));
         }
       }
     };
     channel.setMethodCallHandler(handler);
   }
 
+  private pickDeviceName(settingsName: string, btName: string): string {
+    // settings 未放行时回出厂名（字面量未必等于 marketName，无法可靠比对），
+    // 而华为设备的蓝牙名始终跟随用户自设设备名，故蓝牙名优先。
+    if (btName.length > 0) {
+      return btName;
+    }
+    if (settingsName.length > 0) {
+      return settingsName;
+    }
+    return deviceInfo.marketName;
+  }
+
+  private bluetoothLocalName(): string {
+    try {
+      return connection.getLocalName();
+    } catch (e) {
+      console.error('UniClip bt getLocalName failed: ' + JSON.stringify(e));
+      return '';
+    }
+  }
+
   async onCreate(want: Want, launchParam: AbilityConstant.LaunchParam) {
     this.handleSetupUri(want);
     await super.onCreate(want, launchParam);
+  }
+
+  onWindowStageCreate(windowStage: window.WindowStage): void {
+    super.onWindowStageCreate(windowStage);
+    this.requestDeviceNamePermission();
+  }
+
+  // ACCESS_BLUETOOTH 是 user_grant 权限：首次启动弹窗申请。
+  // 授权后 connection.getLocalName() 才可用。已授权时该调用直接返回，不重复弹窗。
+  private requestDeviceNamePermission() {
+    try {
+      const atManager = abilityAccessCtrl.createAtManager();
+      const permissions: Array<Permissions> = ['ohos.permission.ACCESS_BLUETOOTH'];
+      atManager.requestPermissionsFromUser(this.context, permissions)
+        .then((data) => {
+          console.log('UniClip ACCESS_BLUETOOTH authResults: ' + JSON.stringify(data.authResults));
+        })
+        .catch((e: Error) => {
+          console.error('UniClip ACCESS_BLUETOOTH request failed: ' + e.message);
+        });
+    } catch (e) {
+      console.error('UniClip ACCESS_BLUETOOTH setup failed');
+    }
   }
 
   onNewWant(want: Want, launchParam: AbilityConstant.LaunchParam) {
