@@ -23,6 +23,10 @@ class AppStore extends ChangeNotifier {
   final NativeBridge native = NativeBridge.instance;
 
   OnlineDevice? selfInfo;
+
+  /// 平台探测设备名（bootstrap 时取一次）。设置页清空自定义设备名后，
+  /// 本机条目回落显示它（core 侧的回落源 AppState.hostname 是同一值）。
+  String? platformDeviceName;
   List<OnlineDevice> devices = [];
   final transfers = <String, ActiveTransfer>{};
   List<HistoryEntry> history = [];
@@ -60,6 +64,7 @@ class AppStore extends ChangeNotifier {
       final paths = await platform.resolvePaths();
       dbgLog('bootstrap: paths db=${paths.dbPath} cache=${paths.cacheDir}');
       final deviceName = await platform.deviceName();
+      platformDeviceName = deviceName;
       dbgLog('bootstrap: deviceName=$deviceName, native.start…');
       // 鸿蒙调试/CI 注入口（EntryAbility 经 unidropmobile://setup?… 落盘）：
       // channel 断流期间键盘不可用，设置由此覆盖。文件一次性消费。
@@ -317,6 +322,22 @@ class AppStore extends ChangeNotifier {
   Future<void> saveSettings(AppSettingsDto next) async {
     await native.invokeData('save_settings', {'settings': next.toJson()});
     settings = next;
+    // 改名即时生效：core 保存后立即重连上报新 hostname；本机条目字段
+    // 不可变，在这里重建，设置页「本机」区块无需等重启。
+    final self = selfInfo;
+    if (self != null) {
+      final effective =
+          next.deviceName.isNotEmpty ? next.deviceName : platformDeviceName;
+      if (effective != null && effective != self.hostname) {
+        selfInfo = OnlineDevice(
+          deviceId: self.deviceId,
+          hostname: effective,
+          osType: self.osType,
+          appVersion: self.appVersion,
+          remoteIp: self.remoteIp,
+        );
+      }
+    }
     notifyListeners();
   }
 

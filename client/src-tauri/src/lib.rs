@@ -372,12 +372,22 @@ pub fn run() {
         ));
     }
 
+    // 用户自定义设备名优先于 whoami 主机名（移动端 iOS 16+ 拿不到系统真名
+    // 的主路径，见 core::settings::AppSettings::device_name 注释）。桌面 UI
+    // 暂不暴露该字段，此处对齐只为两端语义一致；HostEnv 仍存 whoami 名——
+    // 它是清空自定义名后的回落源（save_settings_flow 用 AppState.hostname）。
+    let effective_hostname = if initial_settings.device_name.is_empty() {
+        whoami_hostname()
+    } else {
+        initial_settings.device_name.clone()
+    };
+
     let config = core::connection_actor::ConnectionConfig {
         server_url: initial_settings.server_url.clone(),
         account_id: initial_settings.account_id.clone(),
         device_id: device_id.clone(),
         psk_secret: initial_settings.psk_secret.clone(),
-        hostname: whoami_hostname(),
+        hostname: effective_hostname,
         os_type: std::env::consts::OS.to_string(),
         app_version: app_state::APP_VERSION.to_string(),
         // 指纹解析失败不能让应用起不来：回落到最安全的一档，

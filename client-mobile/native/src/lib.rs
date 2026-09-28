@@ -345,7 +345,14 @@ fn start_inner(config_json: *const c_char) -> Result<serde_json::Value, String> 
             account_id: initial_settings.account_id.clone(),
             device_id: device_id.clone(),
             psk_secret: initial_settings.psk_secret.clone(),
-            hostname: device_name.clone(),
+            // 用户自定义设备名（设置页可改，iOS 16+ 拿不到系统真名后的主路径）
+            // 优先于宿主探测的平台名；HostEnv 仍存平台名——它是用户清空
+            // 自定义名后的回落源（save_settings_flow 用 AppState.hostname）。
+            hostname: if initial_settings.device_name.is_empty() {
+                device_name.clone()
+            } else {
+                initial_settings.device_name.clone()
+            },
             // aarch64-unknown-linux-ohos 上报 target_os="linux" /
             // target_env="ohos"，consts::OS 会是 "linux"；服务端 roster
             // 与统计需要真实平台标识，按 target_env 区分。

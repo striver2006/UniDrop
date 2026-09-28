@@ -177,6 +177,7 @@ class AppSettingsDto {
     required this.transferCardRetainSecs,
     required this.cacheTtlHours,
     required this.cacheMaxSizeMb,
+    this.deviceName = '',
   });
 
   String serverUrl;
@@ -191,6 +192,11 @@ class AppSettingsDto {
   int transferCardRetainSecs;
   int cacheTtlHours;
   int cacheMaxSizeMb;
+
+  /// 用户自定义设备显示名；空串 = 未设置，跟随平台探测名。
+  /// iOS 16+ 系统不再提供真实设备名，设置页靠它改名（Rust 侧落库并
+  /// 在启动/保存时优先于平台探测名，见 core settings.rs）。
+  String deviceName;
 
   factory AppSettingsDto.fromJson(Map<String, dynamic> j) => AppSettingsDto(
         serverUrl: j['server_url'] as String? ?? '',
@@ -208,6 +214,7 @@ class AppSettingsDto {
             (j['transfer_card_retain_secs'] as num?)?.toInt() ?? 30,
         cacheTtlHours: (j['cache_ttl_hours'] as num?)?.toInt() ?? 24,
         cacheMaxSizeMb: (j['cache_max_size_mb'] as num?)?.toInt() ?? 10240,
+        deviceName: (j['device_name'] as String?) ?? '',
       );
 
   Map<String, dynamic> toJson() => {
@@ -229,6 +236,7 @@ class AppSettingsDto {
         'cache_max_size_mb': cacheMaxSizeMb,
         'cache_sweep_interval_minutes': 60,
         'legacy_allow_insecure_tls': tlsTrustMode == 'insecure',
+        'device_name': deviceName,
       };
 }
 

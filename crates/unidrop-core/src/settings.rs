@@ -111,6 +111,21 @@ pub struct AppSettings {
     /// `wifi_only`（由移动壳构造首份设置时指定）。见 `host::ReceivePolicy`。
     #[serde(default)]
     pub receive_policy: crate::host::ReceivePolicy,
+
+    /// 用户自定义设备显示名（连接层上报的 hostname）；空串 = 未设置，
+    /// 跟随平台探测名（移动端平台 API / 桌面 whoami）。
+    ///
+    /// 为什么需要它：iOS 16 起 Apple 把 `UIDevice.name` 对第三方 App 脱敏成
+    /// 通用型号名（"iPhone"），恢复真实名需 Apple 审批的
+    /// `user-assigned-device-name` entitlement，个人开发者签名拿不到——
+    /// 设置界面是 iOS 端拿到「像真名的名字」的唯一途径（业界通行做法，
+    /// Home Assistant 同期同样改成手动设置）。保存后由
+    /// `save_settings_flow` 更新 config 并立即重连，改名免重启即时生效。
+    ///
+    /// 裸 `#[serde(default)]` 在这里是安全方向：老库缺键 → 空串 → 未设置，
+    /// 行为与升级前完全一致。
+    #[serde(default)]
+    pub device_name: String,
 }
 
 /// E2EE 默认开启。回落机制保证了对端老版本不会因此失败，
@@ -203,6 +218,7 @@ impl AppSettings {
             pinned_cert_sha256: Vec::new(),
             e2ee_enabled: true,
             receive_policy: Default::default(),
+            device_name: String::new(),
         }
     }
 }
@@ -229,6 +245,25 @@ pub fn validate_account_id(s: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 设备名清洗（保存流程用）：剥控制字符 + trim，超长报错。
+///
+/// hostname 会进服务端 roster 广播，控制字符（尤其换行）必须剥掉。
+/// 长度按字符数（不是字节）算 64 上限：中文设备名 3 字节/字，按字节算
+/// 会把合法名字误杀。超限**当场报错**而不是静默截断——静默截断会让
+/// 面板显示的名字与实际上报的不一致，用户无从分辨。
+fn sanitize_device_name(raw: &str) -> Result<String, String> {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if cleaned.chars().count() > 64 {
+        return Err("设备名最长 64 个字符".to_string());
+    }
+    Ok(cleaned)
+}
+
 /// 保存设置的全流程（清洗 → 落库 → 更新内存与 actor → 重连 → 认领 → 修剪）。
 ///
 /// 从桌面 `cmd_save_settings` 下沉，桌面 tauri command 与移动 FFI 共用。
@@ -242,6 +277,7 @@ pub async fn save_settings_flow(
     // 面板那一层已经拦过一次，这里是兜底——理由见 validate_account_id。
     clean_settings.account_id = clean_settings.account_id.trim().to_string();
     validate_account_id(&clean_settings.account_id)?;
+    clean_settings.device_name = sanitize_device_name(&clean_settings.device_name)?;
 
     clean_settings.server_url = clean_settings
         .server_url
@@ -299,6 +335,13 @@ pub async fn save_settings_flow(
         cfg.account_id = clean_settings.account_id.clone();
         cfg.psk_secret = clean_settings.psk_secret.clone();
         cfg.tls_trust = trust_config;
+        // 设备名：自定义非空即覆盖；清空回落平台探测名（AppState.hostname
+        // 保存的就是它）。改名随步骤 4 的重连即时生效，对端 roster 立刻更新。
+        cfg.hostname = if clean_settings.device_name.is_empty() {
+            state.hostname.clone()
+        } else {
+            clean_settings.device_name.clone()
+        };
     }
 
     // 3. Clear online devices from previous server/account and notify frontend
@@ -387,6 +430,9 @@ mod tests {
         assert_eq!(parsed.psk_secret, "user-configured-secret");
         assert!(parsed.auto_inject);
         assert!(!parsed.start_minimized, "缺失的新字段应取默认值 false");
+        // device_name 同理：老库缺键 → 空串 = 未设置 → 跟随平台探测名，
+        // 行为与升级前一致。这条钉住「新增字段不冲掉用户配置」的那半。
+        assert!(parsed.device_name.is_empty(), "老库缺 device_name 应取空串而非报错");
 
         // 这两条守护的是 #[serde(default = "...")] 而不是裸 #[serde(default)]：
         // u32 的 Default 是 0，而 0 在本功能里表示「不限制 / 不自动消失」。
@@ -468,6 +514,7 @@ mod tests {
     fn current_settings_json_round_trips() {
         let settings = AppSettings {
             start_minimized: true,
+            device_name: "陈振博的 iPhone".to_string(),
             ..AppSettings::default_config()
         };
         let json = serde_json::to_string(&settings).expect("序列化失败");
@@ -476,6 +523,7 @@ mod tests {
         assert_eq!(parsed.server_url, settings.server_url);
         assert_eq!(parsed.account_id, settings.account_id);
         assert_eq!(parsed.psk_secret, settings.psk_secret);
+        assert_eq!(parsed.device_name, settings.device_name);
         assert_eq!(parsed.auto_inject, settings.auto_inject);
         assert!(parsed.start_minimized);
         assert_eq!(parsed.history_max_entries, settings.history_max_entries);
@@ -669,5 +717,28 @@ mod tests {
                 .to_string(),
         ];
         assert!(s.tls_trust_config().is_ok(), "openssl 原样输出必须能直接粘进来");
+    }
+
+    /// 设备名里的换行必须被剥掉：hostname 会进服务端 roster 广播，
+    /// 带换行的名字在对端列表里会拆成两行。
+    #[test]
+    fn sanitize_device_name_strips_control_chars_and_trims() {
+        assert_eq!(
+            sanitize_device_name("  Bob的\u{1}iPhone\n").unwrap(),
+            "Bob的iPhone"
+        );
+        assert_eq!(sanitize_device_name("\t\r\n").unwrap(), "");
+        // 中文按字符数计：64 字远超 64 字节，不能被字节上限误杀。
+        let cjk64 = "设".repeat(64);
+        assert_eq!(sanitize_device_name(&cjk64).unwrap(), cjk64);
+    }
+
+    #[test]
+    fn sanitize_device_name_rejects_over_length() {
+        let too_long = "a".repeat(65);
+        assert!(sanitize_device_name(&too_long).is_err(), "65 字符必须被拒绝");
+        // 65 个中文 trim 后仍是 65 字（不是 195 字节的问题）
+        let cjk65 = "名".repeat(65);
+        assert!(sanitize_device_name(&cjk65).is_err(), "长度上限按字符数计");
     }
 }

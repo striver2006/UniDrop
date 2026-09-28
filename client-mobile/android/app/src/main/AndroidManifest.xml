@@ -3,6 +3,13 @@
          release 缺它会以 Operation not permitted 拒绝所有出站 socket。 -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 真实设备名：国内 ROM（MIUI/HyperOS）的 Settings 键不可读，设备名同步
+         在蓝牙本机名里。Android 12+ 读蓝牙名需 BLUETOOTH_CONNECT（运行时，
+         MainActivity 按需弹窗）；12 以下走老 BLUETOOTH（安装期自动授予）。 -->
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
     <application
         android:label="瞬贴"
         android:name="${applicationName}"

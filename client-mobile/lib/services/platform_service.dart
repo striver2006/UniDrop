@@ -19,6 +19,7 @@ import 'package:share_plus/share_plus.dart';
 
 import '../dbg.dart';
 import '../ffi/bridge.dart';
+import 'ios_device_models.dart';
 
 /// 路径三分配置（record 是 Dart 3 语法，2.19 兼容用小类）。
 class PathConfig {
@@ -79,24 +80,39 @@ class PlatformService {
     );
   }
 
-  /// 平台设备名（连接层上报的 hostname）。
-  /// 三端都取「真正的设备名」而不是机型：iOS=UIDevice.name（用户自定义名），
-  /// Android/鸿蒙走自研 unidrop/device_name 通道（Android 读 Settings 的
-  /// device_name，鸿蒙读 settings.general.DEVICE_NAME 回落 marketName）。
+  /// 平台探测设备名（连接层上报的 hostname 的**探测侧**来源）。
+  ///
+  /// 用户在设置页自定义的设备名（Rust 侧 AppSettings.device_name，SQLite
+  /// 持久化）优先于此处——core 启动与 save_settings 时都会覆盖。本函数只
+  /// 负责探测：Android/鸿蒙走自研 unidrop/device_name 通道（读 Settings 的
+  /// device_name / 蓝牙本机名）；iOS 16+ 把 UIDevice.name 脱敏成通用型号名
+  /// （永远 "iPhone"）、gethostname 在沙盒里只回 "localhost"，真实设备名
+  /// 对应用不可见（唯一官方途径是需 Apple 审批的受管 entitlement，个人
+  /// 开发者签名拿不到），兜底用机型营销名（iPhoneXX,Y → "iPhone 16 Pro"，
+  /// 见 ios_device_models.dart）。
   Future<String> deviceName() async {
     final info = DeviceInfoPlugin();
     try {
       if (isOhosRuntime() || Platform.isAndroid) {
+        // 重试参数按平台分开：Android 首启可能弹 BLUETOOTH_CONNECT 授权
+        // （读蓝牙本机名，国内 ROM 的设备名在那），原生侧挂起等弹窗结果，
+        // 给单次长窗口；鸿蒙保持短超时快重试——那边 channel 断流时不能
+        // 拖慢 bootstrap（权限已在 EntryAbility 启动期请求）。
+        final ohos = isOhosRuntime();
         final real = await retryChannel(
             'deviceName',
             () => const MethodChannel('unidrop/device_name')
                 .invokeMethod<String>('getDeviceName'),
-            attempts: 3);
+            attempts: ohos ? 3 : 1,
+            timeout: ohos
+                ? const Duration(seconds: 2)
+                : const Duration(seconds: 20));
         if (real != null && real.isNotEmpty) return real;
       }
       if (Platform.isIOS) {
         final ios = await retryChannel('iosInfo', () => info.iosInfo);
-        return ios.name; // 用户可自定义的设备名（「张三的 iPhone」）
+        if (!isGenericIosName(ios.name)) return ios.name; // iOS 15 及以下仍是用户自设名
+        return iosMarketingName(ios.utsname.machine) ?? ios.name;
       }
       if (Platform.isAndroid) {
         // 通道失败的兜底（异常 ROM）：至少给机型而不是通用名

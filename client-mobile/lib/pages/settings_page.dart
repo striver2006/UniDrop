@@ -8,6 +8,8 @@
 
 library;
 
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -32,6 +34,7 @@ class _SettingsPageState extends State<SettingsPage> {
   late TextEditingController _retainSecs;
   late TextEditingController _cacheTtl;
   late TextEditingController _cacheMaxMb;
+  late TextEditingController _deviceName;
 
   /// 本地编辑态：初始从持久化设置取，保存前不落库。
   late String _trustMode;
@@ -66,6 +69,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _retainSecs = TextEditingController();
     _cacheTtl = TextEditingController();
     _cacheMaxMb = TextEditingController();
+    _deviceName = TextEditingController();
     _trustMode = 'public_ca';
     _policy = 'always';
     _e2ee = true;
@@ -91,6 +95,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _retainSecs.text = s.transferCardRetainSecs.toString();
     _cacheTtl.text = s.cacheTtlHours.toString();
     _cacheMaxMb.text = s.cacheMaxSizeMb.toString();
+    _deviceName.text = s.deviceName;
     _trustMode = s.tlsTrustMode;
     _policy = s.receivePolicy;
     _e2ee = s.e2eeEnabled;
@@ -107,6 +112,7 @@ class _SettingsPageState extends State<SettingsPage> {
     _retainSecs.dispose();
     _cacheTtl.dispose();
     _cacheMaxMb.dispose();
+    _deviceName.dispose();
     super.dispose();
   }
 
@@ -239,6 +245,17 @@ class _SettingsPageState extends State<SettingsPage> {
               'ID：${store.selfInfo?.deviceId ?? ''}',
             ),
           ),
+          const SizedBox(height: 12),
+          // iOS 16+ 系统不再向 App 提供真实设备名（Apple 对第三方脱敏，恢复
+          // 需审批 entitlement，个人签名拿不到），这里是 iOS 改名的唯一入口；
+          // 其他平台留空即跟随系统名。保存即重连上报，对端设备列表立刻更新。
+          _field(
+            _deviceName,
+            label: '设备名',
+            helper: Platform.isIOS
+                ? 'iOS 16+ 系统不再提供真实设备名，请在此自定义；留空用机型名兜底'
+                : '对端设备列表显示的名字；留空跟随系统',
+          ),
           const SizedBox(height: 32),
         ],
             ),
@@ -326,6 +343,7 @@ class _SettingsPageState extends State<SettingsPage> {
       transferCardRetainSecs: parseNum(_retainSecs, current.transferCardRetainSecs),
       cacheTtlHours: parseNum(_cacheTtl, current.cacheTtlHours),
       cacheMaxSizeMb: parseNum(_cacheMaxMb, current.cacheMaxSizeMb),
+      deviceName: _deviceName.text.trim(),
     );
 
     setState(() => _saving = true);
