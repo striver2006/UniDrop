@@ -246,6 +246,7 @@ class AppStore extends ChangeNotifier {
 
   void _toast(String message) {
     toast = message;
+    notifyListeners(); // 面板内联反馈行依赖 watch 重建（SnackBar 会被 sheet 遮挡）
     onToast?.call(message);
   }
 
@@ -326,17 +327,26 @@ class AppStore extends ChangeNotifier {
   }
 
   /// 设备页「选择文件发送」：pick → 发给当前目标。
-  Future<void> pickAndSendFiles() async {
+  /// 选文件并发送。返回是否真正发起（取消/不支持返回 false）。
+  Future<bool> pickAndSendFiles() async {
     final target = sendTarget;
-    if (target == null) return;
+    if (target == null) return false;
     final paths = await platform.pickFiles();
-    if (paths == null || paths.isEmpty) return;
+    if (paths == null) {
+      // null 有两种语义：用户取消（静默）与平台不支持（须告知，否则
+      // 按钮看起来「没反应」）。鸿蒙 channel 断流期间走后者。
+      if (isOhosRuntime()) _toast('鸿蒙暂不支持选文件（待 channel 修复）');
+      return false;
+    }
+    if (paths.isEmpty) return false;
     await sendFiles(target.deviceId, paths);
     _toast('已发起发送：${paths.length} 个文件');
+    return true;
   }
 
   void setSendTarget(OnlineDevice device) {
     sendTarget = device;
+    toast = null; // 新面板清掉上一条提示，避免陈旧反馈误读
     notifyListeners();
   }
 
@@ -353,23 +363,39 @@ class AppStore extends ChangeNotifier {
   }
 
   /// 发送剪贴板文本。
-  Future<void> sendClipboardText(String targetDevice) async {
+  /// 发送剪贴板文本。返回是否真正发起（供调用方决定收面板等后续动作）。
+  /// 成功/失败都有 toast——静默会让用户以为按钮坏了（真机回归发现）。
+  Future<bool> sendClipboardText(String targetDevice) async {
     final text = await platform.readClipboardText();
     if (text == null) {
       _toast('剪贴板没有可发送的文本');
-      return;
+      return false;
     }
-    await native.invokeData(
-        'send_text', {'target_device': targetDevice, 'text': text});
+    try {
+      await native.invokeData(
+          'send_text', {'target_device': targetDevice, 'text': text});
+      _toast('已发起发送：文本（${text.length} 字）');
+      return true;
+    } catch (e) {
+      _toast('发送失败：$e');
+      return false;
+    }
   }
 
   /// 鸿蒙调试探针：channel 断流期间剪贴板与键盘都不可用，debug 构建用
   /// 固定文本打通发送链验收（release 无此入口）。
-  Future<void> sendProbeText(String targetDevice) async {
-    await native.invokeData('send_text', {
-      'target_device': targetDevice,
-      'text': 'ohos-e2e-probe ${DateTime.now().toIso8601String()}',
-    });
+  Future<bool> sendProbeText(String targetDevice) async {
+    try {
+      await native.invokeData('send_text', {
+        'target_device': targetDevice,
+        'text': 'ohos-e2e-probe ${DateTime.now().toIso8601String()}',
+      });
+      _toast('已发起发送：探针文本');
+      return true;
+    } catch (e) {
+      _toast('发送失败：$e');
+      return false;
+    }
   }
 
   /// Ask 档确认应答。

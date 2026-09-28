@@ -180,13 +180,20 @@ class _SendPanel extends StatelessWidget {
           FilledButton.icon(
             icon: const Icon(Icons.folder_open),
             label: const Text('选择文件发送'),
-            onPressed: () => store.pickAndSendFiles(),
+            onPressed: () async {
+              // 发起成功即收面板——传输卡在「传输」页，面板留着只会挡住反馈
+              final sent = await store.pickAndSendFiles();
+              if (sent && context.mounted) Navigator.of(context).maybePop();
+            },
           ),
           const SizedBox(height: 10),
           OutlinedButton.icon(
             icon: const Icon(Icons.content_paste),
             label: const Text('发送剪贴板文本'),
-            onPressed: () => store.sendClipboardText(target.deviceId),
+            onPressed: () async {
+              final sent = await store.sendClipboardText(target.deviceId);
+              if (sent && context.mounted) Navigator.of(context).maybePop();
+            },
           ),
           // 鸿蒙 channel 断流期間剪贴板/键盘都不可用，debug 构建给一个
           // 固定文本探针打通发送链验收；release 构建不含此入口。
@@ -195,10 +202,26 @@ class _SendPanel extends StatelessWidget {
             OutlinedButton.icon(
               icon: const Icon(Icons.send),
               label: const Text('发送测试文本（鸿蒙调试）'),
-              onPressed: () => store.sendProbeText(target.deviceId),
+              onPressed: () async {
+                final sent = await store.sendProbeText(target.deviceId);
+                if (sent && context.mounted) Navigator.of(context).maybePop();
+              },
             ),
           ],
           const SizedBox(height: 16),
+          // 面板是 modal sheet，会盖住 ScaffoldMessenger 的 SnackBar——
+          // 面板内的操作反馈必须就地展示，否则用户看到的就是「没反应」。
+          if (store.toast != null) ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.secondaryContainer,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(store.toast!, style: theme.textTheme.bodySmall),
+            ),
+            const SizedBox(height: 10),
+          ],
           Text(
             '目录不会被展开；大小与数量受服务端限额约束。',
             style: theme.textTheme.bodySmall
