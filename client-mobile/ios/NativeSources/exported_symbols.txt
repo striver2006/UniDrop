@@ -5,3 +5,4 @@ _unidrop_invoke
 _unidrop_stop
 _unidrop_free_string
 _unidrop_set_event_callback
+_unidrop_poll_event
