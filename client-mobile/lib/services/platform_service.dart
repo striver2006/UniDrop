@@ -80,17 +80,26 @@ class PlatformService {
   }
 
   /// 平台设备名（连接层上报的 hostname）。
+  /// 三端都取「真正的设备名」而不是机型：iOS=UIDevice.name（用户自定义名），
+  /// Android/鸿蒙走自研 unidrop/device_name 通道（Android 读 Settings 的
+  /// device_name，鸿蒙读 settings.general.DEVICE_NAME 回落 marketName）。
   Future<String> deviceName() async {
-    // 鸿蒙：channel 断流，device_info 不可用，先退通用名（机型名待 channel
-    // 修复后接 ohosInfo.marketName）。
-    if (isOhosRuntime()) return 'UniClip Mobile';
     final info = DeviceInfoPlugin();
     try {
+      if (isOhosRuntime() || Platform.isAndroid) {
+        final real = await retryChannel(
+            'deviceName',
+            () => const MethodChannel('unidrop/device_name')
+                .invokeMethod<String>('getDeviceName'),
+            attempts: 3);
+        if (real != null && real.isNotEmpty) return real;
+      }
       if (Platform.isIOS) {
         final ios = await retryChannel('iosInfo', () => info.iosInfo);
         return ios.name; // 用户可自定义的设备名（「张三的 iPhone」）
       }
       if (Platform.isAndroid) {
+        // 通道失败的兜底（异常 ROM）：至少给机型而不是通用名
         final android = await retryChannel('androidInfo', () => info.androidInfo);
         return android.model;
       }

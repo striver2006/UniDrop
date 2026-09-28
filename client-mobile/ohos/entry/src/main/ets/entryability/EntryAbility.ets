@@ -16,14 +16,47 @@
 import { FlutterAbility } from '@ohos/flutter_ohos'
 import { GeneratedPluginRegistrant } from '../plugins/GeneratedPluginRegistrant';
 import FlutterEngine from '@ohos/flutter_ohos/src/main/ets/embedding/engine/FlutterEngine';
+import MethodChannel, { MethodCallHandler, MethodResult } from '@ohos/flutter_ohos/src/main/ets/plugin/common/MethodChannel';
+import MethodCall from '@ohos/flutter_ohos/src/main/ets/plugin/common/MethodCall';
 import Want from '@ohos.app.ability.Want';
 import AbilityConstant from '@ohos.app.ability.AbilityConstant';
+import settings from '@ohos.settings';
+import deviceInfo from '@ohos.deviceInfo';
 import fs from '@ohos.file.fs';
 
 export default class EntryAbility extends FlutterAbility {
   configureFlutterEngine(flutterEngine: FlutterEngine) {
     super.configureFlutterEngine(flutterEngine)
     GeneratedPluginRegistrant.registerWith(flutterEngine)
+    this.registerDeviceNameChannel(flutterEngine)
+  }
+
+  // 上报对端 roster 的真实设备名：「设置→关于本机」的设备名称
+  // （settings.general.DEVICE_NAME）；API 20+ 需 READ_LOCAL_DEVICE_NAME
+  // 权限，未授权/取不到回落市场机型名（marketName，如「Pura 70 Ultra」）。
+  private registerDeviceNameChannel(engine: FlutterEngine) {
+    const channel = new MethodChannel(
+      engine.dartExecutor.getBinaryMessenger(), 'unidrop/device_name');
+    const handler: MethodCallHandler = {
+      onMethodCall: (call: MethodCall, result: MethodResult) => {
+        if (call.method !== 'getDeviceName') {
+          result.notImplemented();
+          return;
+        }
+        try {
+          settings.getValue(this.context, settings.general.DEVICE_NAME)
+            .then((v) => {
+              result.success(v.length > 0 ? v : deviceInfo.marketName);
+            })
+            .catch(() => {
+              result.success(deviceInfo.marketName);
+            });
+        } catch (e) {
+          result.success(deviceInfo.marketName);
+        }
+      }
+    };
+    channel.setMethodCallHandler(handler);
   }
 
   async onCreate(want: Want, launchParam: AbilityConstant.LaunchParam) {
