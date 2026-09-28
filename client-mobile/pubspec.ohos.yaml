@@ -6,7 +6,7 @@
 name: unidrop_mobile
 description: "UniClip（瞬贴）移动端：iOS / Android / 鸿蒙共享一套 Dart 代码"
 publish_to: 'none'
-version: 0.4.4+3
+version: 0.4.5+4
 
 environment:
   sdk: ">=2.19.0 <4.0.0"

@@ -135,7 +135,7 @@ fork 的 `FlutterAbility.onCreate` 里 `await onAttach`（插件注册在其尾�
 - **按钮「没反应」**：modal bottom sheet 盖住了 SnackBar，且不支持时静默 return。修法：发送入口统一返回 bool + 成败都提示 + 面板内联反馈行（不依赖被遮挡的 SnackBar）+ 成功自动收面板；
 - **剪贴板误报**：断流期超时兜底 null 把「读不到」报成「没有」。文案改为实话并指向手动输入；
 - **中文输入**：channel 痊愈后回到系统键盘（真机实证拼音候选「啊」入框），屏上键盘降级为回退；
-- **真实设备名**：三端统一 `unidrop/device_name` 通道——Android 读 `Settings.Global.device_name`，鸿蒙读 `settings.general.DEVICE_NAME`（回落 marketName），iOS 用 `iosInfo.name`。
+- **真实设备名**：三端统一 `unidrop/device_name` 通道，取数以**蓝牙本机名为先**（0.4.5 起）——Android 需 `BLUETOOTH_CONNECT` 运行时授权（MIUI 的 `Settings.Global device_name` 可读但停在默认值，先读它拿不到用户改过的名字）；鸿蒙 `ACCESS_BLUETOOTH` 读 `connection.getLocalName()`（回落 settings.general.DEVICE_NAME / marketName）；iOS 16+ 系统已把 `UIDevice.name` 脱敏成通用名（恢复需 Apple 审批 entitlement），改为设置页自定义设备名（`AppSettings.device_name`，SQLite 落库、保存即重连生效、清空回落平台名）+ 机型营销名兜底（utsname.machine 映射表）。
 
 ## 七、当前限制与后续路线
 

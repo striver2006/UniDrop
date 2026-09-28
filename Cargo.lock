@@ -5087,7 +5087,7 @@ checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "unidrop-client"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "block2 0.6.2",
  "image",
@@ -5120,7 +5120,7 @@ dependencies = [
 
 [[package]]
 name = "unidrop-core"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "base64 0.22.1",
  "crc32fast",
@@ -5144,7 +5144,7 @@ dependencies = [
 
 [[package]]
 name = "unidrop-mobile-native"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "android_logger 0.14.1",
  "base64 0.22.1",
