@@ -43,8 +43,10 @@ static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 /// iOS：stderr 经 os_log 转发，Console.app / devicectl 可见。
 /// 不引 env_logger / android_logger——移动端没有环境变量可配，
 /// 固定 Info 级、stderr 单目的地足够排障用。
+#[cfg(not(target_os = "android"))]
 struct StderrLogger;
 
+#[cfg(not(target_os = "android"))]
 impl log::Log for StderrLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
         metadata.level() <= log::Level::Info
@@ -66,9 +68,12 @@ impl log::Log for StderrLogger {
     fn flush(&self) {}
 }
 
+#[cfg(not(target_os = "android"))]
 static LOGGER: StderrLogger = StderrLogger;
 
 /// 排障日志文件路径（start 时指向 cache_dir 下的 unidrop-debug.log）。
+/// Android 走 logcat 不写文件，故同样只在非 Android 编译。
+#[cfg(not(target_os = "android"))]
 static DEBUG_LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 #[cfg(target_os = "android")]
@@ -264,7 +269,8 @@ fn start_inner(config_json: *const c_char) -> Result<serde_json::Value, String> 
     let cfg = take_string(config_json)?;
     let cfg: serde_json::Value = serde_json::from_str(&cfg).map_err(|e| e.to_string())?;
 
-    // 排障日志双写的落点（见 StderrLogger 注释）。
+    // 排障日志双写的落点（见 StderrLogger 注释；Android 走 logcat 不写文件）。
+    #[cfg(not(target_os = "android"))]
     if let Some(dir) = cfg.get("cache_dir").and_then(|v| v.as_str()) {
         *DEBUG_LOG_PATH.lock().unwrap_or_else(|p| p.into_inner()) =
             Some(PathBuf::from(dir).join("unidrop-debug.log"));
