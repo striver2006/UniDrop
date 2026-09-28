@@ -486,11 +486,10 @@ pub fn run() {
                 unidrop_core::signal_router::spawn_cache_sweeper(state_for_sweep);
             });
 
-            let app_handle = app.handle().clone();
-
             // 5. Start platform clipboard listener (P1-9)
             #[cfg(target_os = "macos")]
             {
+                let app_handle = app.handle().clone();
                 let (clip_tx, mut clip_rx) = tokio::sync::mpsc::channel(32);
                 crate::platform::start_clipboard_listener(clip_tx);
                 let app_handle_clip = app_handle.clone();
