@@ -29,3 +29,8 @@ bool isOhosRuntime() =>
     (Platform.isAndroid &&
         File('/data/storage/el2/base/libs/arm64/libunidrop_mobile.so')
             .existsSync());
+
+/// 鸿蒙 channel 断流期（旧引擎）系统键盘不可用，屏上键盘兜底；
+/// 3.7.12-ohos-1.0.4 引擎后断流已修复，true = 用系统键盘
+/// （屏上键盘保留为回退路径，断流重现时切回 false）。
+const bool kOhosNativeKeyboard = true;

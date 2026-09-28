@@ -41,9 +41,10 @@ class _SettingsPageState extends State<SettingsPage> {
 
   bool _saving = false;
 
-  /// 鸿蒙屏上键盘的当前编辑目标（channel 断流期间系统键盘不可用）。
-  /// 非空时页面底部挂 OhosKeyboardPanel。
+  /// 鸿蒙屏上键盘的当前编辑目标（断流回退路径用）。非空时页面底部挂
+  /// OhosKeyboardPanel。
   OhosKeyboardTarget? _kbdTarget;
+
   final bool _isOhos = isOhosRuntime();
 
   /// 表单是否已从 store 回填过。
@@ -262,7 +263,9 @@ class _SettingsPageState extends State<SettingsPage> {
     bool obscure = false,
     bool number = false,
   }) {
-    if (!_isOhos) {
+    // channel 复活验证期（1.0.4 引擎）：鸿蒙也走原生 TextField——
+    // 系统键盘弹出即证明 TextInput 通道已通，屏上键盘仅作断流回退。
+    if (!_isOhos || kOhosNativeKeyboard) {
       return TextField(
         controller: ctl,
         obscureText: obscure,

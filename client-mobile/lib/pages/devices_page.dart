@@ -214,18 +214,32 @@ class _SendPanelState extends State<_SendPanel> {
             },
           ),
           // 鸿蒙 channel 断流期間剪贴板/系统键盘都不可用：手动输入是主路径。
+          // 1.0.4 引擎后 channel 已修复——kOhosNativeKeyboard 时用原生
+          // TextField（系统键盘，含中文输入法），断流回退保留屏上键盘。
           if (_isOhos) ...[
             const SizedBox(height: 16),
-            OhosField(
-              target: OhosKeyboardTarget(
-                  controller: _manualCtl, label: '手动输入文本'),
-              active: _kbdTarget != null,
-              hint: '剪贴板不可读时的发送入口',
-              onActivate: () => setState(() {
-                _kbdTarget = OhosKeyboardTarget(
-                    controller: _manualCtl, label: '手动输入文本');
-              }),
-            ),
+            if (kOhosNativeKeyboard)
+              TextField(
+                controller: _manualCtl,
+                autocorrect: false,
+                enableSuggestions: false,
+                decoration: const InputDecoration(
+                  labelText: '手动输入文本',
+                  hintText: '剪贴板不可读时的发送入口',
+                  border: OutlineInputBorder(),
+                ),
+              )
+            else
+              OhosField(
+                target: OhosKeyboardTarget(
+                    controller: _manualCtl, label: '手动输入文本'),
+                active: _kbdTarget != null,
+                hint: '剪贴板不可读时的发送入口',
+                onActivate: () => setState(() {
+                  _kbdTarget = OhosKeyboardTarget(
+                      controller: _manualCtl, label: '手动输入文本');
+                }),
+              ),
             const SizedBox(height: 10),
             FilledButton.tonalIcon(
               icon: const Icon(Icons.send),
@@ -239,7 +253,7 @@ class _SendPanelState extends State<_SendPanel> {
                 }
               },
             ),
-            if (_kbdTarget != null)
+            if (!kOhosNativeKeyboard && _kbdTarget != null)
               Padding(
                 padding: const EdgeInsets.only(top: 10),
                 child: OhosKeyboardPanel(
