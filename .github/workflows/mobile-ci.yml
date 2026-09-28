@@ -52,9 +52,11 @@ jobs:
         if: endsWith(matrix.target, 'linux-android')
         run: |
           TRIPLE="${{ matrix.target }}"
-          CLANG="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/${TRIPLE}24-clang"
-          test -x "$CLANG" || { echo "NDK clang 不存在: $CLANG"; ls "$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/" | head; exit 1; }
+          NDK_BIN="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CLANG="$NDK_BIN/${TRIPLE}24-clang"
+          test -x "$CLANG" || { echo "NDK clang 不存在: $CLANG"; ls "$NDK_BIN" | head; exit 1; }
           echo "CC_$(echo "$TRIPLE" | tr '-' '_')=$CLANG" >> "$GITHUB_ENV"
+          echo "AR_$(echo "$TRIPLE" | tr '-' '_')=$NDK_BIN/llvm-ar" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_$(echo "$TRIPLE" | tr 'a-z-' 'A-Z_')_LINKER=$CLANG" >> "$GITHUB_ENV"
 
       - name: cargo check

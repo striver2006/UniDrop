@@ -147,7 +147,7 @@ class _SettingsPageState extends State<SettingsPage> {
         keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
         padding: const EdgeInsets.all(16),
         children: [
-          _Section(title: '服务器'),
+          const _Section(title: '服务器'),
           _field(_server, label: '服务器地址', hint: 'wss://drop.yourdomain.com:58921'),
           const SizedBox(height: 12),
           _field(_account, label: '账号标识', helper: '1-64 位字母、数字与 . _ @ -'),
@@ -159,7 +159,7 @@ class _SettingsPageState extends State<SettingsPage> {
             child: const Text('保存并重连'),
           ),
           const SizedBox(height: 16),
-          _Section(title: '接收策略'),
+          const _Section(title: '接收策略'),
           Wrap(
             spacing: 8,
             children: [
@@ -177,7 +177,7 @@ class _SettingsPageState extends State<SettingsPage> {
             onChanged: (v) => setState(() => _autoInject = v),
           ),
           const SizedBox(height: 24),
-          _Section(title: '存储与清理'),
+          const _Section(title: '存储与清理'),
           _field(_historyMax, label: '历史保留条数（0 = 不限）', number: true),
           const SizedBox(height: 12),
           _field(_retainSecs, label: '完成卡片保持秒数（0 = 不自动消失）', number: true),
@@ -193,7 +193,7 @@ class _SettingsPageState extends State<SettingsPage> {
                 ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
           ),
           const SizedBox(height: 24),
-          _Section(title: '安全'),
+          const _Section(title: '安全'),
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
             title: const Text('端到端加密（E2EE）'),
@@ -225,10 +225,10 @@ class _SettingsPageState extends State<SettingsPage> {
             _field(_pin, label: '证书 SHA-256 指纹（每行一条）', hint: '68e1d200…'),
           ],
           const SizedBox(height: 24),
-          _Section(title: '服务端限额（只读）'),
+          const _Section(title: '服务端限额（只读）'),
           _LimitsCard(limits: store.serverLimits),
           const SizedBox(height: 24),
-          _Section(title: '本机'),
+          const _Section(title: '本机'),
           ListTile(
             contentPadding: EdgeInsets.zero,
             leading: const CircleAvatar(child: Icon(Icons.smartphone)),

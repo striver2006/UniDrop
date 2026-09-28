@@ -41,7 +41,7 @@ class UniClipApp extends StatelessWidget {
           brightness: Brightness.dark,
           useMaterial3: true,
         ),
-        home: _LifecycleHost(child: AppShell()),
+        home: const _LifecycleHost(child: AppShell()),
       ),
     );
   }

@@ -201,6 +201,8 @@ class PlatformService {
   Future<void> shareFiles(List<String> paths, {String? subject}) async {
     if (isOhosRuntime()) throw UnsupportedError('该平台暂不支持系统分享');
     try {
+      // share_plus 11 的实例 API 在鸿蒙变体（7.0.2）不存在，两端共用旧静态 API。
+      // ignore: deprecated_member_use
       await Share.shareXFiles(paths.map((p) => XFile(p)).toList(),
           subject: subject);
     } on MissingPluginException {
@@ -212,6 +214,7 @@ class PlatformService {
   Future<void> shareText(String text) async {
     if (isOhosRuntime()) throw UnsupportedError('该平台暂不支持系统分享');
     try {
+      // ignore: deprecated_member_use —— 同上，两端交集
       await Share.share(text);
     } on MissingPluginException {
       throw UnsupportedError('该平台暂不支持系统分享');
