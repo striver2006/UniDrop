@@ -17,6 +17,7 @@ import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
+import '../dbg.dart';
 import '../ffi/bridge.dart';
 
 /// 路径三分配置（record 是 Dart 3 语法，2.19 兼容用小类）。
@@ -27,14 +28,51 @@ class PathConfig {
   final String cacheDir;
 }
 
+/// 鸿蒙 fork 的引擎编排有启动竞态：FlutterAbility.onCreate 里 await
+/// onAttach（插件注册在其中），但系统的 onWindowStageCreate 不等它，并发
+/// 触发 Dart entrypoint——bootstrap 早期的 channel 调用可能先于插件注册
+/// 到达引擎，被静默丢弃（无 handler 无回包），Future 永不完成
+/// （真机症状：设置页无限转圈）。启动期 channel 调用统一走超时重试。
+Future<T> retryChannel<T>(String label, Future<T> Function() call,
+    {int attempts = 8,
+    Duration timeout = const Duration(seconds: 2),
+    Duration interval = const Duration(milliseconds: 300)}) async {
+  Object? lastError;
+  for (var i = 0; i < attempts; i++) {
+    try {
+      return await call().timeout(timeout);
+    } catch (e) {
+      lastError = e;
+      dbgLog('retryChannel($label): 第${i + 1}/$attempts次失败: $e');
+      await Future<void>.delayed(interval);
+    }
+  }
+  throw StateError('$label 重试 $attempts 次仍失败: $lastError');
+}
+
 class PlatformService {
   /// 数据库与收件目录。对应 V2 计划 §4 的路径三分策略：
   /// - SQLite → 应用支撑目录（参与系统备份，绝不可放缓存区）
   /// - 收件缓存 → 文档目录下的 UniDrop（iOS 文件 App 可见；
   ///   Android/ohos 外部私有目录）
   Future<PathConfig> resolvePaths() async {
-    final support = await getApplicationSupportDirectory();
-    final docs = await getApplicationDocumentsDirectory();
+    // 鸿蒙旁路：实测（Pura 70 Ultra / HarmonyOS 6.1.1 / fork 3.7.12）该设备上
+    // Dart→ArkTS 的 platform channel 整体断流（连 flutter/platform 系统通道
+    // 都无回包），path_provider 的 pigeon 调用永不返回。沙箱路径是固定布局，
+    // 直接给出；语义对齐 path_provider_ohos（documents=filesDir/flutter，
+    // support=filesDir）。与 lib/ffi/bridge.dart 的 dlopen 绝对路径同属一类
+    // 「鸿蒙固定沙箱路径」事实来源。
+    if (isOhosRuntime()) {
+      const filesDir = '/data/storage/el2/base/haps/entry/files';
+      return PathConfig(
+        dbPath: '$filesDir/unidrop.db',
+        cacheDir: '$filesDir/flutter/UniDrop',
+      );
+    }
+    final support =
+        await retryChannel('supportDir', () => getApplicationSupportDirectory());
+    final docs =
+        await retryChannel('documentsDir', () => getApplicationDocumentsDirectory());
     return PathConfig(
       dbPath: '${support.path}/unidrop.db',
       cacheDir: '${docs.path}/UniDrop',
@@ -43,14 +81,17 @@ class PlatformService {
 
   /// 平台设备名（连接层上报的 hostname）。
   Future<String> deviceName() async {
+    // 鸿蒙：channel 断流，device_info 不可用，先退通用名（机型名待 channel
+    // 修复后接 ohosInfo.marketName）。
+    if (isOhosRuntime()) return 'UniClip Mobile';
     final info = DeviceInfoPlugin();
     try {
       if (Platform.isIOS) {
-        final ios = await info.iosInfo;
+        final ios = await retryChannel('iosInfo', () => info.iosInfo);
         return ios.name; // 用户可自定义的设备名（「张三的 iPhone」）
       }
       if (Platform.isAndroid) {
-        final android = await info.androidInfo;
+        final android = await retryChannel('androidInfo', () => info.androidInfo);
         return android.model;
       }
     } catch (_) {
@@ -97,7 +138,9 @@ class PlatformService {
 
     Future<void> report({bool changed = false}) async {
       try {
-        final results = await Connectivity().checkConnectivity();
+        final results = await Connectivity()
+            .checkConnectivity()
+            .timeout(const Duration(seconds: 2));
         final kind = map(results);
         final previous = lastKind;
         lastKind = kind;
@@ -121,19 +164,26 @@ class PlatformService {
 
   /// 读系统剪贴板文本（发送「剪贴板文本」用）。空返回 null。
   Future<String?> readClipboardText() async {
-    final data = await Clipboard.getData(Clipboard.kTextPlain);
-    final text = data?.text;
-    if (text == null || text.isEmpty) return null;
-    return text;
+    try {
+      // 鸿蒙 channel 断流时 Clipboard 永不回包，超时兜底防 UI 卡死
+      final data = await Clipboard.getData(Clipboard.kTextPlain)
+          .timeout(const Duration(seconds: 2));
+      final text = data?.text;
+      if (text == null || text.isEmpty) return null;
+      return text;
+    } catch (_) {
+      return null;
+    }
   }
 
   /// 选文件（多选）。返回可读路径——file_picker 在 iOS/Android 上都会把
   /// 选中内容落到应用可读位置，Rust 侧因此不需要感知 content://。
   ///
-  /// 鸿蒙暂无 file_picker 的 ohos 实现（openharmony-sig 适配在途）：
-  /// MissingPluginException 时返回 null，UI 据此提示「该平台暂不支持选文件」，
-  /// 不让一次能力缺失演成崩溃。
+  /// 鸿蒙暂无 file_picker 的 ohos 实现（openharmony-sig 适配在途），且
+  /// channel 断流会让调用永不返回：直接返回 null，UI 提示「暂不支持」，
+  /// 不让一次能力缺失演成崩溃或挂起。
   Future<List<String>?> pickFiles() async {
+    if (isOhosRuntime()) return null;
     try {
       final result = await FilePicker.platform.pickFiles(allowMultiple: true);
       if (result == null) return null;
@@ -149,6 +199,7 @@ class PlatformService {
   /// 分享一组文件（接收后的「保存到… / 用其他应用打开」等价路径）。
   /// 鸿蒙暂无 ohos 实现：抛出的 MissingPluginException 转成失败结果由调用方提示。
   Future<void> shareFiles(List<String> paths, {String? subject}) async {
+    if (isOhosRuntime()) throw UnsupportedError('该平台暂不支持系统分享');
     try {
       await Share.shareXFiles(paths.map((p) => XFile(p)).toList(),
           subject: subject);
@@ -159,6 +210,7 @@ class PlatformService {
 
   /// 分享纯文本。
   Future<void> shareText(String text) async {
+    if (isOhosRuntime()) throw UnsupportedError('该平台暂不支持系统分享');
     try {
       await Share.share(text);
     } on MissingPluginException {
@@ -167,7 +219,15 @@ class PlatformService {
   }
 
   /// 写文本到系统剪贴板（接收 TEXT 自动注入 / 手动复制用）。
-  Future<void> writeClipboardText(String text) async {
-    await Clipboard.setData(ClipboardData(text: text));
+  /// 返回是否真正写入；鸿蒙 channel 断流时超时返回 false，
+  /// 调用方据此换提示文案（文本本体已在收件目录）。
+  Future<bool> writeClipboardText(String text) async {
+    try {
+      await Clipboard.setData(ClipboardData(text: text))
+          .timeout(const Duration(seconds: 2));
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 }

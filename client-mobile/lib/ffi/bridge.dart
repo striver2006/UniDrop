@@ -14,6 +14,8 @@ import 'dart:io';
 
 import 'package:ffi/ffi.dart';
 
+import '../dbg.dart';
+
 typedef _PollEventC = Pointer<Utf8> Function();
 typedef _PollEventDart = Pointer<Utf8> Function();
 
@@ -51,26 +53,37 @@ class NativeBridge {
       _lib = DynamicLibrary.process();
       return _lib!;
     }
-    // Android 与鸿蒙共用此分支：华为 Flutter 分支的 operatingSystem 在
-    // 鸿蒙上伪装成 android，无法用 Platform 区分两端，只能按「先试谁」
-    // 区分——鸿蒙的 dlopen 搜索路径不含应用 libs 目录（无 classloader
-    // namespace 机制），裸文件名必失败，必须用安装后的绝对路径；Android
-    // 上该绝对路径不存在，回落裸名由 namespace 解析。
-    try {
-      _lib = DynamicLibrary.open(
-          '/data/storage/el2/base/libs/arm64/libunidrop_mobile.so');
-    } on ArgumentError {
-      _lib = DynamicLibrary.open('libunidrop_mobile.so');
+    // Android 与鸿蒙共用此分支：不同 fork/机型上 Platform 标识不稳定
+    // （实测 HarmonyOS 6.1.1 报 'ohos'，早期记录曾见伪装 android），
+    // 不据此分支，按加载行为区分。鸿蒙的 dlopen 搜索路径不含应用 libs
+    // 目录（无 classloader namespace 机制），HAP 的 native 库安装在
+    // el1 bundle 目录（历史包曾落 el2/base），两处都试，最后回落裸名。
+    const ohosLibPaths = [
+      '/data/storage/el1/bundle/libs/arm64/libunidrop_mobile.so',
+      '/data/storage/el2/base/libs/arm64/libunidrop_mobile.so',
+    ];
+    for (final p in ohosLibPaths) {
+      try {
+        _lib = DynamicLibrary.open(p);
+        dbgLog('dlopen: 命中 $p');
+        return _lib!;
+      } on ArgumentError {
+        // 该路径不存在，试下一个
+      }
     }
+    dbgLog('dlopen: 绝对路径均未命中，回落裸名');
+    _lib = DynamicLibrary.open('libunidrop_mobile.so');
     return _lib!;
   }
 
   /// 注册事件回调并启动核心。必须在 UI isolate 调用（NativeCallable.listener
-  /// 的投递目标是它创建时的 isolate）。
+  /// 的投递目标是它创建时的 isolate）。settings 非空时作为启动覆盖
+  /// （鸿蒙调试注入口，见 app_store._consumeOhosSetupOverride）。
   Future<Map<String, dynamic>> start({
     required String dbPath,
     required String cacheDir,
     required String deviceName,
+    Map<String, dynamic>? settings,
   }) {
     final lib = _open();
     final poll = lib.lookupFunction<_PollEventC, _PollEventDart>('unidrop_poll_event');
@@ -90,6 +103,7 @@ class NativeBridge {
       'db_path': dbPath,
       'cache_dir': cacheDir,
       'device_name': deviceName,
+      if (settings != null) 'settings': settings,
     });
     final result = _callStart(config);
     started = result['ok'] == true;

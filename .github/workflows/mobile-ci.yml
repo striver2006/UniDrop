@@ -39,7 +39,7 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
-          targets: ${{ matrix.target }}
+          target: ${{ matrix.target }}
 
       # iOS target 在 Linux 上无链接器可用，check-only 不触发链接，
       # 但 clang/cc 的探测需要占位环境；Android 用 NDK 工具链。
@@ -78,11 +78,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Flutter 版本钉到与本地开发一致的 3.44.6：stable 浮动的 3.47 起
+      # analyze 默认把 info（如 pinned share_plus 的 deprecation）判为失败，
+      # 而代码为兼容鸿蒙变体（share_plus 7.0.2，无 SharePlus.instance）必须
+      # 保留旧静态 API。
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version: 3.44.6
           cache: true
 
-      - run: flutter pub get
+      # 钉死 lockfile 解析，防止 runner 上全新 resolve 漂移出本地未见过的
+      # deprecation（share_plus 11.1.0 与新版 API 差异曾致 analyze 红）。
+      - run: flutter pub get --enforce-lockfile
       - run: flutter analyze
       - run: flutter test

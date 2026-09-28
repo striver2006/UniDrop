@@ -11,6 +11,7 @@ import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 
+import '../dbg.dart';
 import '../ffi/bridge.dart';
 import '../models.dart';
 import '../services/platform_service.dart';
@@ -55,16 +56,25 @@ class AppStore extends ChangeNotifier {
     // UI 可见的 start_failed 状态——否则 provider 构造抛异常，MaterialApp
     // 根本不会构建，用户看到的是无解释的白屏。
     try {
+      dbgLog('bootstrap: resolvePaths…');
       final paths = await platform.resolvePaths();
+      dbgLog('bootstrap: paths db=${paths.dbPath} cache=${paths.cacheDir}');
       final deviceName = await platform.deviceName();
+      dbgLog('bootstrap: deviceName=$deviceName, native.start…');
+      // 鸿蒙调试/CI 注入口（EntryAbility 经 unidropmobile://setup?… 落盘）：
+      // channel 断流期间键盘不可用，设置由此覆盖。文件一次性消费。
+      final setupOverride = await _consumeOhosSetupOverride(paths);
       final result = await native.start(
         dbPath: paths.dbPath,
         cacheDir: paths.cacheDir,
         deviceName: deviceName,
+        settings: setupOverride,
       );
       if (result['ok'] == true) {
         selfInfo = OnlineDevice.fromJson((result['data'] as Map).cast<String, dynamic>());
+        dbgLog('bootstrap: start ok, self=${selfInfo?.deviceId} os=${selfInfo?.osType}');
       } else {
+        dbgLog('bootstrap: start failed: ${result['error']}');
         connectionState = 'start_failed';
         connectionError = result['error']?.toString();
         notifyListeners();
@@ -77,13 +87,46 @@ class AppStore extends ChangeNotifier {
       });
 
       await refreshDevices();
+      dbgLog('bootstrap: refreshDevices done, devices=${devices.length}');
       await refreshSettings();
+      dbgLog('bootstrap: refreshSettings done, settings=${settings != null}');
       await refreshLimits();
       await refreshHistory();
+      dbgLog('bootstrap: complete');
     } catch (e) {
+      dbgLog('bootstrap: exception: $e');
       connectionState = 'start_failed';
       connectionError = '核心初始化失败：$e';
       notifyListeners();
+    }
+  }
+
+  /// 鸿蒙设置注入文件的读取与删除（一次性）。返回 AppSettings 的 serde
+  /// 键映射，不存在或解析失败返回 null。
+  Future<Map<String, dynamic>?> _consumeOhosSetupOverride(PathConfig paths) async {
+    if (!isOhosRuntime()) return null;
+    try {
+      final file = File('${File(paths.dbPath).parent.path}/bootstrap_config.json');
+      if (!file.existsSync()) return null;
+      final raw = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+      await file.delete();
+      final mapped = <String, dynamic>{};
+      if (raw['server'] is String) mapped['server_url'] = raw['server'];
+      if (raw['account'] is String) mapped['account_id'] = raw['account'];
+      if (raw['psk'] is String) mapped['psk_secret'] = raw['psk'];
+      // 自建 TLS 服务：trust=pinned&pin=<sha256>（可逗号分隔多个指纹）
+      if (raw['trust'] is String) mapped['tls_trust_mode'] = raw['trust'];
+      if (raw['pin'] is String) {
+        mapped['pinned_cert_sha256'] = (raw['pin'] as String)
+            .split(',')
+            .where((s) => s.isNotEmpty)
+            .toList();
+      }
+      dbgLog('bootstrap: 注入设置覆盖 ${mapped.keys.toList()}');
+      return mapped.isEmpty ? null : mapped;
+    } catch (e) {
+      dbgLog('bootstrap: 设置注入读取失败: $e');
+      return null;
     }
   }
 
@@ -186,8 +229,9 @@ class AppStore extends ChangeNotifier {
     final kind = payload['kind'] as String?;
     try {
       if (kind == 'text') {
-        await platform.writeClipboardText(payload['text'] as String? ?? '');
-        _toast('已写入系统剪贴板，可直接粘贴');
+        final ok =
+            await platform.writeClipboardText(payload['text'] as String? ?? '');
+        _toast(ok ? '已写入系统剪贴板，可直接粘贴' : '已接收文本（鸿蒙剪贴板暂不可写），请在历史中查看');
       } else if (kind == 'image') {
         // 图片剪贴板写入需要平台通道支持，Flutter Clipboard 仅文本。
         // 收到的图片已保存在收件目录，引导用户从历史卡片分享/保存。
@@ -317,6 +361,15 @@ class AppStore extends ChangeNotifier {
     }
     await native.invokeData(
         'send_text', {'target_device': targetDevice, 'text': text});
+  }
+
+  /// 鸿蒙调试探针：channel 断流期间剪贴板与键盘都不可用，debug 构建用
+  /// 固定文本打通发送链验收（release 无此入口）。
+  Future<void> sendProbeText(String targetDevice) async {
+    await native.invokeData('send_text', {
+      'target_device': targetDevice,
+      'text': 'ohos-e2e-probe ${DateTime.now().toIso8601String()}',
+    });
   }
 
   /// Ask 档确认应答。

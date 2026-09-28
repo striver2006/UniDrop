@@ -12,7 +12,7 @@ members = [
 #   版本门槛因此天然同号；
 # - 发版时与 client/package.json、client/src-tauri/tauri.conf.json 同批更新
 #   （chore(release) 独立提交，不由脚本代改——既有惯例）。
-version = "0.4.2"
+version = "0.4.3"
 
 [workspace.dependencies]
 # 三 crate 共用的第三方依赖在此统一版本，防止依赖树出现两份。

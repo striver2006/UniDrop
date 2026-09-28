@@ -74,9 +74,13 @@ impl AppState {
             device_id,
             hostname: host.hostname,
             // std::env::consts::OS 在桌面产出 windows/macos/linux，
-            // 在移动端产出 ios/android，在鸿蒙产出 ohos——与服务端的
-            // 自由字符串约定（仅存储与日志）正好对齐。
-            os_type: std::env::consts::OS.to_string(),
+            // 在移动端产出 ios/android；鸿蒙（aarch64-unknown-linux-ohos）
+            // 的 consts::OS 是 "linux"——真实平台标识在 target_env。
+            os_type: if cfg!(target_env = "ohos") {
+                "ohos".to_string()
+            } else {
+                std::env::consts::OS.to_string()
+            },
             app_version: APP_VERSION.to_string(),
             db_conn,
             cache_manager,

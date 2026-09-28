@@ -54,3 +54,10 @@ client-mobile/ohos/libs/
 client-mobile/ohos/local.properties
 client-mobile/flutter_*.log
 client-mobile/pubspec.ohos.lock
+client-mobile/pubspec.main.yaml.bak
+client-mobile/pubspec.main.lock.bak
+# 上一节的 client-mobile/ 前缀在本文件（嵌套 .gitignore）中不生效，
+# 依赖切换的备份/锁文件用无前缀形式兜底：
+pubspec.ohos.lock
+pubspec.main.yaml.bak
+pubspec.main.lock.bak

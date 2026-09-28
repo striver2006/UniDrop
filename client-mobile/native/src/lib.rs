@@ -340,9 +340,10 @@ fn start_inner(config_json: *const c_char) -> Result<serde_json::Value, String> 
             device_id: device_id.clone(),
             psk_secret: initial_settings.psk_secret.clone(),
             hostname: device_name.clone(),
-            // aarch64-unknown-linux-ohos 上 consts::OS 报 "linux"，服务端
-            // roster 与统计需要真实平台标识。
-            os_type: if cfg!(target_os = "ohos") {
+            // aarch64-unknown-linux-ohos 上报 target_os="linux" /
+            // target_env="ohos"，consts::OS 会是 "linux"；服务端 roster
+            // 与统计需要真实平台标识，按 target_env 区分。
+            os_type: if cfg!(target_env = "ohos") {
                 "ohos".to_string()
             } else {
                 std::env::consts::OS.to_string()

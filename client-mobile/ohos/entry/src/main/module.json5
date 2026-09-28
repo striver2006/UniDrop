@@ -44,6 +44,19 @@
             "actions": [
               "action.system.home"
             ]
+          },
+          {
+            // 调试/CI 注入口：aa start -U "unidropmobile://setup?server=…&account=…&psk=…"
+            // 鸿蒙 platform channel 断流期间无法用键盘改设置，经 URI 落盘
+            // bootstrap_config.json 由 Dart 在 native.start 前读取覆盖。
+            "actions": [
+              "ohos.want.action.viewData"
+            ],
+            "uris": [
+              {
+                "scheme": "unidropmobile"
+              }
+            ]
           }
         ]
       }

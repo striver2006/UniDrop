@@ -9,10 +9,12 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import 'app_shell.dart';
+import 'dbg.dart';
 import 'state/app_store.dart';
 import 'widgets/transfer_card.dart';
 
 void main() {
+  dbgLog('main: ohos=${isOhosRuntime()}');
   runApp(const UniClipApp());
 }
 

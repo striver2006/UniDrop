@@ -215,4 +215,43 @@ FFI 事件改轮询模式（2.19 无 NativeCallable，三端统一）。
 迁移构建+自动签名；b) 等 openharmony-sig 3.22+ ohos 工具分支。全部环境
 事实与正解形态已固化至 scripts/*.sh 与记忆。
 
+### Session 3（2026-09-28 凌晨 · 鸿蒙真机调通 + Mobile CI 修复）
+
+**Mobile CI 三修**（首跑 5 job 全红的根因）：`cfg!(target_os="ohos")` 死代码
+（该 target 实为 target_os="linux"/target_env="ohos"）——lib.rs 与
+app_state.rs 两处同源 os_type 一并修复（真机实证上报 "ohos"）；
+workflow 的 `targets:` 输入名笔误（应为 `target:`，三个交叉编译 job 从未
+装过 target）；Flutter 钉 3.44.6 + `pub get --enforce-lockfile`（3.47 起
+analyze 默认把 pinned 依赖的 deprecation info 判失败）。另补
+`scripts/use_ohos_deps.sh`（pubspec.ohos.yaml 引用但缺失的变体切换脚本）。
+
+**鸿蒙构建链端到端一条命令**：`ohos/hvigorw` 委托 DevEco 自带 hvigor6
+（含 DEVECO_SDK_HOME 兜底），`flutter build hap --debug` 一次完成 kernel
+编译 + ohpm + 签名打包；设备发现需 `ln -s 26.0.0 ~/Library/OpenHarmony/Sdk/26`
+（fork 只认纯数字 API 目录名）；PATH 需加 SDK toolchains 与 DevEco ohpm。
+
+**鸿蒙运行异常根因**（Pura 70 Ultra / HarmonyOS 6.1.1 实测）：fork 引擎的
+**Dart→ArkTS platform channel 单向断流**——插件 pigeon 调用与
+flutter/platform 系统通道的消息全部永不回包（DartMessenger 入口零到达），
+反向 ArkTS→Dart 正常。键盘不弹、剪贴板失效、path_provider 挂起（设置页
+无限转圈）皆同源。旁路矩阵（均以 `isOhosRuntime()` 门控，channel 修复后
+可回退）：固定沙箱路径替 path_provider；deviceName 退通用名；剪贴板/选
+文件/分享超时降级不挂起；启动期 channel 调用统一 `retryChannel` 超时重试
+（附单测）；**URI 设置注入口**（`aa start -U 'unidropmobile://setup?server=…
+&account=…&psk=…&trust=pinned&pin=…'`，EntryAbility 落盘 → Dart 启动覆盖）；
+**屏上 ASCII 键盘**（`lib/widgets/ohos_keyboard.dart`，设置页表单内置）；
+debug 构建「发送测试文本」探针按钮。
+
+**真机实证**：bootstrap 全链路面包屑落盘（`lib/dbg.dart` →
+haps/entry/cache/unidrop-bootstrap.log）；公网中继 pinned 证书连接成功，
+roster 出现 CZBMacBookPro/Mi 10；鸿蒙→Mac 两次 COMPLETED（E2EE 协商成功），
+Mac→鸿蒙接收 + SHA-256 校验通过，历史双向记录；熄屏断连 45s 空闲检测 +
+重连正常。排障资产：`tool/vm_stdout.dart`（VM service 直连，绕过 fork
+attach 的 listViews 空视图缺陷）、`scripts/ohos_baseline.sh` /
+`ohos_dart_logs.sh`。
+
+**遗留**：channel 断流根治在 fork 引擎（2024 预编译 vs HarmonyOS 6.1.1），
+待 openharmony-sig 3.22+ 基座后回退旁路并复测；断流期间剪贴板自动注入/
+选文件/系统分享在鸿蒙端不可用（已优雅降级）。
+
 ---

@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:unidrop_mobile/models.dart';
+import 'package:unidrop_mobile/services/platform_service.dart';
 import 'package:unidrop_mobile/widgets/adaptive.dart';
 
 void main() {
@@ -10,6 +12,31 @@ void main() {
     final src = File('lib/main.dart').readAsStringSync();
     expect(RegExp(r'void\s+main\s*\(').hasMatch(src), isTrue,
         reason: 'main.dart 被覆盖成空壳会让 analyze/test 照常全绿，只在构建期爆炸');
+  });
+
+  group('retryChannel 启动竞态容错（鸿蒙 fork 插件注册晚于 Dart 启动）', () {
+    test('前几次超时后成功——返回最终结果', () async {
+      var calls = 0;
+      final v = await retryChannel('t', () {
+        calls++;
+        // 前两次模拟 channel 无回包（永不完成的 Future），第三次成功
+        if (calls < 3) return Completer<int>().future;
+        return Future.value(7);
+      }, timeout: const Duration(milliseconds: 50), interval: Duration.zero);
+      expect(v, 7);
+      expect(calls, 3);
+    });
+
+    test('全部失败——抛 StateError 而不是无限挂起', () async {
+      Future<Object> never() => Completer<Object>().future;
+      await expectLater(
+        retryChannel('t', never,
+            attempts: 3,
+            timeout: const Duration(milliseconds: 30),
+            interval: Duration.zero),
+        throwsStateError,
+      );
+    });
   });
 
   group('WindowSizeClass 断点（V2 计划 §5.2 的 Pad 适配约定）', () {

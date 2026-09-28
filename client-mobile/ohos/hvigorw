@@ -1,61 +1,17 @@
 #!/bin/bash
-
-# Copyright (c) 2023 Hunan OpenValley Digital Industry Development Co., Ltd.
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
+# flutter ohos 工具链（3.7.12 分支）在主工程阶段会调用本脚本跑 hvigor 任务。
+# 工程本地不再有 hvigor node_modules（2023 版 hvigor4 与 API26 SDK 互不识别），
+# 直接委托给 DevEco Studio 自带的 hvigor6——这是当前唯一穿透的构建路径
+# （见 docs/design/MOBILE_PLAN_V2.md 鸿蒙章节与 67f9ada 提交记录）。
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# DEVECO_SDK_HOME 由本脚本兜底导出，避免 hvigor 报 00303217 配置错误。
+set -e
 
-# ----------------------------------------------------------------------------
-#  Hvigor startup script, version 1.0.0
-# 
-#  Required ENV vars:
-#  ------------------
-#    NODE_HOME - location of a Node home dir
-#    or 
-#    Add /usr/local/nodejs/bin to the PATH environment variable
-# ----------------------------------------------------------------------------
-
-HVIGOR_APP_HOME=$(dirname $(readlink -f $0))
-HVIGOR_WRAPPER_SCRIPT=${HVIGOR_APP_HOME}/hvigor/hvigor-wrapper.js
-warn() {
-	echo ""
-	echo -e "\033[1;33m`date '+[%Y-%m-%d %H:%M:%S]'`$@\033[0m"
-}
-
-error() {
-	echo ""
-	echo -e "\033[1;31m`date '+[%Y-%m-%d %H:%M:%S]'`$@\033[0m"
-}
-
-fail() {
-	error "$@"
-	exit 1
-}
-
-# Determine node to start hvigor wrapper script
-if [ -n "${NODE_HOME}" ];then
-   EXECUTABLE_NODE="${NODE_HOME}/bin/node"
-   if [ ! -x "$EXECUTABLE_NODE" ];then
-       fail "ERROR: NODE_HOME is set to an invalid directory,check $NODE_HOME\n\nPlease set NODE_HOME in your environment to the location where your nodejs installed"
-   fi
-else
-   EXECUTABLE_NODE="node"
-   which ${EXECUTABLE_NODE} > /dev/null 2>&1 || fail "ERROR: NODE_HOME is not set and not 'node' command found in your path"
+DEVECO="${DEVECO_STUDIO_DIR:-/Applications/DevEco-Studio.app}"
+HVIGORW="$DEVECO/Contents/tools/hvigor/bin/hvigorw"
+if [ ! -x "$HVIGORW" ]; then
+  echo "找不到 DevEco hvigorw：$HVIGORW（安装 DevEco Studio 或用 DEVECO_STUDIO_DIR 指定）" >&2
+  exit 1
 fi
-
-# Check hvigor wrapper script
-if [ ! -r "$HVIGOR_WRAPPER_SCRIPT" ];then
-	fail "ERROR: Couldn't find hvigor/hvigor-wrapper.js in ${HVIGOR_APP_HOME}"
-fi
-
-# start hvigor-wrapper script
-exec "${EXECUTABLE_NODE}" \
-	"${HVIGOR_WRAPPER_SCRIPT}" "$@"
+export DEVECO_SDK_HOME="${DEVECO_SDK_HOME:-$DEVECO/Contents/sdk}"
+exec "$HVIGORW" "$@"

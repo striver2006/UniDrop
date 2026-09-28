@@ -3,9 +3,11 @@
 
 library;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../dbg.dart';
 import '../models.dart';
 import '../state/app_store.dart';
 import '../widgets/adaptive.dart';
@@ -186,6 +188,16 @@ class _SendPanel extends StatelessWidget {
             label: const Text('发送剪贴板文本'),
             onPressed: () => store.sendClipboardText(target.deviceId),
           ),
+          // 鸿蒙 channel 断流期間剪贴板/键盘都不可用，debug 构建给一个
+          // 固定文本探针打通发送链验收；release 构建不含此入口。
+          if (kDebugMode && isOhosRuntime()) ...[
+            const SizedBox(height: 10),
+            OutlinedButton.icon(
+              icon: const Icon(Icons.send),
+              label: const Text('发送测试文本（鸿蒙调试）'),
+              onPressed: () => store.sendProbeText(target.deviceId),
+            ),
+          ],
           const SizedBox(height: 16),
           Text(
             '目录不会被展开；大小与数量受服务端限额约束。',

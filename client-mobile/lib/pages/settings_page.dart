@@ -11,8 +11,10 @@ library;
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../dbg.dart';
 import '../models.dart';
 import '../state/app_store.dart';
+import '../widgets/ohos_keyboard.dart';
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key});
@@ -38,6 +40,11 @@ class _SettingsPageState extends State<SettingsPage> {
   bool _autoInject = false;
 
   bool _saving = false;
+
+  /// 鸿蒙屏上键盘的当前编辑目标（channel 断流期间系统键盘不可用）。
+  /// 非空时页面底部挂 OhosKeyboardPanel。
+  OhosKeyboardTarget? _kbdTarget;
+  final bool _isOhos = isOhosRuntime();
 
   /// 表单是否已从 store 回填过。
   ///
@@ -133,43 +140,19 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
         ],
       ),
-      body: ListView(
+      body: Column(
+        children: [
+          Expanded(
+            child: ListView(
         keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
         padding: const EdgeInsets.all(16),
         children: [
           _Section(title: '服务器'),
-          TextField(
-            controller: _server,
-            autocorrect: false,
-            enableSuggestions: false,
-            decoration: const InputDecoration(
-              labelText: '服务器地址',
-              hintText: 'wss://drop.yourdomain.com:58921',
-              border: OutlineInputBorder(),
-            ),
-          ),
+          _field(_server, label: '服务器地址', hint: 'wss://drop.yourdomain.com:58921'),
           const SizedBox(height: 12),
-          TextField(
-            controller: _account,
-            autocorrect: false,
-            enableSuggestions: false,
-            decoration: const InputDecoration(
-              labelText: '账号标识',
-              helperText: '1-64 位字母、数字与 . _ @ -',
-              border: OutlineInputBorder(),
-            ),
-          ),
+          _field(_account, label: '账号标识', helper: '1-64 位字母、数字与 . _ @ -'),
           const SizedBox(height: 12),
-          TextField(
-            controller: _psk,
-            obscureText: true,
-            autocorrect: false,
-            enableSuggestions: false,
-            decoration: const InputDecoration(
-              labelText: '共享密钥（PSK）',
-              border: OutlineInputBorder(),
-            ),
-          ),
+          _field(_psk, label: '共享密钥（PSK）', obscure: true),
           const SizedBox(height: 8),
           FilledButton.tonal(
             onPressed: _saving ? null : () => _save(store, s),
@@ -195,41 +178,13 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           const SizedBox(height: 24),
           _Section(title: '存储与清理'),
-          TextField(
-            controller: _historyMax,
-            keyboardType: TextInputType.number,
-            decoration: const InputDecoration(
-              labelText: '历史保留条数（0 = 不限）',
-              border: OutlineInputBorder(),
-            ),
-          ),
+          _field(_historyMax, label: '历史保留条数（0 = 不限）', number: true),
           const SizedBox(height: 12),
-          TextField(
-            controller: _retainSecs,
-            keyboardType: TextInputType.number,
-            decoration: const InputDecoration(
-              labelText: '完成卡片保持秒数（0 = 不自动消失）',
-              border: OutlineInputBorder(),
-            ),
-          ),
+          _field(_retainSecs, label: '完成卡片保持秒数（0 = 不自动消失）', number: true),
           const SizedBox(height: 12),
-          TextField(
-            controller: _cacheTtl,
-            keyboardType: TextInputType.number,
-            decoration: const InputDecoration(
-              labelText: '收件保留小时数（0 = 不按时间清理）',
-              border: OutlineInputBorder(),
-            ),
-          ),
+          _field(_cacheTtl, label: '收件保留小时数（0 = 不按时间清理）', number: true),
           const SizedBox(height: 12),
-          TextField(
-            controller: _cacheMaxMb,
-            keyboardType: TextInputType.number,
-            decoration: const InputDecoration(
-              labelText: '收件容量上限 MB（0 = 不限容量）',
-              border: OutlineInputBorder(),
-            ),
-          ),
+          _field(_cacheMaxMb, label: '收件容量上限 MB（0 = 不限容量）', number: true),
           const SizedBox(height: 8),
           Text(
             '手机存储有限，建议容量 2048 MB 起步；收件目录 iOS 在「文件」App 的'
@@ -267,17 +222,7 @@ class _SettingsPageState extends State<SettingsPage> {
           // 一行一条，支持直接粘 openssl 输出（core 侧解析时容错冒号与前后缀）。
           if (_trustMode == 'pinned') ...[
             const SizedBox(height: 12),
-            TextField(
-              controller: _pin,
-              maxLines: 3,
-              autocorrect: false,
-              enableSuggestions: false,
-              decoration: const InputDecoration(
-                labelText: '证书 SHA-256 指纹（每行一条）',
-                hintText: '68e1d200…',
-                border: OutlineInputBorder(),
-              ),
-            ),
+            _field(_pin, label: '证书 SHA-256 指纹（每行一条）', hint: '68e1d200…'),
           ],
           const SizedBox(height: 24),
           _Section(title: '服务端限额（只读）'),
@@ -295,7 +240,51 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           const SizedBox(height: 32),
         ],
+            ),
+          ),
+          if (_kbdTarget != null)
+            OhosKeyboardPanel(
+              target: _kbdTarget!,
+              onDone: () => setState(() => _kbdTarget = null),
+            ),
+        ],
       ),
+    );
+  }
+
+  /// 鸿蒙 channel 断流期间系统键盘不可用（TextInput.show 永不回包），
+  /// 表单字段降级为屏上键盘录入；其他平台保持原生 TextField。
+  Widget _field(
+    TextEditingController ctl, {
+    required String label,
+    String? hint,
+    String? helper,
+    bool obscure = false,
+    bool number = false,
+  }) {
+    if (!_isOhos) {
+      return TextField(
+        controller: ctl,
+        obscureText: obscure,
+        autocorrect: false,
+        enableSuggestions: false,
+        keyboardType: number ? TextInputType.number : null,
+        decoration: InputDecoration(
+          labelText: label,
+          hintText: hint,
+          helperText: helper,
+          border: const OutlineInputBorder(),
+        ),
+      );
+    }
+    final target =
+        OhosKeyboardTarget(controller: ctl, label: label, obscure: obscure);
+    return OhosField(
+      target: target,
+      active: _kbdTarget?.controller == ctl,
+      hint: hint,
+      helper: helper,
+      onActivate: () => setState(() => _kbdTarget = target),
     );
   }
 

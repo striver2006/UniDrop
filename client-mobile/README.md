@@ -10,6 +10,12 @@ client-mobile/
 ├── scripts/
 │   ├── build_native_android.sh   # Rust → jniLibs（AGP 自动打包）
 │   ├── build_native_ios.sh       # Rust → ios/NativeSources 静态库（force_load）
+│   ├── build_native_ohos.sh      # Rust → 鸿蒙 .so（拷入 entry/libs 与工程 libs）
+│   ├── use_ohos_deps.sh          # 主/鸿蒙 pubspec 变体切换（含 lock 备份恢复）
+│   ├── prepare_ohos_plugin_wrappers.sh  # 插件 hvigor wrapper（pub get 后重跑）
+│   ├── standardize_ohos_plugins.sh      # 插件目录结构标准化
+│   ├── ohos_baseline.sh          # 真机：启动→拉日志→截图 一键基线
+│   ├── ohos_dart_logs.sh         # 真机：VM service 直连抓 Dart stdout
 │   └── check_ohos.sh             # 鸿蒙 target 交叉编译检查（本机）
 ├── android/        # Flutter 生成的 Android 工程
 └── ios/            # Flutter 生成的 iOS 工程（含静态库链接配置）
@@ -35,37 +41,57 @@ flutter run                                # 连接设备/模拟器
 | :--- | :--- | :--- |
 | Android | `flutter build apk --debug` | arm64-v8a + x86_64 的 `libunidrop_mobile.so` 打包在内 |
 | iOS 真机 | `flutter build ios --no-codesign --debug` | 静态库 force_load 进主二进制（FFI 运行时查找无静态引用，普通链接会被 dead-strip） |
-| 鸿蒙 | 见下节 | 代码就绪，构建需华为 Flutter SDK |
+| 鸿蒙 | 真机构建/运行已通（Pura 70 Ultra · HarmonyOS 6.1） | 见下节；channel 断流有旁路 |
 | 交叉检查 | `./scripts/check_ohos.sh` | aarch64-unknown-linux-ohos 的 cargo check（DevEco llvm） |
 
 已知环境问题：Xcode 27 + Flutter 3.44.6 的 `--simulator` 构建存在环境级不兼容
 （空白工程同样失败，`Flutter.framework` debug 产物的架构校验 bug）；真机构建不受影响，
 升级 Flutter 后即可恢复。
 
-## 鸿蒙（HarmonyOS NEXT）构建
+## 鸿蒙（HarmonyOS NEXT）构建与调试
 
-鸿蒙端 **Dart 代码与本仓库完全一致**（`lib/` 不含平台分支），差异只在平台壳：
+鸿蒙端 Dart 代码与本仓库完全一致（`lib/` 无平台分支），差异在平台壳与工具链。
+工具链基座：**openharmony-sig flutter_flutter 3.7.12（Dart 2.19）** + DevEco Studio
+自带 hvigor6（`flutter build hap` 经 `ohos/hvigorw` 委托给 DevEco，已是端到端一条命令）。
 
-1. 安装[华为 Flutter 分支](https://gitee.com/openharmony-sig/flutter_flutter)
-   （`dev` 分支跟随官方 stable 版本），设 `PATH` 指向其 `bin/flutter`；
-2. 生成 ohos 平台目录（一次性）：
-   ```bash
-   flutter config --enable-ohos
-   flutter create --platforms ohos .
-   ```
-3. 编译 Rust 为鸿蒙 .so（与 Android 同法，工具链换 DevEco llvm）：
-   ```bash
-   # aarch64-unknown-linux-ohos，CC/AR 见 scripts/check_ohos.sh
-   cargo build -p unidrop-mobile-native --target aarch64-unknown-linux-ohos --release
-   cp ../target/aarch64-unknown-linux-ohos/release/libunidrop_mobile.so \
-      ohos/libs/arm64-v8a/   # 目录名以生成的工程为准
-   ```
-4. `flutter build hap --release`（需 DevEco 签名配置），产物上架华为 AppGallery。
+```bash
+# 0. 一次性环境准备
+ln -sfn 26.0.0 ~/Library/OpenHarmony/Sdk/26   # 华为工具的设备发现只认纯数字目录名
+export PATH="/Users/chenzhenbo/DevLib/Flutter-Ohos/bin:\
+/Users/chenzhenbo/Library/OpenHarmony/Sdk/26.0.0/toolchains:\
+/Applications/DevEco-Studio.app/Contents/tools/ohpm/bin:$PATH"
+export PUB_HOSTED_URL=https://pub.flutter-io.cn FLUTTER_STORAGE_BASE_URL=https://storage.flutter-io.cn
 
-依赖插件的鸿蒙适配来自 openharmony-sig 的 [flutter_packages](https://gitee.com/openharmony-sig/flutter_packages)
-（path_provider / device_info_plus / connectivity_plus 等均有 ohos 实现）；
-`file_picker`、`share_plus` 若缺位，`PlatformService` 已按能力探测降级设计，
-可后续接 openharmony-sig 的对应适配或 ArkTS 通道。
+# 1. 切依赖到鸿蒙变体（pubspec.ohos.yaml；切回用 main）
+./scripts/use_ohos_deps.sh ohos
+
+# 2. Rust → 鸿蒙 .so（改过 crates/ 或 native/ 后重跑；产物进 ohos/entry/libs/arm64-v8a/）
+./scripts/build_native_ohos.sh --release
+
+# 3. 出包（kernel 编译 + ohpm + hvigor 签名一体），安装到真机
+flutter build hap --debug
+hdc install -r ohos/entry/build/default/outputs/default/entry-default-signed.hap
+hdc shell aa start -a EntryAbility -b com.unidrop.unidrop_mobile
+```
+
+**真机调试与排障**（stderr 不进 hilog，通道断流时 attach 也不可用）：
+- Rust 核心日志：`{cache_dir}/unidrop-debug.log`；Dart bootstrap 面包屑：
+  `haps/entry/cache/unidrop-bootstrap.log`（沙箱路径见 `lib/dbg.dart`），
+  `hdc file recv` 拉取，或 `scripts/ohos_baseline.sh` 一键拉取+截图。
+- VM service 直连（绕过 fork attach 的 listViews 缺陷）：`scripts/ohos_dart_logs.sh`。
+- 锁屏会拦截 `aa start`；远程注入设置（键盘断流时的改配置通道）：
+  ```bash
+  hdc shell "aa start -a EntryAbility -b com.unidrop.unidrop_mobile -U \
+    'unidropmobile://setup?server=wss%3A%2F%2F<host>%3A<port>&account=<账号>&psk=<密钥>&trust=pinned&pin=<sha256指纹>'"
+  ```
+
+**当前平台限制**（fork 引擎 Dart→ArkTS platform channel 断流的实测规避，
+根因待 fork 修复后回退）：剪贴板读写/文件选择/系统分享不可用
+（`PlatformService` 已降级为不挂起）；设置页表单用内置屏上 ASCII 键盘
+（`lib/widgets/ohos_keyboard.dart`）；设备名退化为通用名。
+
+依赖插件的鸿蒙适配来自 openharmony-sig 的 [flutter_packages](https://gitee.com/openharmony-sig/flutter_packages)；
+`path_provider` 的 pigeon 通道在断流设备上不可达，`resolvePaths` 走固定沙箱路径旁路。
 
 服务端**零改动**：`os_type` 是自由字符串，移动端上报 `ios` / `android` / `ohos`。
 
