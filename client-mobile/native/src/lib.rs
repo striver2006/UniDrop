@@ -324,6 +324,13 @@ fn start_inner(config_json: *const c_char) -> Result<serde_json::Value, String> 
         if let Some(over) = cfg.get("settings") {
             if let Some(patched) = overlay_settings(&initial_settings, over) {
                 initial_settings = patched;
+                // 覆盖必须落库：只改内存的话注入只活一次启动（鸿蒙 setup
+                // URI 注入实测踩中——当次连上，重启即回默认配置）。
+                let json_str = serde_json::to_string(&initial_settings)
+                    .map_err(|e| format!("注入设置序列化失败: {}", e))?;
+                storage::db::save_persisted_settings(&db, &json_str)
+                    .map_err(|e| format!("注入设置落库失败: {}", e))?;
+                log::info!("Setup override persisted to database");
             }
         }
 
