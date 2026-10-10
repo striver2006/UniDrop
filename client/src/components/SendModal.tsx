@@ -174,11 +174,12 @@ export const SendModal: React.FC<SendModalProps> = ({
 
         {/* Body */}
         <div className="mt-4 space-y-3.5 flex-1 overflow-y-auto">
-          {/* Error Banner */}
+          {/* Error Banner —— break-all + 换行：路径类错误没有空格可断行，
+              truncate 会把「文件太大/重名」这类带关键信息的提示截成一截省略号 */}
           {errorMsg && (
-            <div className="p-2.5 rounded-lg bg-rose-500/20 border border-rose-500/40 flex items-center space-x-2 text-rose-300 text-xs">
-              <AlertCircle className="w-4 h-4 shrink-0" />
-              <span className="truncate">{errorMsg}</span>
+            <div className="p-2.5 rounded-lg bg-rose-500/20 border border-rose-500/40 flex items-start space-x-2 text-rose-300 text-xs">
+              <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+              <span className="min-w-0 break-all whitespace-pre-wrap leading-relaxed">{errorMsg}</span>
             </div>
           )}
 

@@ -60,17 +60,36 @@ pub async fn cmd_save_transfer_as(
     }
 
     let mut copied = 0u32;
+    // 文件夹传输的接收件位于会话目录的子目录里（发送端以「文件夹名/」前缀
+    // 展开）。能定位回会话目录就保留相对结构，让用户另存出同样的文件夹；
+    // 定位不回（缓存迁移等异常）则退化为平铺——老会话仍可另存。
+    let session_dir = state.cache_manager.cache_root().join(&session_id);
     for src in &files {
         if !src.exists() {
             continue;
         }
 
+        let rel_in_session = src.strip_prefix(&session_dir).ok();
+        let sub_dir: Option<PathBuf> = rel_in_session
+            .and_then(|r| r.parent())
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(PathBuf::from);
+        let target_root = match &sub_dir {
+            Some(d) => {
+                let t = dest_dir.join(d);
+                std::fs::create_dir_all(&t).map_err(|e| format!("创建子目录 {} 失败: {}", d.display(), e))?;
+                t
+            }
+            None => dest_dir.clone(),
+        };
+
         // Name collision: append " (n)" before the extension instead of overwriting
-        let file_name = src
-            .file_name()
+        let file_name = rel_in_session
+            .and_then(|r| r.file_name())
+            .or_else(|| src.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| format!("unidrop-file-{}", copied));
-        let mut target = dest_dir.join(&file_name);
+        let mut target = target_root.join(&file_name);
         if target.exists() {
             let as_path = PathBuf::from(&file_name);
             let stem = as_path
@@ -84,9 +103,9 @@ pub async fn cmd_save_transfer_as(
             let mut n = 1u32;
             loop {
                 let candidate = if ext.is_empty() {
-                    dest_dir.join(format!("{} ({})", stem, n))
+                    target_root.join(format!("{} ({})", stem, n))
                 } else {
-                    dest_dir.join(format!("{} ({}).{}", stem, n, ext))
+                    target_root.join(format!("{} ({}).{}", stem, n, ext))
                 };
                 if !candidate.exists() {
                     target = candidate;

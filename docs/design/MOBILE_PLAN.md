@@ -95,7 +95,7 @@
  | **C** | **断点续传未实现**：`BitmapRepo` 无生产调用、`resumed_items` 恒空 | `core/e2ee.rs:118-121` 注释自述、`lib.rs:549` 与 `:573` | 移动端中断是常态（切后台 / 锁屏 / 蜂窝切换），优先级由「可选」升为「强烈建议」 | M2.5 |
  | **D** | **剪贴板监听只有 macOS 接线**：Windows / Linux 的 `listener_*.rs` 是空函数体 | `lib.rs:914` 的 `#[cfg(target_os = "macos")]`；`listener_windows.rs:7-10`、`listener_linux.rs:6-9` 均为注释占位 | 说明「自动同步」目前本就是单平台特性；移动端按前台监听实现即可，**不算功能降级** | 记录 |
  | **E** | **SQLite 与缓存同目录，且位于系统缓存区** | `storage/db.rs:6-10` + `core/cache_manager.rs:38-43`（macOS 落 `~/Library/Caches/UniDrop/cache/`） | `device_id`、PSK、账号、全部历史都在这一个库里。移动端必须迁移；桌面端建议同批修（含一次性文件搬迁） | M1 |
- | **F** | **目录不展开传输**（选目录被静默跳过） | `transfer_engine.rs:168-171`、`clipboard_cmd.rs:187-189` | 与移动端能力天然一致，无需变更，仅需 UI 文案对齐 | 记录 |
+ | **F** | ~~**目录不展开传输**（选目录被静默跳过）~~ **已于 0.4.6 修复**：`expand_selection` 递归展开，文件夹以自身名字为前缀（`文件夹名/内部路径`），接收端 PathGuard 原样重建目录结构 | `transfer_engine.rs` 的 `expand_selection` / `prepare_offer`、`send_flow.rs` 的 `precheck_file_paths` | 移动端共享同一核心，接收文件夹即自动重建；发送侧仍受 file_picker 只有文件选择的限制 | 已落地 |
  
  ---
  
@@ -171,7 +171,7 @@
  | `cmd_get_online_devices` | **直接复用** | 前端补 ios / android 图标（`components/DeviceList.tsx:16-18` 现只有 Monitor / Laptop / Terminal） |
  | `cmd_get_self_info` | 复用 + 改造 | `whoami::hostname()`（`app_state.rs:75-86`）在移动端不可靠 → 走原生取设备名，并支持用户自定义显示名 |
  | `cmd_inject_files` | **语义替换** | → 「保存到… / 分享 / 存相册」；文本与图片仍写系统剪贴板 |
- | `cmd_send_files` | 复用 + 改造 | 路径来源换成 SAF / `UIDocumentPicker`。**Android SAF 返回 `content://`，Rust `File::open` 打不开** → 方案 b（首选）：Kotlin 侧开 `ParcelFileDescriptor` 传 fd，Rust 用 `File::from_raw_fd`，零拷贝；方案 a（兜底）：先复制进应用私有目录。M0-T0.4 决策。限额预检 `precheck_file_paths`（`clipboard_cmd.rs:172-232`）与「目录不展开」口径原样复用 |
+ | `cmd_send_files` | 复用 + 改造 | 路径来源换成 SAF / `UIDocumentPicker`。**Android SAF 返回 `content://`，Rust `File::open` 打不开** → 方案 b（首选）：Kotlin 侧开 `ParcelFileDescriptor` 传 fd，Rust 用 `File::from_raw_fd`，零拷贝；方案 a（兜底）：先复制进应用私有目录。M0-T0.4 决策。限额预检 `precheck_file_paths`（`send_flow.rs`）现按「目录先经 `expand_selection` 递归展开」的新口径（0.4.6 起）——计数与限额都作用在展开后的文件清单上 |
  | `cmd_get_settings` / `cmd_save_settings` | 复用 + 扩展 | 新增字段必须带**自定义** `#[serde(default = "…")]`——`settings_cmd.rs:19-105` 的注释已把「裸 default 让 `0` 静默变成不限制」这个坑写清楚了，照办即可 |
  | `cmd_get_autostart` / `cmd_set_autostart` | 平台分流 | Android → `RECEIVE_BOOT_COMPLETED` + 前台服务开关；iOS → 返回不支持，前端隐藏该项。`core/startup.rs` 的 `--silent` 真值表在移动端不适用，保持桌面专属 |
  | `cmd_hide_window` | 移动端 no-op | 移动端无窗口隐藏语义，改为隐藏入口 |

@@ -290,7 +290,7 @@ class _SendPanelState extends State<_SendPanel> {
             const SizedBox(height: 10),
           ],
           Text(
-            '目录不会被展开；大小与数量受服务端限额约束。',
+            '文件夹会递归展开为其中的所有文件发送；大小与数量受服务端限额约束。',
             style: theme.textTheme.bodySmall
                 ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
           ),

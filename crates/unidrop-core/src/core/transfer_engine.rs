@@ -48,6 +48,124 @@ pub enum TransferSource {
     Memory(Vec<u8>),
 }
 
+/// 一次用户选择（文件 / 文件夹混排）展开后的单个待发送文件。
+///
+/// `relative` 就是 OFFER item 的 `relative_path`：直接选中的文件为文件名本身；
+/// 选中的文件夹以「文件夹名/」为前缀递归展开。接收端 PathGuard 支持嵌套
+/// 相对路径并自动创建父目录，因此能据此在会话目录下原样重建目录结构。
+#[derive(Debug, Clone)]
+pub struct SelectedFile {
+    /// 发送时按 item index 对齐读取的本地绝对路径。
+    pub path: PathBuf,
+    /// 线上路径，分隔符恒为 `/`（不随宿主平台变）。
+    pub relative: String,
+}
+
+/// 登记一个展开结果，占位表同时充当重名检测。
+///
+/// 重名宁可报错也不静默改名：改名会悄悄改变接收端重建出的目录结构，
+/// 「发过去的东西和我发的不一样」比「让我分开两次发」糟糕得多。
+fn push_selected(
+    out: &mut Vec<SelectedFile>,
+    seen: &mut std::collections::HashMap<String, PathBuf>,
+    abs: PathBuf,
+    rel: String,
+) -> Result<(), String> {
+    if let Some(prev) = seen.get(&rel) {
+        return Err(format!(
+            "不同选择的展开结果重名：「{}」（{} 与 {}），请分开多次发送或先重命名其一",
+            rel,
+            prev.display(),
+            abs.display()
+        ));
+    }
+    seen.insert(rel.clone(), abs.clone());
+    out.push(SelectedFile { path: abs, relative: rel });
+    Ok(())
+}
+
+/// 把用户选择展开成待发送文件清单：文件原样保留，文件夹递归展开。
+///
+/// - 空文件夹不产生任何条目（线上没有「建目录」的载荷形态，`is_dir`
+///   字段只是占位）——全空时由预检给出可读提示；
+/// - 不可读路径跳过，与 `prepare_offer` 的跳过口径一致；
+/// - 每层目录按文件名排序，保证展开序确定——OFFER 的 item 顺序、哈希
+///   计算次序与测试断言都依赖这一点可复现；
+/// - 目录内的符号链接：指向文件的跟随，指向目录的跳过。跟随目录符号
+///   链接可能成环（自引用 / 互相引用），逐级 canonical 去重的复杂度
+///   配不上这个边角收益，直接不跟；
+/// - 两个选择展开出**完全相同**的相对路径时报错（典型：不同位置的两个
+///   同名文件夹里装着同名文件）。同名根但文件互不相同时放行——接收端
+///   会把它们合并进同一个文件夹，没有覆盖风险。
+pub fn expand_selection(paths: &[PathBuf]) -> Result<Vec<SelectedFile>, String> {
+    let mut out: Vec<SelectedFile> = Vec::new();
+    let mut seen: std::collections::HashMap<String, PathBuf> = std::collections::HashMap::new();
+
+    for p in paths {
+        // fs::metadata 跟随符号链接：直接选中的链接文件按目标文件对待。
+        let meta = match fs::metadata(p) {
+            Ok(m) => m,
+            Err(_) => continue, // 与 prepare_offer 一致：不可读的跳过
+        };
+
+        if !meta.is_dir() {
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "unnamed".to_string());
+            push_selected(&mut out, &mut seen, p.clone(), name)?;
+            continue;
+        }
+
+        // 文件夹以自身名字为根：接收端拿到的就是「<文件夹名>/内部路径」，
+        // 多个选择之间的同名文件天然不会互相覆盖。
+        let root_name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "folder".to_string());
+
+        // 显式栈而非递归：目录深度不受调用栈约束。
+        // 每层先输出本层文件（有序），子目录逆序压栈使弹出恢复正序，
+        // 整体是稳定的前序遍历。
+        let mut stack: Vec<(PathBuf, String)> = vec![(p.clone(), root_name)];
+        while let Some((cur, prefix)) = stack.pop() {
+            let entries = match fs::read_dir(&cur) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let mut level_files: Vec<(PathBuf, String)> = Vec::new();
+            let mut level_dirs: Vec<(PathBuf, String)> = Vec::new();
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let child_rel = format!("{}/{}", prefix, name);
+                let ft = match entry.file_type() {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if ft.is_dir() {
+                    level_dirs.push((entry.path(), child_rel));
+                } else if ft.is_file()
+                    || (ft.is_symlink() && fs::metadata(entry.path()).is_ok_and(|m| m.is_file()))
+                {
+                    level_files.push((entry.path(), child_rel));
+                }
+            }
+
+            level_files.sort_by(|a, b| a.1.cmp(&b.1));
+            level_dirs.sort_by(|a, b| a.1.cmp(&b.1));
+            for (abs, rel) in level_files {
+                push_selected(&mut out, &mut seen, abs, rel)?;
+            }
+            for (abs, rel) in level_dirs.into_iter().rev() {
+                stack.push((abs, rel));
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 /// 把 URL 查询串里的 `token=` 值抹掉，供日志输出使用。
 ///
 /// 数据面 URL 把一次性会话令牌拼在查询串里，而这两条连接日志是 `info` 级别。
@@ -146,7 +264,7 @@ impl TransferEngine {
     /// 这个状态在类型上就不可表示。
     pub fn prepare_offer(
         session_id: Uuid,
-        file_paths: &[PathBuf],
+        files: &[SelectedFile],
         e2ee_key: Option<&ring::aead::LessSafeKey>,
     ) -> Result<(TransferOfferPayload, Vec<PathBuf>), String> {
         // 四处同源之一：块长只从 plaintext_chunk_len 取，不得就地写 MAX_PAYLOAD_LENGTH。
@@ -155,7 +273,8 @@ impl TransferEngine {
         let mut valid_paths = Vec::new();
         let mut total_size = 0i64;
 
-        for p in file_paths.iter() {
+        for f in files.iter() {
+            let p = &f.path;
             let metadata = match fs::metadata(p) {
                 Ok(m) => m,
                 Err(e) => {
@@ -164,7 +283,9 @@ impl TransferEngine {
                 }
             };
 
-            // P3-8: If it is a directory, skip direct File::open
+            // expand_selection 之后的清单里不应再有目录；保留兜底以防
+            // 有调用方绕过展开直接喂路径（展开与预检之间目录被替换成
+            // 同名目录的竞态也落在这里）。
             if metadata.is_dir() {
                 log::warn!("Skipping directory {:?} in file transfer offer", p);
                 continue;
@@ -173,7 +294,10 @@ impl TransferEngine {
             let file_size = metadata.len() as i64;
             total_size += file_size;
 
-            let file_name = p.file_name().and_then(|n| n.to_str()).unwrap_or("unnamed").to_string();
+            // 相对路径直接来自展开结果（文件夹选择带「文件夹名/」前缀），
+            // 不再从磁盘路径取 file_name——那会把目录结构压平成裸文件名，
+            // 接收端就重建不出文件夹了。
+            let file_name = f.relative.clone();
 
             // Compute SHA-256
             let mut file = File::open(p).map_err(|e| format!("cannot open {:?}: {}", p, e))?;
@@ -206,7 +330,7 @@ impl TransferEngine {
         }
 
         if items.is_empty() {
-            return Err("No valid readable files to send".into());
+            return Err("没有可发送的文件：所选内容不存在、不可读或均为空文件夹".into());
         }
 
         let summary = if items.len() == 1 {
@@ -1300,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_offer_aligns_valid_paths_and_skips_dirs() {
+    fn test_prepare_offer_aligns_valid_paths_and_skips_dir_entries() {
         let temp_dir = std::env::temp_dir().join(format!("unidrop_test_{}", Uuid::new_v4()));
         fs::create_dir_all(&temp_dir).unwrap();
 
@@ -1315,12 +1439,18 @@ mod tests {
         let mut f2 = File::create(&file2).unwrap();
         f2.write_all(b"Hello World 2").unwrap();
 
-        // Input paths has directory first, then file1, non-existent, then file2
+        // 展开由 expand_selection 负责；这里手工构造清单，混进一个目录条目
+        // 验证 prepare_offer 的兜底跳过，以及相对路径原样进入 item。
         let non_existent = temp_dir.join("does_not_exist.bin");
-        let input_paths = vec![sub_dir, file1.clone(), non_existent, file2.clone()];
+        let input = expand_selection(&[file1.clone(), non_existent, file2.clone()]).unwrap();
+        let input = {
+            let mut v = vec![SelectedFile { path: sub_dir.clone(), relative: "sub_folder".to_string() }];
+            v.extend(input);
+            v
+        };
 
         let session_id = Uuid::new_v4();
-        let (offer, valid_paths) = TransferEngine::prepare_offer(session_id, &input_paths, None).unwrap();
+        let (offer, valid_paths) = TransferEngine::prepare_offer(session_id, &input, None).unwrap();
 
         assert_eq!(offer.items.len(), 2);
         assert_eq!(valid_paths.len(), 2);
@@ -1331,6 +1461,75 @@ mod tests {
 
         assert_eq!(valid_paths[1], file2);
         assert_eq!(offer.items[1].relative_path, "file2.txt");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    /// 文件夹选择必须递归展开并以「文件夹名/」为前缀——这是「文件夹不能发送」
+    /// 这个 bug 的正面断言：接收端靠这个前缀重建目录结构。
+    #[test]
+    fn test_expand_selection_recurses_into_directories_with_prefix() {
+        let temp_dir = std::env::temp_dir().join(format!("unidrop_test_{}", Uuid::new_v4()));
+        let docs = temp_dir.join("docs");
+        fs::create_dir_all(docs.join("notes")).unwrap();
+        fs::write(docs.join("readme.md"), b"hi").unwrap();
+        fs::write(docs.join("notes").join("a.txt"), b"a").unwrap();
+        fs::write(docs.join("notes").join("b.txt"), b"b").unwrap();
+
+        let loose = temp_dir.join("loose.txt");
+        fs::write(&loose, b"l").unwrap();
+
+        let selected = expand_selection(&[docs, loose]).unwrap();
+
+        let rels: Vec<&str> = selected.iter().map(|f| f.relative.as_str()).collect();
+        // 每层按文件名有序：docs 下先 readme.md 再进入 notes；loose.txt 是
+        // 直接选中的文件，保持裸文件名（无前缀）。
+        assert_eq!(
+            rels,
+            vec!["docs/readme.md", "docs/notes/a.txt", "docs/notes/b.txt", "loose.txt"]
+        );
+        assert!(selected.iter().all(|f| f.path.is_file()));
+        assert_eq!(selected[0].path, temp_dir.join("docs").join("readme.md"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    /// 两个不同位置的同名文件夹内出现同一路径（如都有 photos/1.jpg）：
+    /// 必须报错而不是静默覆盖，否则一个会把另一个的条目挤掉、接收端互相覆写。
+    /// 同名根但内容不相交的文件不在此列——它们在接收端合并进同一个文件夹，
+    /// 无覆盖风险，放行。
+    #[test]
+    fn test_expand_selection_rejects_same_name_roots() {
+        let temp_dir = std::env::temp_dir().join(format!("unidrop_test_{}", Uuid::new_v4()));
+        let a = temp_dir.join("a").join("photos");
+        let b = temp_dir.join("b").join("photos");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("1.jpg"), b"x").unwrap();
+        fs::write(b.join("1.jpg"), b"y").unwrap();
+
+        let err = expand_selection(&[a, b]).unwrap_err();
+        assert!(err.contains("photos/1.jpg"), "报错应点名重名的相对路径：{}", err);
+        assert!(err.contains("分开多次发送"), "报错应给出可操作的处理方式：{}", err);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    /// 空文件夹不产生条目；与文件混选时只发文件，全空由预检兜底提示。
+    #[test]
+    fn test_expand_selection_empty_dir_contributes_nothing() {
+        let temp_dir = std::env::temp_dir().join(format!("unidrop_test_{}", Uuid::new_v4()));
+        let empty = temp_dir.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+
+        let selected = expand_selection(std::slice::from_ref(&empty)).unwrap();
+        assert!(selected.is_empty());
+
+        let file = temp_dir.join("f.txt");
+        fs::write(&file, b"f").unwrap();
+        let selected = expand_selection(&[empty, file.clone()]).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].path, file);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

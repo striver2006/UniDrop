@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::app_state::AppState;
-use crate::core::transfer_engine::{TransferEngine, TransferSource};
+use crate::core::transfer_engine::{expand_selection, TransferEngine, TransferSource, SelectedFile};
 use crate::host::HostBridge;
 use crate::protocol::{ActionType, ControlEnvelope, ServerLimits, TransferOfferPayload};
 use crate::storage::HistoryRepo;
@@ -50,39 +50,39 @@ fn human_bytes(n: i64) -> String {
     format!("{:.2} GB", v / (KB * KB * KB))
 }
 
-/// 一次 metadata 遍历：过滤掉目录与不可读项，同时累计大小并校验限额。
+/// 一次 metadata 遍历：过滤掉不可读项，同时累计大小并校验限额。
+///
+/// 入参是 **`expand_selection` 展开后的清单**——文件夹已经递归成带前缀的
+/// 文件条目，所以这里的计数天然含目录内的文件（目录内 60 个文件就是 60 个
+/// item），与 `prepare_offer` 的口径一致（两者都跳过不可读项）。
 ///
 /// **这一趟必须发生在 `prepare_offer` 之前。** `prepare_offer` 会把每个文件
 /// 完整读一遍算 SHA-256；把预检放在它之后，等于超限的 100 GB 文件也要先花
 /// 几分钟算完哈希才弹提示——需求 3 要的「超出限制时弹出提示」就名存实亡了。
 /// 文件大小只需 `fs::metadata`，根本不需要哈希。
 ///
-/// **条目计数必须与 `prepare_offer` 的跳过逻辑同口径**（`transfer_engine.rs`
-/// 遇到目录与不可读项都 `continue`）。若直接拿 `paths.len()` 去比上限，
-/// 用户选了 70 项、其中 10 项是目录时，实际只会产生 60 个 item（未超 64），
-/// 却会在这里被误拒。遍历 metadata 本来就要做，顺手过滤不增加任何 IO。
-///
-/// 返回过滤后的路径，供调用方原样交给 `prepare_offer`。
+/// 返回过滤后的清单，供调用方原样交给 `prepare_offer`。
 fn precheck_file_paths(
-    paths: &[PathBuf],
+    files: &[SelectedFile],
     limits: Option<&ServerLimits>,
-) -> Result<Vec<PathBuf>, String> {
-    let mut usable: Vec<PathBuf> = Vec::with_capacity(paths.len());
+) -> Result<Vec<SelectedFile>, String> {
+    let mut usable: Vec<SelectedFile> = Vec::with_capacity(files.len());
     let mut total: i64 = 0;
 
-    for p in paths {
-        let meta = match std::fs::metadata(p) {
+    for f in files {
+        let meta = match std::fs::metadata(&f.path) {
             Ok(m) => m,
             Err(_) => continue, // 与 prepare_offer 一致：不可读的跳过
         };
         if meta.is_dir() {
-            continue; // 与 prepare_offer 一致：目录不展开也不计数
+            continue; // 展开后不应出现；与 prepare_offer 的兜底跳过同口径
         }
 
         let size = meta.len() as i64;
         if let Some(l) = limits {
             if ServerLimits::exceeds(l.max_single_file_bytes, size) {
-                let name = p
+                let name = f
+                    .path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "该文件".to_string());
@@ -95,11 +95,11 @@ fn precheck_file_paths(
             }
         }
         total += size;
-        usable.push(p.clone());
+        usable.push(f.clone());
     }
 
     if usable.is_empty() {
-        return Err("没有可发送的文件（目录不会被展开，请直接选择文件）".into());
+        return Err("没有可发送的文件（所选路径不存在、不可读或均为空文件夹）".into());
     }
 
     if let Some(l) = limits {
@@ -246,12 +246,13 @@ fn emit_fallback(bridge: &dyn HostBridge, reason: Option<String>) {
     }
 }
 
-/// 发送文件的全流程（限额预检 → E2EE 协商 → 哈希与 OFFER 构造 → 派发）。
+/// 发送文件的全流程（目录展开 → 限额预检 → E2EE 协商 → 哈希与 OFFER 构造 → 派发）。
 ///
-/// 路径来源由宿主决定：桌面是文件对话框 / 剪贴板文件列表；
+/// 路径来源由宿主决定：桌面是文件对话框 / 拖拽 / 剪贴板文件列表（可含文件夹）；
 /// 移动端是 SAF / DocumentPicker 返回的**可读文件路径**
 /// （Flutter 的 file_picker 在两端都把选中内容落在应用可读的临时目录，
 /// 因此这里不需要感知 content:// URI）。
+/// 文件夹在这里统一递归展开，线上只出现文件条目。
 pub async fn send_files_flow(
     state: &AppState,
     bridge: &dyn HostBridge,
@@ -265,7 +266,10 @@ pub async fn send_files_flow(
     let path_bufs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
     let session_id = Uuid::new_v4();
 
-    // 0. 限额预检——必须在算哈希之前，且必须在 dispatch_offer 之前。
+    // 0. 目录展开 + 限额预检——必须发生在算哈希与 dispatch_offer 之前。
+    //
+    //    展开在前：文件夹在这里递归成带「文件夹名/」前缀的文件清单，
+    //    预检的条目计数因此包含目录内的所有文件。
     //
     //    在哈希之前：否则超限的大文件要等全量 SHA-256 算完才被拒（见
     //    precheck_file_paths 的说明）。
@@ -273,9 +277,12 @@ pub async fn send_files_flow(
     //    在 dispatch_offer 之前：dispatch_offer 会先写 pending_outbound、
     //    再落一行 TRANSFERRING 历史。在那之后才拒绝，会留下一张永远停在
     //    「传输中」的卡片和一行没人收尾的历史——正是要修的那个形态。
+    //
+    //    两段都是纯文件系统 IO，合并进同一个 spawn_blocking。
     let limits_snapshot = { state.server_limits.lock().await.clone() };
-    let path_bufs = tokio::task::spawn_blocking(move || {
-        precheck_file_paths(&path_bufs, limits_snapshot.as_ref())
+    let files = tokio::task::spawn_blocking(move || {
+        let expanded = expand_selection(&path_bufs)?;
+        precheck_file_paths(&expanded, limits_snapshot.as_ref())
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -285,11 +292,10 @@ pub async fn send_files_flow(
     emit_fallback(bridge, decision.fallback_reason);
 
     // 2. Prepare offer in spawn_blocking（防止哈希阻塞 Tokio worker）
-    let paths_for_hash = path_bufs.clone();
     let e2ee_key = decision.key;
     let key_for_prepare = e2ee_key.clone();
     let (offer_payload, valid_paths) = tokio::task::spawn_blocking(move || {
-        TransferEngine::prepare_offer(session_id, &paths_for_hash, key_for_prepare.as_deref())
+        TransferEngine::prepare_offer(session_id, &files, key_for_prepare.as_deref())
     })
     .await
     .map_err(|e| e.to_string())??;
@@ -355,15 +361,6 @@ pub async fn send_bytes_flow(
     dispatch_offer(state, &target_device, offer_payload, source, e2ee_key.as_deref()).await
 }
 
-/// 剪贴板里有文件列表时的预检入口（桌面 cmd_send_clipboard 的 FILES 分支用；
-/// 移动端无此形态）。抽出来只为让两条路径共用同一套限额口径。
-pub fn precheck_clipboard_files(
-    paths: &[PathBuf],
-    limits: Option<&ServerLimits>,
-) -> Result<Vec<PathBuf>, String> {
-    precheck_file_paths(paths, limits)
-}
-
 /// `send_bytes_flow` 使用的兜底常量的只读出口（测试与宿主展示用）。
 pub fn fallback_text_bytes() -> usize {
     FALLBACK_TEXT_BYTES
@@ -418,6 +415,15 @@ mod tests {
         }
     }
 
+    /// 直接选中单个文件的展开等价物：relative 就是文件名本身。
+    fn sel(path: PathBuf) -> SelectedFile {
+        let relative = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unnamed".to_string());
+        SelectedFile { path, relative }
+    }
+
     /// 服务端未下发限额（老服务端，或尚未连上）时**不做文件预检**。
     ///
     /// 这条守护「三选一」：None 必须是「沿用改造前行为」，既不能当成
@@ -426,7 +432,7 @@ mod tests {
     #[test]
     fn absent_limits_do_not_reject_anything() {
         let tmp = TempDir::new();
-        let paths = vec![tmp.file("big.bin", 4096)];
+        let paths = vec![sel(tmp.file("big.bin", 4096))];
 
         let usable = precheck_file_paths(&paths, None).expect("未下发限额时不应拒绝");
         assert_eq!(usable.len(), 1);
@@ -452,32 +458,44 @@ mod tests {
         );
     }
 
-    /// **目录不计入条目数。**
+    /// **文件夹内的文件计入条目数与总量。**
     ///
-    /// prepare_offer 遇到目录直接跳过、不递归展开，所以预检的计数口径必须
-    /// 与它一致。若这里图省事写 paths.len()，用户选了 4 项（其中 2 个目录）
-    /// 在上限为 2 时会被误拒，而实际只会产生 2 个 item。
+    /// 展开发生在预检之前，所以目录里的每个文件都是一个 item、都累计大小。
+    /// 这条同时是「文件夹不能发送」的正面断言：文件夹不再被静默丢弃，
+    /// 而是展开成文件参与全部限额口径。
     #[test]
-    fn directories_are_skipped_and_do_not_count_toward_item_limit() {
+    fn directory_contents_count_toward_item_limit_and_total() {
         let tmp = TempDir::new();
-        let paths = vec![
-            tmp.file("a.txt", 10),
-            tmp.dir("sub1"),
-            tmp.dir("sub2"),
-            tmp.file("b.txt", 10),
-        ];
+        let dir = tmp.dir("photos");
+        std::fs::write(dir.join("a.jpg"), vec![0u8; 600]).unwrap();
+        std::fs::write(dir.join("b.jpg"), vec![0u8; 600]).unwrap();
 
-        let usable = precheck_file_paths(&paths, Some(&limits(0, 0, 2)))
-            .expect("两个目录不应占用条目额度");
-        assert_eq!(usable.len(), 2, "只应保留两个真实文件");
-        assert!(usable.iter().all(|p| p.is_file()));
+        let expanded = expand_selection(&[dir]).unwrap();
+        assert_eq!(expanded.len(), 2, "文件夹必须展开成其中的文件");
+
+        // 3 个条目撞上 2 的上限：报错且数字要出现在文案里
+        let with_extra = sel(tmp.file("c.bin", 10));
+        let mut all = expanded.clone();
+        all.push(with_extra);
+        let err = precheck_file_paths(&all, Some(&limits(0, 0, 2))).unwrap_err();
+        assert!(err.contains("文件太多"), "目录文件计入后应报条目超限：{}", err);
+        assert!(err.contains('3'), "文案应写明当前数量：{}", err);
+
+        // 两个 600B 文件撞上 1000B 总量上限
+        let err = precheck_file_paths(&expanded, Some(&limits(0, 1000, 0))).unwrap_err();
+        assert!(err.contains("总量"), "目录文件的大小应累计进总量：{}", err);
+
+        // 不撞上限时原样通过
+        let usable = precheck_file_paths(&all, Some(&limits(0, 0, 3))).unwrap();
+        assert_eq!(usable.len(), 3);
+        assert!(usable.iter().all(|f| f.path.is_file()));
     }
 
     /// 不可读/不存在的路径同样跳过，与 prepare_offer 一致。
     #[test]
     fn missing_paths_are_skipped() {
         let tmp = TempDir::new();
-        let paths = vec![tmp.file("a.txt", 10), tmp.0.join("does-not-exist.bin")];
+        let paths = vec![sel(tmp.file("a.txt", 10)), sel(tmp.0.join("does-not-exist.bin"))];
 
         let usable = precheck_file_paths(&paths, Some(&limits(0, 0, 1)))
             .expect("不存在的路径不应占用条目额度");
@@ -488,9 +506,9 @@ mod tests {
     fn item_count_over_limit_is_rejected_with_the_number() {
         let tmp = TempDir::new();
         let paths = vec![
-            tmp.file("a.txt", 10),
-            tmp.file("b.txt", 10),
-            tmp.file("c.txt", 10),
+            sel(tmp.file("a.txt", 10)),
+            sel(tmp.file("b.txt", 10)),
+            sel(tmp.file("c.txt", 10)),
         ];
 
         let err = precheck_file_paths(&paths, Some(&limits(0, 0, 2))).unwrap_err();
@@ -502,7 +520,7 @@ mod tests {
     #[test]
     fn single_file_over_limit_names_the_file() {
         let tmp = TempDir::new();
-        let paths = vec![tmp.file("small.txt", 10), tmp.file("huge.bin", 5000)];
+        let paths = vec![sel(tmp.file("small.txt", 10)), sel(tmp.file("huge.bin", 5000))];
 
         let err = precheck_file_paths(&paths, Some(&limits(1024, 0, 0))).unwrap_err();
         assert!(
@@ -515,7 +533,7 @@ mod tests {
     #[test]
     fn total_over_limit_is_rejected() {
         let tmp = TempDir::new();
-        let paths = vec![tmp.file("a.bin", 600), tmp.file("b.bin", 600)];
+        let paths = vec![sel(tmp.file("a.bin", 600)), sel(tmp.file("b.bin", 600))];
 
         // 单文件都不超，总量超
         let err = precheck_file_paths(&paths, Some(&limits(1024, 1000, 0))).unwrap_err();
@@ -525,7 +543,7 @@ mod tests {
     #[test]
     fn exactly_at_limit_passes() {
         let tmp = TempDir::new();
-        let paths = vec![tmp.file("a.bin", 1024)];
+        let paths = vec![sel(tmp.file("a.bin", 1024))];
 
         precheck_file_paths(&paths, Some(&limits(1024, 1024, 1)))
             .expect("恰好等于上限必须通过");
@@ -537,22 +555,25 @@ mod tests {
         let tmp = TempDir::new();
         let mut paths = Vec::new();
         for i in 0..50 {
-            paths.push(tmp.file(&format!("f{}.bin", i), 2048));
+            paths.push(sel(tmp.file(&format!("f{}.bin", i), 2048)));
         }
 
         precheck_file_paths(&paths, Some(&limits(0, 0, 0))).expect("限额全为 0 时不应拒绝");
     }
 
-    /// 全是目录时给出可操作的提示，而不是笼统的「没有文件」。
+    /// 只选了空文件夹（或全部不可读）时给出可操作的提示，而不是笼统的
+    /// 「没有文件」。走完整链路（展开 → 预检），和 send_files_flow 同序。
     #[test]
-    fn only_directories_yields_actionable_error() {
+    fn only_empty_directories_yield_actionable_error() {
         let tmp = TempDir::new();
         let paths = vec![tmp.dir("only-a-dir")];
 
-        let err = precheck_file_paths(&paths, Some(&limits(0, 0, 0))).unwrap_err();
+        let expanded = expand_selection(&paths).unwrap();
+        assert!(expanded.is_empty(), "空文件夹不应产生条目");
+        let err = precheck_file_paths(&expanded, Some(&limits(0, 0, 0))).unwrap_err();
         assert!(
-            err.contains("目录"),
-            "应说明目录不会被展开，否则用户不知道为什么发不出去：{}",
+            err.contains("空文件夹"),
+            "应说明可能是空文件夹，否则用户不知道为什么发不出去：{}",
             err
         );
     }

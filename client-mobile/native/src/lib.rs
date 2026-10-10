@@ -643,11 +643,14 @@ mod tests {
         let dir = std::env::temp_dir().join("unidrop-bootstrap-smoke");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let cfg = format!(
-            "{{\"db_path\":\"{}/db.sqlite\",\"cache_dir\":\"{}/cache\",\"device_name\":\"smoke\"}}",
-            dir.display(),
-            dir.display()
-        );
+        // 用 json! 而不是 format! 手拼：Windows 临时目录里的 `\` 会被当成
+        // JSON 转义符（`C:\Users\...` → invalid escape），冒烟在本机直接误报。
+        let cfg = serde_json::json!({
+            "db_path": dir.join("db.sqlite"),
+            "cache_dir": dir.join("cache"),
+            "device_name": "smoke",
+        })
+        .to_string();
 
         // 1. start（10 秒上限：Dart 侧是同步 FFI 调用，挂这里 UI 就白屏/转圈）
         let cfg_c = CString::new(cfg).unwrap();
