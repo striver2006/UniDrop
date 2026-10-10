@@ -600,13 +600,16 @@ fn apply_activation_policy(app: &AppHandle, concluded: TrayPlacement) {
 // ---------------------------------------------------------------------------
 
 async fn read_flag(app: &AppHandle, key: &str) -> bool {
-    let state = app.state::<AppState>();
+    // manage() 注册的类型是 Arc<AppState>（见 lib.rs 的 .manage(app_state.clone())）；
+    // 这里若取裸 AppState 会 panic「state() called before manage()」——panic 发生在
+    // async command 的 tokio task 里，IPC 响应永不返回，前端 await 永远挂起。
+    let state = app.state::<std::sync::Arc<AppState>>();
     let conn = state.db_conn.lock().await;
     db::get_local_flag(&conn, key).is_some()
 }
 
 async fn write_flag(app: &AppHandle, key: &str, value: &str) {
-    let state = app.state::<AppState>();
+    let state = app.state::<std::sync::Arc<AppState>>();
     let conn = state.db_conn.lock().await;
     if let Err(e) = db::set_local_flag(&conn, key, value) {
         log::warn!("Failed to persist flag {}: {}", key, e);
@@ -644,7 +647,7 @@ pub async fn current_payload(app: &AppHandle) -> TrayPlacementPayload {
 /// 那次安全唤起。而且「拉」通道（`current_payload`）本来就是现读的，
 /// 留着快照会让推、拉两条通道对同一个字段给出不同的答案。
 async fn read_start_minimized(app: &AppHandle) -> bool {
-    let state = app.state::<AppState>();
+    let state = app.state::<std::sync::Arc<AppState>>();
     let settings = state.settings.lock().await;
     settings.start_minimized
 }

@@ -388,11 +388,13 @@ export const App: React.FC = () => {
         data-tauri-drag-region
         className="flex items-center justify-between px-4 py-3 bg-slate-850/80 backdrop-blur border-b border-slate-800 cursor-move select-none"
       >
-        <div data-tauri-drag-region className="flex items-center space-x-2 pointer-events-auto">
+        {/* min-w-0 允许左侧在 380px 窗宽下收缩，配内部 truncate 截断主机名，
+            而不是把右侧按钮组挤到换行。 */}
+        <div data-tauri-drag-region className="flex items-center space-x-2 pointer-events-auto min-w-0">
           <div className="w-7 h-7 rounded-lg bg-teal-500/20 flex items-center justify-center border border-teal-500/40 pointer-events-none">
             <Clipboard className="w-4 h-4 text-teal-400" />
           </div>
-          <div data-tauri-drag-region>
+          <div data-tauri-drag-region className="min-w-0">
             <h1 className="text-sm font-semibold text-slate-100 flex items-center space-x-1.5 pointer-events-none">
               <span>瞬贴</span>
               <span className="text-[11px] text-slate-400 font-normal">UniDrop</span>
@@ -404,13 +406,16 @@ export const App: React.FC = () => {
                 </span>
               )}
             </h1>
-            <p className="text-[11px] text-slate-400 pointer-events-none">
+            <p className="text-[11px] text-slate-400 pointer-events-none truncate">
               本机: {selfDevice ? `${selfDevice.hostname} (${selfDevice.os_type.toUpperCase()})` : "载入中..."}
             </p>
           </div>
         </div>
 
-        <div className="flex items-center space-x-1.5 cursor-default">
+        {/* shrink-0 + whitespace-nowrap：380px 窗宽下左侧标题块会挤压这里，
+            「偏好设置」一旦换行按钮就竖着长高，头部布局随之变形。空间不足时
+            应当由左侧（已 truncate）让位，按钮组整体保持一行。 */}
+        <div className="flex items-center space-x-1.5 cursor-default shrink-0">
           <button
             onClick={fetchInitialData}
             className={`p-1.5 rounded-lg text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition ${
@@ -422,7 +427,7 @@ export const App: React.FC = () => {
           </button>
           <button
             onClick={() => setIsSettingsOpen(true)}
-            className="flex items-center space-x-1 px-2.5 py-1 rounded-lg bg-slate-800/90 hover:bg-slate-700/90 border border-slate-700/70 text-slate-200 hover:text-teal-300 transition text-xs font-medium shadow-sm"
+            className="flex items-center space-x-1 px-2.5 py-1 rounded-lg bg-slate-800/90 hover:bg-slate-700/90 border border-slate-700/70 text-slate-200 hover:text-teal-300 transition text-xs font-medium shadow-sm whitespace-nowrap"
             title="偏好设置"
           >
             <Settings className="w-3.5 h-3.5 text-teal-400" />

@@ -9,7 +9,12 @@
 # 从 .env 载入。凭证不全时**跳过而不失败**：本机自用的构建不该因为没配公证而报错。
 set -e
 
-BUNDLE_DIR="src-tauri/target/release/bundle/dmg"
+CLIENT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# Cargo workspace 的构建产物落在仓库根 target/；独立构建才在 client/src-tauri/target/ 下
+BUNDLE_DIR="$CLIENT_DIR/../target/release/bundle/dmg"
+if [ ! -d "$BUNDLE_DIR" ]; then
+  BUNDLE_DIR="$CLIENT_DIR/src-tauri/target/release/bundle/dmg"
+fi
 
 # 仅 macOS 有意义；其他平台直接跳过
 if [ "$(uname -s)" != "Darwin" ]; then
