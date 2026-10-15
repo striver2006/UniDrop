@@ -83,6 +83,13 @@ func (h *DataWSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	slog.Info("data plane disconnected", "session", sessionID, "role", role, "device", deviceID)
 }
 
+const (
+	// Timeout for pushing or writing 4MB data frames over WAN/cellular.
+	dataFrameTimeout = 30 * time.Second
+	// Timeout for pushing or writing 64B ACK frames.
+	ackFrameTimeout = 10 * time.Second
+)
+
 // handleSender reads data frames from sender and delivers ACKs/NACKs back to sender.
 func (h *DataWSHandler) handleSender(ctx context.Context, ws *websocket.Conn, pipe *relay.RelayPipe, pool *relay.BufferPool) {
 	senderCtx, cancel := context.WithCancel(ctx)
@@ -96,21 +103,35 @@ func (h *DataWSHandler) handleSender(ctx context.Context, ws *websocket.Conn, pi
 			select {
 			case <-senderCtx.Done():
 				return
-			case <-pipe.DoneChan:
-				// Propagate pipe closure so the client stops waiting on a dead session
-				_ = ws.Close(websocket.StatusGoingAway, "relay pipe closed")
-				return
 			case ackBuf, ok := <-pipe.BackwardChan:
 				if !ok {
 					return
 				}
-				writeCtx, writeCancel := context.WithTimeout(senderCtx, 5*time.Second)
+				writeCtx, writeCancel := context.WithTimeout(senderCtx, ackFrameTimeout)
 				err := ws.Write(writeCtx, websocket.MessageBinary, *ackBuf)
 				writeCancel()
 				ackPool.Put(ackBuf)
 				if err != nil {
 					return
 				}
+			case <-pipe.DoneChan:
+				// Drain any remaining ACK frames in BackwardChan before closing
+				for len(pipe.BackwardChan) > 0 {
+					select {
+					case ackBuf, ok := <-pipe.BackwardChan:
+						if ok {
+							writeCtx, writeCancel := context.WithTimeout(senderCtx, ackFrameTimeout)
+							_ = ws.Write(writeCtx, websocket.MessageBinary, *ackBuf)
+							writeCancel()
+							ackPool.Put(ackBuf)
+						}
+					default:
+						break
+					}
+				}
+				// Propagate pipe closure so the client stops waiting on a dead session
+				_ = ws.Close(websocket.StatusGoingAway, "relay pipe closed")
+				return
 			}
 		}
 	}()
@@ -154,7 +175,7 @@ func (h *DataWSHandler) handleSender(ctx context.Context, ws *websocket.Conn, pi
 
 		Metrics.TotalRelayedBytes.Add(uint64(len(data)))
 
-		if err := pipe.PushForward(buf, 5*time.Second); err != nil {
+		if err := pipe.PushForward(buf, dataFrameTimeout); err != nil {
 			pool.Put(buf)
 			slog.Warn("pipe push forward failed", "error", err)
 			break
@@ -183,7 +204,7 @@ func (h *DataWSHandler) handleReceiver(ctx context.Context, ws *websocket.Conn, 
 				if !ok {
 					return
 				}
-				writeCtx, writeCancel := context.WithTimeout(receiverCtx, 5*time.Second)
+				writeCtx, writeCancel := context.WithTimeout(receiverCtx, dataFrameTimeout)
 				err := ws.Write(writeCtx, websocket.MessageBinary, *dataBuf)
 				writeCancel()
 				pool.Put(dataBuf)
@@ -231,7 +252,7 @@ func (h *DataWSHandler) handleReceiver(ctx context.Context, ws *websocket.Conn, 
 		*ackBuf = (*ackBuf)[:len(data)]
 		copy(*ackBuf, data)
 
-		if err := pipe.PushBackward(ackBuf, 5*time.Second); err != nil {
+		if err := pipe.PushBackward(ackBuf, ackFrameTimeout); err != nil {
 			ackPool.Put(ackBuf)
 			slog.Warn("pipe push backward failed", "error", err)
 			break

@@ -146,6 +146,16 @@ impl HistoryRepo {
         .ok()
     }
 
+    /// Returns the current status of a session (e.g. 'COMPLETED', 'FAILED', 'TRANSFERRING').
+    pub fn get_task_status(conn: &Connection, session_id: &str) -> Option<String> {
+        conn.query_row(
+            "SELECT status FROM transfer_tasks WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .ok()
+    }
+
     /// Lists the most recent tasks, oldest first is reversed — newest first.
     /// 列出**当前账号**的历史。
     ///
@@ -807,5 +817,17 @@ mod tests {
 
         HistoryRepo::delete_sessions(&mut conn, &ids).unwrap();
         assert_eq!(HistoryRepo::list_history(&conn, "acct", 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_get_task_status() {
+        let conn = test_conn();
+        HistoryRepo::record_task(&conn, "acct", "s1", "peer", "RECEIVE", &sample_offer("s1", "FILES"), "TRANSFERRING").unwrap();
+        assert_eq!(HistoryRepo::get_task_status(&conn, "s1").as_deref(), Some("TRANSFERRING"));
+
+        HistoryRepo::update_task_status(&conn, "s1", "COMPLETED", None).unwrap();
+        assert_eq!(HistoryRepo::get_task_status(&conn, "s1").as_deref(), Some("COMPLETED"));
+
+        assert_eq!(HistoryRepo::get_task_status(&conn, "nonexistent"), None);
     }
 }

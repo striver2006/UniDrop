@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-const MIN_RTO: Duration = Duration::from_millis(500);
-const MAX_RTO: Duration = Duration::from_secs(15);
-const INITIAL_RTO: Duration = Duration::from_millis(1500);
+const MIN_RTO: Duration = Duration::from_millis(3000);
+const MAX_RTO: Duration = Duration::from_secs(60);
+const INITIAL_RTO: Duration = Duration::from_millis(10000);
 
 pub const MAX_RETRIES: u32 = 5;
 
@@ -34,8 +34,8 @@ impl SlidingWindow {
             total_chunks,
             in_flight: HashMap::new(),
             acked: HashMap::new(),
-            srtt: Duration::from_millis(500),
-            rttvar: Duration::from_millis(250),
+            srtt: Duration::from_millis(4000),
+            rttvar: Duration::from_millis(1500),
             rto: INITIAL_RTO,
         }
     }

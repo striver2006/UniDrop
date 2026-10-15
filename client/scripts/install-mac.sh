@@ -31,7 +31,10 @@ fi
 echo "==> 2. 编译并打包应用 (.app)..."
 pnpm tauri build --bundles app
 
-APP_SOURCE="src-tauri/target/release/bundle/macos/UniDrop.app"
+APP_SOURCE="../target/release/bundle/macos/UniDrop.app"
+if [ ! -d "$APP_SOURCE" ]; then
+  APP_SOURCE="src-tauri/target/release/bundle/macos/UniDrop.app"
+fi
 if [ ! -d "$APP_SOURCE" ]; then
   echo "错误: 未找到构建产物 $APP_SOURCE"
   exit 1

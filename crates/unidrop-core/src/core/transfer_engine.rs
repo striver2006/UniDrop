@@ -579,7 +579,7 @@ impl TransferEngine {
         }
 
         let total_chunks_count = all_chunks.len() as u32;
-        let mut window = SlidingWindow::new(total_chunks_count, 4);
+        let mut window = SlidingWindow::new(total_chunks_count, 2);
         let mut next_chunk_to_send: u32 = 0;
         let mut transferred_bytes: i64 = 0;
         let total_size = offer.total_size;
@@ -651,6 +651,11 @@ impl TransferEngine {
                             if ack_bytes.len() >= HEADER_SIZE {
                                 if let Ok(ack_hdr) = BinaryHeader::decode(&ack_bytes) {
                                     if ack_hdr.chunk_type == ChunkType::Ack {
+                                        log::info!(
+                                            "Sender received ACK for item {} chunk {}",
+                                            ack_hdr.item_index,
+                                            ack_hdr.chunk_index
+                                        );
                                         // Find corresponding global chunk
                                         if let Some(pos) = all_chunks.iter().position(|c| c.item_index == ack_hdr.item_index && c.chunk_index == ack_hdr.chunk_index) {
                                             window.on_ack(pos as u32);
@@ -674,10 +679,10 @@ impl TransferEngine {
                                     } else if ack_hdr.chunk_type == ChunkType::Nack {
                                         // R3 / N1: Fast retransmit on NACK
                                         if let Some(pos) = all_chunks.iter().position(|c| c.item_index == ack_hdr.item_index && c.chunk_index == ack_hdr.chunk_index) {
-                                        if let Some(retransmit_idx) = window.on_nack(pos as u32) {
-                                            log::warn!("Received NACK for chunk {}, immediately fast-retransmitting", retransmit_idx);
-                                            let desc = &all_chunks[retransmit_idx as usize];
-                                            if let Ok(payload) = read_chunk_payload(desc) {
+                                            if let Some(retransmit_idx) = window.on_nack(pos as u32) {
+                                                log::warn!("Received NACK for chunk {}, immediately fast-retransmitting", retransmit_idx);
+                                                let desc = &all_chunks[retransmit_idx as usize];
+                                                if let Ok(payload) = read_chunk_payload(desc) {
                                                     if let Ok(frame) = build_data_frame(
                                                         session_uuid,
                                                         desc.item_index,
@@ -695,13 +700,35 @@ impl TransferEngine {
                                 }
                             }
                         }
-                        _ => break, // Connection closed or failed
+                        Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {
+                            log::debug!("Sender received ping/pong on data stream");
+                        }
+                        Some(Ok(Message::Close(frame))) => {
+                            log::warn!("Sender data websocket closed by server/peer: {:?}", frame);
+                            break;
+                        }
+                        Some(Ok(other)) => {
+                            log::warn!("Sender received unexpected websocket message: {:?}", other);
+                            break;
+                        }
+                        Some(Err(e)) => {
+                            log::warn!("Sender data websocket error: {:?}", e);
+                            break;
+                        }
+                        None => {
+                            log::warn!("Sender data websocket stream ended (None)");
+                            break;
+                        }
                     }
                 }
 
                 _ = check_interval.tick() => {
                     let timeouts = window.check_timeouts(Instant::now());
                     for timed_out_idx in timeouts {
+                        log::warn!(
+                            "Chunk {} timed out (RTO: {:?}), retransmitting for session {}",
+                            timed_out_idx, window.rto, session_id
+                        );
                         let desc = &all_chunks[timed_out_idx as usize];
                         if let Ok(payload) = read_chunk_payload(desc) {
                             if let Ok(frame) = build_data_frame(
@@ -904,7 +931,22 @@ impl TransferEngine {
         while let Some(msg) = read.next().await {
             let chunk_data = match msg {
                 Ok(Message::Binary(bytes)) => bytes,
-                _ => break,
+                Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => {
+                    log::debug!("Receiver received ping/pong on data stream");
+                    continue;
+                }
+                Ok(Message::Close(frame)) => {
+                    log::warn!("Receiver data websocket closed by server/peer: {:?}", frame);
+                    break;
+                }
+                Ok(other) => {
+                    log::warn!("Receiver received unexpected websocket message: {:?}", other);
+                    break;
+                }
+                Err(e) => {
+                    log::warn!("Receiver data websocket error: {:?}", e);
+                    break;
+                }
             };
 
             if chunk_data.len() < HEADER_SIZE {
@@ -1031,12 +1073,25 @@ impl TransferEngine {
             let ack = BinaryHeader::new_ack(header.session_id, header.item_index, header.chunk_index);
             let mut ack_frame = [0u8; HEADER_SIZE];
             if ack.encode(&mut ack_frame).is_ok() {
-                let _ = write.send(Message::Binary(ack_frame.to_vec())).await;
+                if let Err(e) = write.send(Message::Binary(ack_frame.to_vec())).await {
+                    log::warn!("Receiver failed to send ACK for chunk {}: {}", header.chunk_index, e);
+                } else {
+                    log::debug!("Receiver sent ACK for chunk {}", header.chunk_index);
+                }
             }
 
             // 4. Track completion via bitmap set
             let was_new = received_chunks_per_item[item_idx].insert(header.chunk_index);
             if was_new {
+                log::info!(
+                    "Receiver saved chunk {}/{} for item {} ({} bytes, total received: {}/{})",
+                    header.chunk_index + 1,
+                    header.total_chunks,
+                    item_idx,
+                    payload.len(),
+                    total_received_bytes + payload.len() as i64,
+                    total_size
+                );
                 // 这里必须累加 `payload`（解密后的明文）而不是 `wire_payload`（密文）：
                 // total_size 是明文口径，密文每块多 16 字节，累加密文会让
                 // transferred_size 虚高、进度提前触顶。上面的 clamp 会盖住百分比的
@@ -1209,6 +1264,9 @@ impl TransferEngine {
                         }
                     }
                     finalize_history_status(state.as_ref(), bridge.as_ref(), &session_id, "COMPLETED", None).await;
+
+                    // 给发送端留出接收最终 ACK 的时间（500ms），避免接收端过快退出导致中继 pipe 提前关闭引发发送端误报失败
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 } else {
                     let fail_env = ControlEnvelope {
                         version: 1,

@@ -497,6 +497,10 @@ impl SignalRouter {
 
                     let brief = {
                         let conn = self.state.db_conn.lock().await;
+                        if HistoryRepo::get_task_status(&conn, &sid).as_deref() == Some("COMPLETED") {
+                            log::warn!("Ignored peer TRANSFER_FAILURE for locally COMPLETED session {}", sid);
+                            return;
+                        }
                         let brief = HistoryRepo::get_task_brief(&conn, &sid);
                         let _ = HistoryRepo::update_task_status(&conn, &sid, "FAILED", err_msg.as_deref());
                         brief
